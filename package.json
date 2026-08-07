@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "canvas-confetti": "^1.9.4",
     "convex": "^1.43.0",
     "react": "^18.2.0",
@@ -16,6 +17,7 @@
     "react-router-dom": "^6.22.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/react": "^18.2.43",
     "@types/react-dom": "^18.2.17",
     "@vitejs/plugin-react": "^4.2.1",

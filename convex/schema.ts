@@ -16,14 +16,28 @@ import { v } from "convex/values";
  * TIER ENUM: PRD §6 users.tier = 'silver' | 'gold' | 'platinum'
  * (Task 2 points engine's ivory/champagne/noir are display-layer names in the
  *  approved design spec; the stored enum follows PRD + this schema spec.)
+ *
+ * AUTH (Step 3): PRD §3.1 merchant email+password (bcrypt) with self-service
+ * forgot-password reset link; PRD §3.2 customer zero-login crypto magic-link.
+ *   - password_hash        : bcrypt hash (never plaintext)
+ *   - magic_token          : 256-bit hex, valid 180 days (PRD §3.2)
+ *   - magic_token_created_at: epoch ms for the 180-day expiry check
+ *   - session_token/expiry : merchant login session, 7 days
+ *   - reset_token/expiry   : forgot-password token, 24h
+ * All tokens are cryptographically random (32 bytes → 64 hex chars).
  */
 export default defineSchema({
   /** PRD §6 Table `users` — customers + merchant(s). */
   users: defineTable({
-    email: v.optional(v.string()), // unique; required for merchant, optional for customer
+    email: v.optional(v.string()), // unique; required for merchant, optional for customer (normalized lowercase)
     mobile: v.string(), // unique customer lookup key (Billing Desk searches by phone)
-    password_hash: v.optional(v.string()), // merchant only (task: plaintext seed; real hash in auth step)
-    magic_token: v.optional(v.string()), // customer zero-login magic-link token
+    password_hash: v.optional(v.string()), // merchant only — bcrypt hash (PRD §3.1)
+    magic_token: v.optional(v.string()), // customer zero-login magic-link token (256-bit hex)
+    magic_token_created_at: v.optional(v.number()), // epoch ms — 180-day magic-link expiry (PRD §3.2)
+    reset_token: v.optional(v.string()), // forgot-password token (256-bit hex)
+    reset_expiry: v.optional(v.number()), // epoch ms — reset token expiry (24h)
+    session_token: v.optional(v.string()), // merchant session token (256-bit hex)
+    session_expiry: v.optional(v.number()), // epoch ms — merchant session expiry (7 days)
     role: v.union(v.literal("customer"), v.literal("merchant")),
     name: v.string(),
     points: v.optional(v.number()), // default 0 — treat missing as 0 in app code (Convex has no field defaults)
@@ -53,7 +67,8 @@ export default defineSchema({
     ),
   })
     .index("by_mobile", ["mobile"]) // Billing Desk phone lookup; duplicate mobile = unique in app logic
-    .index("by_magic_token", ["magic_token"]) // magic-link validation
+    .index("by_email", ["email"]) // merchant login + forgot-password lookup (PRD §3.1)
+    .index("by_magic_token", ["magic_token"]) // magic-link validation (PRD §3.2)
     .index("by_tier", ["tier"]), // campaign segmentation by loyalty tier
 
   /** PRD §6 Table `lookbooks` — designer collection groups. */
