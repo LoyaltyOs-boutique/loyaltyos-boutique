@@ -1,0 +1,14 @@
+# PERMANENT RULE - FROM MA'AM - Reference: obra/superpowers (607KB, 235 entries)
+# Date: 2026-08-06
+
+HARD-GATE (from skills/brainstorming/SKILL.md): Do NOT write any code until you have presented a design and user has approved it. Applies to EVERY project regardless of perceived simplicity. Save approved design to docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md and commit.
+
+Whenever user gives ANY new project/folder in future:
+1. FIRST scan if spec-driven (check .clinerules, .superpowers/sdd/progress.md with format Task N: complete (commits ...), docs/superpowers/specs/, docs/superpowers/plans/, memory-bank/, git repo)
+2. If NOT spec-driven or <50% spec-driven (like current 15%), FIRST clone and convert to spec-driven using superpowers reference: create .clinerules, .superpowers/sdd/progress.md ledger, docs/superpowers/specs/, plans/, memory-bank/ (6 files), .worklogs/, tasks.md, git init
+3. Use progress ledger for memory (not just context) - trust ledger and git log over recollection
+4. Create spec as dated approved artifact with Design Decisions table, then plan as executable contract with Global Constraints copied verbatim, verification steps
+5. Always update memory-bank/progress.md and .superpowers/sdd/progress.md after every task with exact format
+6. Never start coding without HARD-GATE approval
+
+This rule applies to ALL future projects. This is standing instruction from Ma'am.

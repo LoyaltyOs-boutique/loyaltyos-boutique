@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { -webkit-font-smoothing: antialiased; }
+  body { @apply bg-paper text-ink font-sans; }
+  * { border-radius: 0 !important; }
+  .radius-sharp { border-radius: 2px !important; }
+  ::selection { background: #C5A880; color: #fff; }
+}
+
+@layer components {
+  .luxe-title { @apply font-serif text-ink; }
+  .eyebrow { @apply text-[11px] tracking-luxe uppercase text-steel; }
+  .hairline { @apply border-line; }
+  .card { @apply bg-paper border border-line shadow-card; }
+  .btn { @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 text-[11px] tracking-luxe uppercase transition-colors cursor-pointer select-none; }
+  .btn-ink { @apply btn bg-ink text-white hover:bg-black; }
+  .btn-gold { @apply btn bg-gold text-white hover:bg-[#B3936C]; }
+  .btn-outline { @apply btn border border-ink text-ink hover:bg-ink hover:text-white; }
+  .btn-ghost { @apply btn border border-line text-steel hover:border-ink hover:text-ink; }
+  .chip { @apply inline-flex items-center gap-2 px-4 py-3 border border-line bg-white text-left hover:border-ink cursor-pointer transition-colors; }
+  .input { @apply w-full border border-line bg-white px-3 py-2.5 text-sm outline-none focus:border-ink transition-colors placeholder:text-steel/50; }
+  .label { @apply block text-[10px] tracking-luxe uppercase text-steel mb-1.5; }
+  .tbl { @apply w-full text-left text-sm; }
+  .tbl th { @apply text-[10px] tracking-luxe uppercase text-steel font-medium pb-3 border-b border-line whitespace-nowrap; }
+  .tbl td { @apply py-3.5 border-b border-line align-middle; }
+}
+
+@keyframes pop { 0%{transform:scale(1)} 40%{transform:scale(1.45)} 100%{transform:scale(1)} }
+.animate-pop { animation: pop .38s ease; }
+@keyframes fadeUp { from{opacity:0; transform:translateY(10px)} to{opacity:1; transform:none} }
+.animate-fadeUp { animation: fadeUp .45s ease both; }
+@keyframes goldPulse { 0%,100%{box-shadow:0 0 0 0 rgba(197,168,128,.35)} 50%{box-shadow:0 0 0 8px rgba(197,168,128,0)} }
+.animate-goldPulse { animation: goldPulse 2.2s infinite; }
+
+.scroll-thin::-webkit-scrollbar { width: 5px; height: 5px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: #E5E5E5; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
