@@ -84,11 +84,15 @@ export const merchantLogin = mutation({
 
     if (!merchant || merchant.role !== "merchant" || !merchant.password_hash) {
       // Timing-safe no-op compare so missing users don't respond faster.
-      await bcrypt.compare(password, DUMMY_HASH);
+      // compareSync: Convex forbids timers (async bcrypt uses setTimeout) —
+      // the sync API is pure JS and is the documented Convex pattern.
+      bcrypt.compareSync(password, DUMMY_HASH);
       return null;
     }
 
-    const valid = await bcrypt.compare(password, merchant.password_hash);
+    // compareSync (not await bcrypt.compare) — async bcrypt uses setTimeout,
+    // which Convex prohibits in queries/mutations.
+    const valid = bcrypt.compareSync(password, merchant.password_hash);
     if (!valid) return null;
 
     const token = randomHex();
