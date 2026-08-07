@@ -30,3 +30,5 @@
 
 - 2026-08-06: Spec-driven conversion complete. Permanent rule stored in `.clinerules`, `memory-bank/systemPatterns.md`, `memory-bank/activeContext.md`. Implementation awaits HARD-GATE approval to begin coding.
 - 2026-08-06: Task 2 complete — points engine (`apps/api/src/services/points.js`) + TDD suite (`apps/api/test/points.test.js`, 30/30 pass) in commit `e2ff5b9`.
+- 2026-08-07: **Convex amendment approved** (`docs/superpowers/specs/2026-08-07-convex-amendment-design.md`) — backend provider changed from Express+PG+Redis+Docker to Convex (Dec #2/#3/#8). This supersedes the original Mould Express/PG implementation plan for backend work.
+- 2026-08-07: **Step 1 complete** — Convex project `loyaltyos-boutique` created (team `wowcirclemould`), `convex/` scaffolded, env in `.env.local` (gitignored), branch `feat/step1-connect-convex` pushed. Tester agent: convex/ ✅, VITE_CONVEX_URL ✅, build CSS 27.74 kB ✅, `/login` HTTP 200 ✅ (commits `cf2cdd4`, `f90f9d1`). No `src/` edits.
