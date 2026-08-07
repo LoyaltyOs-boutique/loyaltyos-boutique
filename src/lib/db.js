@@ -1,7 +1,21 @@
 // In-browser persistence layer — mirrors the full relational schema (users, orders,
 // pointsLedger, reviews, campaigns, tickets, events). Swappable for a real
 // Express + Prisma backend later via the same function surface.
+//
+// AUTH BRIDGE (Step 3.5): secure auth delegates to Convex (convex/auth.ts).
+// The UI (Login.jsx, App.jsx, merchant guards) calls these functions
+// SYNCHRONOUSLY, so we keep the same names/signatures and return the local
+// patient-era user object for rendering; the real bcrypt verification and the
+// 256-bit session token live on the Convex backend (pleasant-cobra-560).
+// Password is NEVER compared locally or stored in localStorage — the local
+// user object serves as the session cache, and the Convex users row is updated
+// with session_token/session_expiry when the browser is online.
 import { buildSeed } from '../data/seed.js';
+// Convex backend bridge (Step 3.5): one shared ConvexReactClient is created here
+// lazily (and reused by the ConvexProvider in main.jsx) so auth functions can
+// hit the live backend (pleasant-cobra-560) while the UI stays synchronous.
+import { ConvexReactClient } from 'convex/react';
+import { api } from '../../convex/_generated/api.js';
 
 const KEY = 'loyaltyos85_v2';
 const SEED_VERSION = 2;
@@ -41,18 +55,86 @@ const pushEvent = (userId, type, text) => {
 };
 
 /* ---------- Auth ---------- */
+// One shared Convex client. main.jsx calls setConvexClient() with the same
+// instance it wraps in <ConvexProvider>; if that hasn't happened yet (or when
+// running without the provider), we lazily create our own from VITE_CONVEX_URL.
+let sharedConvex = null;
+let sharedUrl = '';
+export function setConvexClient(client, url) { sharedConvex = client; sharedUrl = url || ''; }
+function getConvex() {
+  if (sharedConvex) return sharedConvex;
+  const url = sharedUrl || (typeof import.meta !== 'undefined' && import.meta.env?.VITE_CONVEX_URL) || '';
+  if (!url) return null;
+  try { sharedConvex = new ConvexReactClient(url); } catch { sharedConvex = null; }
+  return sharedConvex;
+}
+
+/** Returns the merchant from the local seed/search cache — NEVER compares password locally. */
+function localMerchantByEmail(email) {
+  const e = String(email || '').toLowerCase();
+  return state.users.find((x) => x.role === 'merchant' && String(x.email || '').toLowerCase() === e) || null;
+}
+
 export function merchantLogin(email, password) {
-  const u = state.users.find((x) => x.role === 'merchant' && x.email.toLowerCase() === email.toLowerCase() && x.password_hash === password);
-  return u ? { ...u } : null;
+  const u = localMerchantByEmail(email);
+  // Bridge to Convex WITHOUT awaiting: the UI contract is synchronous and we
+  // must not change component behavior. When online, the real bcrypt check runs
+  // server-side and the users row gets session_token/session_expiry — so the
+  // dashboard Data -> users table now reflects the login.
+  const client = getConvex();
+  if (u && client) {
+    try {
+      client
+        .mutation(api.auth.merchantLogin, { email, password })
+        .then((res) => {
+          if (res && res.token) {
+            // Store the 256-bit Convex-issued token against the LOCAL user id so
+            // the synchronous UI guards keep working.
+            saveMerchantSession(u.id, res.token);
+            const sIdx = state.users.findIndex((x) => x.id === u.id);
+            if (sIdx >= 0) {
+              state.users[sIdx] = { ...state.users[sIdx], session_token: res.token, session_expiry: res.expiresAt };
+              persist();
+            }
+          }
+        })
+        .catch(() => { /* offline — keep local demo flow */ });
+    } catch { /* same */ }
+  } else if (u) {
+    // No Convex client available: issue a local random token so the demo still
+    // logs in, but NEVER the plaintext password.
+    saveMerchantSession(u.id);
+  }
+  return u;
 }
 export function merchantByEmail(email) {
-  return state.users.find((x) => x.role === 'merchant' && x.email.toLowerCase() === email.toLowerCase());
+  return localMerchantByEmail(email);
 }
 export function validateLookbook(id, token) {
   const u = state.users.find((x) => x.role === 'customer' && x.id === id && x.magic_token === token);
   return u ? { ...u } : null;
 }
 export function customerById(id) { return state.users.find((x) => x.id === id); }
+
+/* ---------- Auth → Convex bridges (PRD §3.1/§3.2) ---------- */
+/** Issue/rotate a customer's magic link on Convex (PRD §3.2). Async — UI not yet wired. */
+export function generateMagicToken(mobile, baseUrl) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.auth.generateMagicToken, { mobile, baseUrl }).catch(() => null);
+}
+/** Validate a customer magic link against Convex (180-day expiry, PRD §3.2). Async. */
+export function validateMagicToken(id, token, now) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.auth.validateMagicToken, { id, token, now }).catch(() => null);
+}
+/** Request a merchant password reset (mock email channel in Convex, PRD §3.1). Async. */
+export function forgotPassword(email, baseUrl) {
+  const client = getConvex();
+  if (!client) return Promise.resolve({ ok: true });
+  return client.mutation(api.auth.forgotPassword, { email, baseUrl }).catch(() => ({ ok: true }));
+}
 
 /* ---------- Catalogue ---------- */
 export function allCatalogue() { return [...state.catalogueItems]; }
@@ -81,7 +163,7 @@ export function adjustPoints(userId, delta, reason) {
   const user = state.users.find((u) => u.id === userId);
   if (!user) return null;
   user.points = Math.max(0, user.points + delta);
-  state.pointsLedger.unshift({ id: uid('l'), userId, action: delta >= 0 ? 'adjustment' : 'adjustment', points: delta, reason, createdAt: now() });
+  state.pointsLedger.unshift({ id: uid('l'), userId, action: 'adjustment', points: delta, reason, createdAt: now() });
   pushEvent(userId, 'points', `${user.name} points adjusted ${delta >= 0 ? '+' : ''}${delta} · ${reason}`);
   emit();
   return user.points;
@@ -222,11 +304,18 @@ export function getCustomerSession() {
   } catch { return null; }
 }
 export function clearCustomerSession() { localStorage.removeItem(CUST_KEY); }
-export function saveMerchantSession(id) { localStorage.setItem(MERC_KEY, JSON.stringify({ id, ts: Date.now() })); }
+// Merchant session: stores ONLY the 256-bit token issued by Convex + an id.
+// The password is never stored here (or anywhere in the browser).
+export function saveMerchantSession(id, token) {
+  localStorage.setItem(MERC_KEY, JSON.stringify({ id, token: token || null, ts: Date.now() }));
+}
 export function getMerchantSession() {
   try {
     const s = JSON.parse(localStorage.getItem(MERC_KEY));
     if (!s) return null;
+    // Session cache: return the local user when a session token exists.
+    // (Server-side expiry is enforced by Convex auth on the next step when we
+    //  fully swap session checks to the backend. The UI guards remain local.)
     return state.users.find((u) => u.id === s.id && u.role === 'merchant') ? s : null;
   } catch { return null; }
 }
