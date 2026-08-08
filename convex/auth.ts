@@ -1,6 +1,7 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import bcrypt from "bcryptjs";
+import { Resend } from "resend";
 
 /**
  * LoyaltyOS Boutique — Auth functions (Step 3)
@@ -136,6 +137,9 @@ export const generateMagicToken = mutation({
 
     const base = (baseUrl ?? PORTAL_BASE_URL).replace(/\/+$/, "");
     const magicLink = `${base}/lookbook?id=${customer._id}&token=${token}`;
+    // Step 3.6: PRD §3.2 delivers the lookbook link via WhatsApp; Resend email
+    // is a backup channel — reuse the sendResetEmail() Resend pattern
+    // (digital@mouldinnovation.com -> customer email) when needed.
     return {
       user: toPublicUser(customer),
       magicLink,
@@ -179,11 +183,47 @@ export const validateMagicToken = query({
 });
 
 /**
+ * Send the password-reset email via Resend (Step 3.6).
+ *
+ * Sender is the brand inbox digital@mouldinnovation.com; the API key comes
+ * from the RESEND_API_KEY Convex environment variable. Returns true when
+ * Resend accepted the email, false when the key is missing or the send
+ * failed — the caller then falls back to the mock console log so local dev
+ * never breaks. Never throws: forgotPassword must always answer { ok: true }.
+ */
+async function sendResetEmail(to: string, resetLink: string): Promise<boolean> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return false;
+  try {
+    const resend = new Resend(apiKey);
+    const { error } = await resend.emails.send({
+      from: "LoyaltyOS Boutique <digital@mouldinnovation.com>",
+      to,
+      subject: "Reset your LoyaltyOS password - 85 Lansdowne",
+      html: `<p>Click to reset your LoyaltyOS Boutique (85 Lansdowne) password:</p><p><a href="${resetLink}">${resetLink}</a></p><p>Valid for 24 hours.</p><p>— LoyaltyOS Boutique · 85 Lansdowne</p>`,
+    });
+    if (error) {
+      console.error("[forgotPassword] Resend error:", error.name, error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(
+      "[forgotPassword] Resend exception:",
+      err instanceof Error ? err.message : String(err),
+    );
+    return false;
+  }
+}
+
+/**
  * PRD §3.1 — Forgot password (merchant self-service reset).
  * Finds the merchant by email, issues a 256-bit reset token valid 24h,
- * persists it (reset_token, reset_expiry), and logs the reset link to the
- * console as the mock email channel (Phase 1). Always returns { ok: true }
- * so the endpoint cannot be used for account enumeration.
+ * persists it (reset_token, reset_expiry), and sends a real reset email
+ * via Resend from digital@mouldinnovation.com (Step 3.6). If RESEND_API_KEY
+ * is missing or the send fails, falls back to the mock console log so local
+ * dev never breaks. Always returns { ok: true } so the endpoint cannot be
+ * used for account enumeration.
  */
 export const forgotPassword = mutation({
   args: {
@@ -202,10 +242,13 @@ export const forgotPassword = mutation({
       const resetExpiry = Date.now() + RESET_HOURS * 3_600_000;
       await ctx.db.patch(merchant._id, { reset_token: resetToken, reset_expiry: resetExpiry });
       const base = (baseUrl ?? PORTAL_BASE_URL).replace(/\/+$/, "");
-      // Mock email channel — Phase 2 will send via a real email provider.
-      console.log(
-        `[forgotPassword] RESET LINK for ${merchant.email}: ${base}/reset-password?id=${merchant._id}&token=${resetToken}`,
-      );
+      const resetLink = `${base}/reset-password?id=${merchant._id}&token=${resetToken}`;
+
+      // Step 3.6: real email via Resend, mock-log fallback when not configured.
+      const emailed = await sendResetEmail(normalized, resetLink);
+      if (!emailed) {
+        console.log(`[forgotPassword] RESET LINK for ${merchant.email}: ${resetLink}`);
+      }
     }
     // Deliberately identical response whether or not the account exists.
     return { ok: true };
