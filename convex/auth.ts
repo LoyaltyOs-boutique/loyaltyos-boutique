@@ -1,7 +1,8 @@
-import { mutation, query } from "./_generated/server";
+import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import bcrypt from "bcryptjs";
 import { Resend } from "resend";
+import { internal } from "./_generated/api";
 
 /**
  * LoyaltyOS Boutique — Auth functions (Step 3)
@@ -182,6 +183,44 @@ export const validateMagicToken = query({
   },
 });
 
+/** Merchant ref returned to the forgot-password action — public fields only, never secrets. */
+type MerchantRef = {
+  _id: import("./_generated/dataModel").Id<"users">;
+  name: string | null;
+  email: string | null;
+};
+
+/**
+ * PRD §3.1 — Internal: find a merchant by email (actions have no ctx.db).
+ * Lookup only; the caller builds the reset link and sends the email.
+ */
+export const findMerchantByEmail = internalQuery({
+  args: { email: v.string() },
+  handler: async (ctx, { email }): Promise<MerchantRef | null> => {
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_email", (q) => q.eq("email", email))
+      .first();
+    if (!user || user.role !== "merchant" || !user.email) return null;
+    return { _id: user._id, name: user.name ?? null, email: user.email };
+  },
+});
+
+/**
+ * PRD §3.1 — Internal: persist the 256-bit reset token with 24h expiry.
+ * Actions have no ctx.db, so forgotPassword commits via runMutation.
+ */
+export const saveResetToken = internalMutation({
+  args: {
+    userId: v.id("users"),
+    resetToken: v.string(),
+    resetExpiry: v.number(),
+  },
+  handler: async (ctx, { userId, resetToken, resetExpiry }) => {
+    await ctx.db.patch(userId, { reset_token: resetToken, reset_expiry: resetExpiry });
+  },
+});
+
 /**
  * Send the password-reset email via Resend (Step 3.6).
  *
@@ -217,34 +256,37 @@ async function sendResetEmail(to: string, resetLink: string): Promise<boolean> {
 }
 
 /**
- * PRD §3.1 — Forgot password (merchant self-service reset).
- * Finds the merchant by email, issues a 256-bit reset token valid 24h,
- * persists it (reset_token, reset_expiry), and sends a real reset email
- * via Resend from digital@mouldinnovation.com (Step 3.6). If RESEND_API_KEY
- * is missing or the send fails, falls back to the mock console log so local
- * dev never breaks. Always returns { ok: true } so the endpoint cannot be
- * used for account enumeration.
+ * PRD §3.1 — Forgot password (merchant self-service reset), Step 3.6b.
+ * Converted from mutation to ACTION: Convex mutations cannot fetch external
+ * APIs, actions can — this unblocks the real Resend email to Gmail. Actions
+ * have no ctx.db, so the flow is: findMerchantByEmail (internalQuery) →
+ * saveResetToken (internalMutation) → Resend send (fetch, try/catch fallback).
+ * Keeps anti-enumeration { ok: true } for unknown emails and the 24h expiry.
  */
-export const forgotPassword = mutation({
+export const forgotPassword = action({
   args: {
     email: v.string(),
     baseUrl: v.optional(v.string()),
   },
   handler: async (ctx, { email, baseUrl }) => {
     const normalized = email.trim().toLowerCase();
-    const merchant = await ctx.db
-      .query("users")
-      .withIndex("by_email", (q) => q.eq("email", normalized))
-      .first();
+    const merchant = await ctx.runQuery(internal.auth.findMerchantByEmail, {
+      email: normalized,
+    });
 
-    if (merchant && merchant.role === "merchant") {
+    if (merchant) {
       const resetToken = randomHex();
       const resetExpiry = Date.now() + RESET_HOURS * 3_600_000;
-      await ctx.db.patch(merchant._id, { reset_token: resetToken, reset_expiry: resetExpiry });
+      await ctx.runMutation(internal.auth.saveResetToken, {
+        userId: merchant._id,
+        resetToken,
+        resetExpiry,
+      });
       const base = (baseUrl ?? PORTAL_BASE_URL).replace(/\/+$/, "");
       const resetLink = `${base}/reset-password?id=${merchant._id}&token=${resetToken}`;
 
-      // Step 3.6: real email via Resend, mock-log fallback when not configured.
+      // Step 3.6b: real email via Resend (fetch is legal in an action);
+      // mock-log fallback when not configured or the send fails.
       const emailed = await sendResetEmail(normalized, resetLink);
       if (!emailed) {
         console.log(`[forgotPassword] RESET LINK for ${merchant.email}: ${resetLink}`);
