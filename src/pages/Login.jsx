@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { BRAND } from '../data/seed.js';
-import { merchantLogin, merchantByEmail, saveMerchantSession, resetDemo } from '../lib/db.js';
+import { merchantLogin, saveMerchantSession, resetDemo, forgotPassword } from '../lib/db.js';
 import { cls } from '../lib/util.js';
 
 export default function Login() {
@@ -12,7 +12,6 @@ export default function Login() {
   const [error, setError] = useState('');
   const [mode, setMode] = useState('login'); // login | forgot | sent
   const [fpEmail, setFpEmail] = useState('');
-  const [resetLink, setResetLink] = useState('');
 
   const submit = (e) => {
     e.preventDefault();
@@ -22,18 +21,13 @@ export default function Login() {
     navigate(location.state?.from?.pathname || '/merchant/dashboard', { replace: true });
   };
 
-  const sendReset = (e) => {
+  const sendReset = async (e) => {
     e.preventDefault();
-    const u = merchantByEmail(fpEmail);
-    const link = `/reset?token=${Math.random().toString(36).slice(2, 12)}&email=${encodeURIComponent(fpEmail)}`;
-    if (u) {
-      setResetLink(link);
-      setMode('sent');
-      console.log(`🔐 [Mock] Password reset token for ${u.email}: ${link}`);
-    } else {
-      setResetLink(link); // don't leak account existence — still show sent
-      setMode('sent');
-    }
+    // Real recovery email via the Convex forgotPassword action (Step 3.7).
+    // The action always resolves {ok:true} (anti-enumeration) — the UI shows
+    // the generic message either way and never leaks account existence.
+    await forgotPassword(fpEmail, window.location.origin);
+    setMode('sent');
   };
 
   return (
@@ -100,8 +94,7 @@ export default function Login() {
             <div className="text-center animate-fadeUp">
               <div className="text-4xl mb-4">✉️</div>
               <h2 className="luxe-title text-3xl mb-3">Check your inbox.</h2>
-              <p className="text-sm text-steel mb-6">If <span className="text-ink">{fpEmail}</span> is registered, a secure recovery link has been sent. For this prototype, the tokenized link is below:</p>
-              <div className="bg-mist border border-line p-3 text-xs break-all text-gold mb-6">{resetLink}</div>
+              <p className="text-sm text-steel mb-6">If <span className="text-ink">{fpEmail}</span> is registered, a secure recovery link has been sent. Please check your inbox (and spam folder).</p>
               <button onClick={() => setMode('login')} className="btn-ink w-full">Back to sign in</button>
             </div>
           )}

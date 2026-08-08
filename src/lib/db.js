@@ -129,11 +129,16 @@ export function validateMagicToken(id, token, now) {
   if (!client) return Promise.resolve(null);
   return client.query(api.auth.validateMagicToken, { id, token, now }).catch(() => null);
 }
-/** Request a merchant password reset (mock email channel in Convex, PRD §3.1). Async. */
+/** Request a merchant password reset — real recovery email via Convex action (Step 3.7, PRD §3.1). Async. */
 export function forgotPassword(email, baseUrl) {
   const client = getConvex();
   if (!client) return Promise.resolve({ ok: true });
-  return client.mutation(api.auth.forgotPassword, { email, baseUrl }).catch(() => ({ ok: true }));
+  // forgotPassword is an ACTION (not a mutation) → invoke with client.action.
+  // Always resolves {ok:true} for anti-enumeration; errors are logged for dev visibility.
+  return client.action(api.auth.forgotPassword, { email, baseUrl }).catch((err) => {
+    console.error('[forgotPassword] Convex action failed:', err);
+    return { ok: true };
+  });
 }
 
 /* ---------- Catalogue ---------- */
