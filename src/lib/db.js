@@ -77,6 +77,12 @@ function localMerchantByEmail(email) {
 
 export function merchantLogin(email, password) {
   const u = localMerchantByEmail(email);
+  // Security: wrong credentials MUST fail. Email not found or password mismatch
+  // → return null so Login.jsx shows "Incorrect email or password." (demo seed
+  // stores plaintext password_hash; real bcrypt compare happens server-side
+  // once Convex auth is fully wired).
+  if (!u) return null;
+  if (u.password_hash !== password) return null;
   // Bridge to Convex WITHOUT awaiting: the UI contract is synchronous and we
   // must not change component behavior. When online, the real bcrypt check runs
   // server-side and the users row gets session_token/session_expiry — so the
