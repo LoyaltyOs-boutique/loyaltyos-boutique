@@ -114,7 +114,7 @@ export default function Customers() {
                     <button onClick={(e) => { e.stopPropagation(); copyLink(c); }} title="Copy magic link" className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Copy link">
                       {copiedId === c.id ? '✓' : '🔗'}
                     </button>
-                    <a href={shareWa(c)} target="_blank" rel="noreferrer" title="Share on WhatsApp" onClick={(e) => e.stopPropagation()} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="WhatsApp">✆</a>
+                    <a href={shareWa(c)} target="_blank" rel="noreferrer" title="Share on WhatsApp" onClick={(e) => e.stopPropagation()} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="WhatsApp"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
                   </div>
                 </td>
                 <td className="text-right text-gold">→</td>
@@ -158,7 +158,7 @@ export default function Customers() {
                   <span className="text-xs text-gold select-all border border-line bg-mist px-3 py-2 min-w-0 max-w-full break-all">{magicUrl(active)}</span>
                   <button onClick={() => openLookbook(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">Open lookbook 👁</button>
                   <button onClick={() => copyLink(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">{copiedId === active.id ? '✓ Copied' : 'Copy'}</button>
-                  <a href={shareWa(active)} target="_blank" rel="noreferrer" className="btn-gold !px-3 !py-1.5 text-[9px]">WhatsApp ✆</a>
+                  <a href={shareWa(active)} target="_blank" rel="noreferrer" className="btn-gold !px-3 !py-1.5 text-[9px]">WhatsApp <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
                 </div>
               </div>
               <div className="sm:col-span-2"><Info label="Custom tags" value={<div className="flex gap-2 flex-wrap">{active.custom_tags?.length ? active.custom_tags.map((t) => <Tag key={t}>{t}</Tag>) : <span className="text-steel">—</span>}</div>} /></div>
