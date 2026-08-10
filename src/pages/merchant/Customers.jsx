@@ -27,6 +27,10 @@ export default function Customers() {
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
   const magicUrl = (c) => `${window.location.origin}${waToken(c).m}`;
   const copyLink = (c) => { if (navigator.clipboard) navigator.clipboard.writeText(magicUrl(c)); setCopiedId(c.id); setTimeout(() => setCopiedId(null), 1600); };
+  const openLookbook = (c) => {
+    if (!c.magic_token) { alert('Generate magic link first'); return; }
+    window.open(magicUrl(c), '_blank', 'noopener,noreferrer');
+  };
   const shareWa = (c) => `https://wa.me/${waToken(c).wa}?text=${encodeURIComponent(waMessage(c, waToken(c).m))}`;
 
   const list = useMemo(() => {
@@ -104,6 +108,9 @@ export default function Customers() {
                 <td className="text-sm text-steel">{parseMD(c.anniversary)}</td>
                 <td className="text-center whitespace-nowrap">
                   <div className="inline-flex gap-1.5 items-center">
+                    <button onClick={(e) => { e.stopPropagation(); openLookbook(c); }} title="Open lookbook" className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Open lookbook">
+                      👁
+                    </button>
                     <button onClick={(e) => { e.stopPropagation(); copyLink(c); }} title="Copy magic link" className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Copy link">
                       {copiedId === c.id ? '✓' : '🔗'}
                     </button>
@@ -149,9 +156,9 @@ export default function Customers() {
                 <div className="label">Magic link (personal WhatsApp access)</div>
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-xs text-gold select-all border border-line bg-mist px-3 py-2 min-w-0 max-w-full break-all">{magicUrl(active)}</span>
+                  <button onClick={() => openLookbook(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">Open lookbook 👁</button>
                   <button onClick={() => copyLink(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">{copiedId === active.id ? '✓ Copied' : 'Copy'}</button>
                   <a href={shareWa(active)} target="_blank" rel="noreferrer" className="btn-gold !px-3 !py-1.5 text-[9px]">WhatsApp ✆</a>
-                  <a href={magicUrl(active)} target="_blank" rel="noreferrer" className="text-[10px] text-steel underline">Open ↗</a>
                 </div>
               </div>
               <div className="sm:col-span-2"><Info label="Custom tags" value={<div className="flex gap-2 flex-wrap">{active.custom_tags?.length ? active.custom_tags.map((t) => <Tag key={t}>{t}</Tag>) : <span className="text-steel">—</span>}</div>} /></div>
