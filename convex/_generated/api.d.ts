@@ -9,6 +9,7 @@
  */
 
 import type * as auth from "../auth.js";
+import type * as customers from "../customers.js";
 
 import type {
   ApiFromModules,
@@ -18,6 +19,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
+  customers: typeof customers;
 }>;
 
 /**
