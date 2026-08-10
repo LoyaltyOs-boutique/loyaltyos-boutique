@@ -1,4 +1,4 @@
-// In-browser persistence layer — mirrors the full relational schema (users, orders,
+  // In-browser persistence layer — mirrors the full relational schema (users, orders,
 // pointsLedger, reviews, campaigns, tickets, events). Swappable for a real
 // Express + Prisma backend later via the same function surface.
 //
@@ -147,6 +147,158 @@ export function forgotPassword(email, baseUrl) {
   });
 }
 
+/* ---------- Customer CRM → Convex bridge (Step 4.5, PRD Module 1) ---------- */
+// Contract parity: function names mirror convex/customers.ts (Step 4) so the
+// frontend surface stays identical. The components (Customers.jsx, Dashboard.jsx)
+// call customers()/getData()/derivedMetrics()/addStaffNote SYNCHRONOUSLY, so we
+// mirror the merchantLogin bridge pattern (Step 3.5): localStorage is the initial
+// render, and a background hydrate merges live Convex rows into state and emits —
+// the UI then re-renders with real backend data (e.g. Priya Sharma on
+// pleasant-cobra-560) WITHOUT any component edits.
+let crmHydrating = false;
+
+// Convex store note/measurement/date shapes differ slightly from local ones.
+const noteToLocal = (n) => ({
+  id: n.id || uid('n'),
+  text: n.text,
+  ts: n.date ? new Date(n.date).toISOString() : now(),
+  by: n.author || 'Owner',
+});
+
+// Map a Convex merchant customer row into the local user shape. For brand-new
+// Convex-only customers we fabricate the local-only fields (magic_token, chat…)
+// so every existing component feature (magic links, ledger, tags) keeps working.
+function toLocalCustomer(c) {
+  return {
+    id: c.id, convexId: c.id, _isConvex: true,
+    email: c.email ?? null,
+    mobile: c.mobile ?? '',
+    whatsapp: waDigits(c.mobile),
+    name: c.name,
+    points: c.points ?? 0,
+    tier: c.tier ?? 'silver',
+    birthday: c.birthday ?? null,
+    anniversary: c.anniversary ?? null,
+    custom_tags: c.custom_tags ?? [],
+    measurements: c.measurements ?? {},
+    staff_notes: (c.staff_notes || []).map(noteToLocal),
+    password_hash: null, magic_token: null, chat: [], location: null,
+    role: 'customer',
+  };
+}
+
+// Merge a single Convex customer sheet into state.users (idempotent). Matches by
+// convexId → mobile → name so a re-hydrate refreshes instead of duplicating.
+// Preserves the local id/magic_token/chat for UI features while stamping
+// convexId so mutations always target the real Convex doc.
+function mergeConvexCustomer(cvx, silent = false) {
+  if (!cvx || !cvx.id) return false;
+  const local = toLocalCustomer(cvx);
+  const idx = state.users.findIndex((u) =>
+    (u.convexId && u.convexId === cvx.id) ||
+    (u.mobile && cvx.mobile && waDigits(u.mobile) === waDigits(cvx.mobile)) ||
+    (u.name && cvx.name && String(u.name).trim().toLowerCase() === String(cvx.name).trim().toLowerCase())
+  );
+  if (idx >= 0) {
+    const prev = state.users[idx];
+    // Keep the local id (magic links/ledger) + local-only fields; take the
+    // authoritative CRM fields + convexId from the backend sheet.
+    state.users[idx] = {
+      ...prev,
+      ...local,
+      id: prev.id,
+      convexId: cvx.id,
+      password_hash: prev.password_hash,
+      magic_token: prev.magic_token,
+      whatsapp: prev.whatsapp || local.whatsapp,
+      chat: prev.chat || [],
+      location: prev.location,
+    };
+  } else {
+    state.users.push(local);
+  }
+  if (!silent) emit();
+  return true;
+}
+
+// Background hydrate (Step 4.5): pull the full customer list from Convex and
+// merge it into the local state. Components keep their synchronous contract —
+// initial render = localStorage seed, then emit() swaps in live Convex data.
+export function hydrateCustomers() {
+  if (crmHydrating) return;
+  const client = getConvex();
+  if (!client) return;
+  crmHydrating = true;
+  client.query(api.customers.getCustomers)
+    .then((rows) => {
+      crmHydrating = false;
+      if (!Array.isArray(rows)) return;
+      let changed = false;
+      for (const c of rows) changed = mergeConvexCustomer(c, true) || changed;
+      if (changed) emit();
+    })
+    .catch(() => { crmHydrating = false; /* offline — stay on localStorage seed */ });
+}
+// Re-hydrate when a customer spreadsheet mutation succeeds so the list reflects
+// the backend immediately. Returns the Convex sheet doc for chaining callers.
+function refreshFromConvexSheet(doc) {
+  mergeConvexCustomer(doc);
+  return doc;
+}
+
+/** Full customer list from Convex (async). Falls back to [] when offline/error. */
+export function getCustomers() {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.customers.getCustomers).catch(() => []);
+}
+
+/** Full customer profile by Convex id (async). Falls back to null when offline/error. */
+export function getCustomerById(id) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.customers.getCustomerById, { id }).catch(() => null);
+}
+
+// Resolve the Convex `Id<"users">` for a UI-facing userId → keeps mutations valid
+// for both hydrated Convex rows (convexId) and plain seed ids (passthrough).
+const convexUserId = (userId) => {
+  const u = state.users.find((x) => x.id === userId);
+  return (u && u.convexId) || userId;
+};
+
+/** Patch a customer's body-fit measurements on Convex (async). */
+export function updateMeasurements(userId, measurements) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.customers.updateMeasurements, { userId: convexUserId(userId), measurements })
+    .then((updated) => (updated ? refreshFromConvexSheet(updated) : updated))
+    .catch(() => null);
+}
+
+/** Replace a customer's custom tags on Convex (async). */
+export function updateCustomTags(userId, tags) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.customers.updateCustomTags, { userId: convexUserId(userId), tags })
+    .then((updated) => (updated ? refreshFromConvexSheet(updated) : updated))
+    .catch(() => null);
+}
+
+/** Delight Queue — customers with a birthday within the next `days` days (async). */
+export function getUpcomingBirthdays(days) {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.customers.getUpcomingBirthdays, { days }).catch(() => []);
+}
+
+/** Delight Queue — customers with an anniversary within the next `days` days (async). */
+export function getUpcomingAnniversaries(days) {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.customers.getUpcomingAnniversaries, { days }).catch(() => []);
+}
+
 /* ---------- Catalogue ---------- */
 export function allCatalogue() { return [...state.catalogueItems]; }
 export function addCatalogueItem({ title, price, image_url, instagram_link, source }) {
@@ -182,8 +334,19 @@ export function adjustPoints(userId, delta, reason) {
 export function addStaffNote(userId, text, by) {
   const user = state.users.find((u) => u.id === userId);
   if (!user) return;
+  // Local-first (Step 4.5): the UI contract is synchronous — render the note
+  // instantly, then persist it to Convex in the background and refresh the row.
   user.staff_notes = [{ id: uid('n'), text, ts: now(), by: by || 'Owner' }, ...user.staff_notes];
   emit();
+  const client = getConvex();
+  const convexId = user.convexId || (user._isConvex ? user.id : null);
+  if (client && convexId) {
+    try {
+      client.mutation(api.customers.addStaffNote, { userId: convexId, text, author: by || 'Owner' })
+        .then((updated) => { if (updated) refreshFromConvexSheet(updated); })
+        .catch(() => { /* offline — local note stays */ });
+    } catch { /* same */ }
+  }
 }
 
 /* ---------- Checkout ---------- */
@@ -388,3 +551,8 @@ export const waMessage = (user, magicLink) =>
 // can read `state` without a prior getData() call. Placed here — after `state` is
 // initialized to null — to avoid a temporal-dead-zone access inside load().
 state = load();
+// Step 4.5 CRM bridge: after the eager load, hydrate the customer list from
+// Convex in the background. Pages reading customers()/derivedMetrics() render
+// the localStorage seed instantly, then emit() swaps in the live Convex rows
+// (merchant CRM + Delight Desk) as soon as the query resolves.
+hydrateCustomers();
