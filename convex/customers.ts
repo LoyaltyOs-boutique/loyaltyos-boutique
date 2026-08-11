@@ -29,6 +29,11 @@ import type { Id } from "./_generated/dataModel";
  * AUTH NOTE: session-based auth gating (requireMerchant) is a follow-up when
  * the shared Convex auth middleware lands (Step 3 stores session_token but the
  * CRM step inherits the same un-gated surface as auth.ts for now).
+ *
+ * IMPROVEMENT 4 (WhatsApp number as UNIQUE key — Ma'am's rule):
+ *   ONE WhatsApp number = ONE customer profile. Convex has no native unique
+ *   constraint, so uniqueness is enforced in code: createCustomer checks the
+ *   by_mobile index first and refuses to insert a duplicate row.
  */
 
 type UserDoc = import("./_generated/dataModel").Doc<"users">;
@@ -236,5 +241,99 @@ export const getUpcomingAnniversaries = query({
       points: doc.points ?? 0,
       days_until: daysUntil,
     }));
+  },
+});
+
+/**
+ * IMPROVEMENT 4 — WhatsApp number as UNIQUE key for customers.
+ * Ma'am's rule: ONE WhatsApp number = ONE customer profile — prevent
+ * duplicate accounts from the same number. Convex has no native unique
+ * constraint, so uniqueness is enforced in code here (by_mobile index +
+ * explicit pre-insert check in createCustomer).
+ *
+ * Frontend wiring (Join/Onboarding) lands in a later step — these two
+ * functions are backend-only additions; the existing 7 CRM functions are
+ * untouched.
+ */
+
+/** Normalize a WhatsApp mobile number: trim + digits only. */
+function normalizeMobile(mobile: string): string {
+  return mobile.trim().replace(/\D/g, "");
+}
+
+/**
+ * Find a customer profile by their (normalized) WhatsApp number.
+ * Uses the by_mobile index and filters to role="customer".
+ * Returns the merchant view of the customer, or null when not found.
+ */
+export const findCustomerByMobile = query({
+  args: { mobile: v.string() },
+  handler: async (ctx, { mobile }) => {
+    const normalized = normalizeMobile(mobile);
+    if (!normalized) return null;
+    const doc = await ctx.db
+      .query("users")
+      .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
+      .filter((q) => q.eq(q.field("role"), "customer"))
+      .first();
+    return doc ? toMerchantCustomer(doc) : null;
+  },
+});
+
+/**
+ * Create a customer profile keyed by WhatsApp number.
+ *
+ * UNIQUE KEY CHECK — one WhatsApp number = ONE customer profile:
+ * queries users by the by_mobile index first. If ANY user (customer or
+ * merchant) already holds this mobile, returns { ok:false, error } and
+ * DOES NOT insert a duplicate row.
+ *
+ * On success returns { ok:true, id, customer } with the merchant view of
+ * the new profile (points: 0, tier: "silver").
+ */
+export const createCustomer = mutation({
+  args: {
+    mobile: v.string(),
+    name: v.string(),
+    birthday: v.optional(v.string()),
+    anniversary: v.optional(v.string()),
+    custom_tags: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags }) => {
+    const normalized = normalizeMobile(mobile);
+    if (!normalized) throw new Error("Mobile number is required.");
+    const customerName = name.trim();
+    if (!customerName) throw new Error("Customer name is required.");
+
+    // UNIQUE CHECK — block duplicate accounts from the same WhatsApp number.
+    const existing = await ctx.db
+      .query("users")
+      .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
+      .first();
+    if (existing) {
+      return {
+        ok: false,
+        error: "This WhatsApp number already has a profile",
+        existingId: existing._id,
+      };
+    }
+
+    // No existing profile — safe to insert the new customer.
+    const id = await ctx.db.insert("users", {
+      mobile: normalized,
+      name: customerName,
+      role: "customer",
+      points: 0,
+      tier: "silver",
+      ...(birthday ? { birthday: birthday.trim() } : {}),
+      ...(anniversary ? { anniversary: anniversary.trim() } : {}),
+      custom_tags: custom_tags ?? [],
+    });
+    const created = await ctx.db.get(id);
+    return {
+      ok: true,
+      id,
+      customer: created ? toMerchantCustomer(created) : null,
+    };
   },
 });
