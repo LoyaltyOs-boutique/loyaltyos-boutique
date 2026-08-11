@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import confetti from 'canvas-confetti';
 import { BRAND } from '../data/seed.js';
 import {
@@ -46,18 +46,37 @@ export default function Lookbook() {
   const [payMethod, setPayMethod] = useState('online');
   const [likeAnim, setLikeAnim] = useState(null);
 
+  const navigate = useNavigate();
+
   // Authenticate via magic link (query) or 180-day session
   useEffect(() => {
     const id = params.get('id');
     const token = params.get('token');
+
+    // Improvement 3b: Redirect to onboarding form if params are present but invalid/incomplete
+    if (id && !token) {
+      navigate(`/join?id=${id}`, { replace: true });
+      return;
+    }
     if (id && token) {
       const u = validateLookbook(id, token);
-      if (u) { saveCustomerSession(id, token); setCustomer(u); return; }
+      if (u) { 
+        saveCustomerSession(id, token); 
+        setCustomer(u); 
+        return; 
+      }
+      // Token invalid or customer not found — redirect to join with params preserved
+      navigate(`/join?id=${id}&token=${token}`, { replace: true });
+      return;
     }
+
+    // No params: check existing session
     const s = getCustomerSession();
     if (s) { const u = validateLookbook(s.id, s.token); if (u) { setCustomer(u); return; } }
+
+    // No params and no valid session: show invitation page (public landing)
     setDenied(true);
-  }, [params]);
+  }, [params, navigate]);
 
   const catalogue = useMemo(() => allCatalogue(), [db]);
   const reviewedItemIds = useMemo(

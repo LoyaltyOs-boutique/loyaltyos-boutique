@@ -1,16 +1,34 @@
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { onboardCustomer, waMessage, waDigits } from '../lib/db.js';
+import { onboardCustomer, waMessage, waDigits, customerById } from '../lib/db.js';
 import { COUNTRIES, BRAND } from '../data/seed.js';
 
 const input = 'w-full border border-line bg-white px-3 py-3 text-sm outline-none focus:border-ink transition-colors placeholder:text-steel/50';
 
 export default function Join() {
+  const [params] = useSearchParams();
+  // Improvement 3b: when the customer clicks a magic link / onboarding link the
+  // merchant sent, Lookbook redirects here with id/token preserved in the query.
+  // The standard onboarding form still works; we prefill when we can.
+  const fromLink = Boolean(params.get('id') || params.get('token'));
   const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India' });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+
+  // Prefill known fields when the link carries a customer id we already know.
+  useEffect(() => {
+    const id = params.get('id');
+    if (!id) return;
+    const existing = customerById(id);
+    if (!existing) return;
+    setF((prev) => ({
+      ...prev,
+      name: prev.name || existing.name || '',
+      whatsapp: prev.whatsapp || existing.mobile || existing.whatsapp || '',
+    }));
+  }, [params]);
 
   const submit = (e) => {
     e.preventDefault();
@@ -61,8 +79,12 @@ export default function Join() {
         <div className="text-center mb-8">
           <img src={BRAND.logo} alt="85 Lansdowne" className="h-9 object-contain mx-auto mb-4" />
           <div className="eyebrow mb-2">Private client access · 85 Lansdowne</div>
-          <h1 className="luxe-title text-3xl">Join our lookbook.</h1>
-          <p className="text-sm text-steel mt-3">Fill this once and we'll instantly create your personal boutique link — no password needed, ever.</p>
+          <h1 className="luxe-title text-3xl">{fromLink ? 'Complete your profile.' : 'Join our lookbook.'}</h1>
+          <p className="text-sm text-steel mt-3">
+            {fromLink
+              ? 'Welcome — just a moment to set up your private boutique profile, then your lookbook will open instantly.'
+              : "Fill this once and we'll instantly create your personal boutique link — no password needed, ever."}
+          </p>
         </div>
         <form onSubmit={submit} className="card p-6 space-y-4">
           <div>
