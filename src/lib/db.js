@@ -614,7 +614,12 @@ const genToken = () => {
 };
 export function waDigits(n) { return String(n || '').replace(/[^0-9]/g, ''); }
 
-export function onboardCustomer({ name, whatsapp, calling, birthday, anniversary, city, country, note }) {
+/**
+ * Core local onboarding: creates the customer row + a local magic token and
+ * returns { user, magicLink } — the synchronous contract the /join
+ * self-onboarding flow and same-browser demo rely on (shape is NEVER changed).
+ */
+function createLocalCustomer({ name, whatsapp, calling, birthday, anniversary, city, country, note }) {
   const existing = customers();
   let id = slugify(name);
   let n = 1;
@@ -644,6 +649,84 @@ export function onboardCustomer({ name, whatsapp, calling, birthday, anniversary
   emit();
   const magicLink = `/lookbook?id=${id}&token=${token}`;
   return { user, magicLink };
+}
+
+/** Synchronous local-only onboarding — used by the /join self-onboarding flow (KEEP UNCHANGED). */
+export function onboardCustomer(f) {
+  return createLocalCustomer(f);
+}
+
+/**
+ * Merchant Client Onboarding (magic-link fix): creates the customer on Convex
+ * (createCustomer — unique per WhatsApp number) and rotates a BACKEND-issued
+ * magic token (generateMagicToken). The returned link is keyed to the Convex
+ * user id, so the client can open their PERSONAL MODULE directly from ANY
+ * device — Lookbook.jsx validates via api.auth.validateMagicToken instead of
+ * the local-only sync check. Falls back to the local link when Convex is
+ * unreachable (same-browser demo keeps working).
+ */
+export async function onboardCustomerRemote(f) {
+  const client = getConvex();
+  if (!client) return createLocalCustomer(f);
+
+  const mobile = waDigits(f.whatsapp || f.calling);
+  try {
+    // One WhatsApp number = ONE profile (createCustomer refuses duplicates and
+    // returns the existing id — re-onboarding then just rotates the token).
+    const created = await client.mutation(api.customers.createCustomer, {
+      mobile,
+      name: (f.name || 'New Client').trim(),
+      ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
+      ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
+    });
+    const cvxId = created && (created.ok ? created.id : created.existingId);
+
+    // Rotate/issue the 256-bit magic token on Convex (180-day validity).
+    const linkRes = await client.mutation(api.auth.generateMagicToken, {
+      mobile,
+      ...(typeof location !== 'undefined' ? { baseUrl: location.origin } : {}),
+    });
+    if (!linkRes || !linkRes.user || !cvxId) return createLocalCustomer(f);
+
+    // Stamp a local row keyed by the CONVEX id so likes/checkout/ledger and
+    // the same-browser session all target the backend-backed customer. The
+    // result card preserves the merchant-entered city/country via fallback.
+    const synced = syncMagicLinkCustomer(linkRes.user, linkRes.token, cvxId, {
+      location: { city: f.city || '', country: f.country || 'India' },
+    });
+    if (!synced) return createLocalCustomer(f);
+    return {
+      user: synced,
+      magicLink: `/lookbook?id=${linkRes.user.id}&token=${linkRes.token}`,
+    };
+  } catch {
+    return createLocalCustomer(f); // offline / Convex error → same-browser local link (unchanged)
+  }
+}
+
+/**
+ * Upsert the local view of a Convex-validated customer, keyed by their Convex
+ * id, and stamp the validated magic token so this browser validates locally on
+ * subsequent visits (180-day session + instant likes/checkout). Returns the
+ * merged local-shaped row, or null when no id is available.
+ */
+export function syncMagicLinkCustomer(publicUser, token, cvxId, fallback) {
+  const id = String((publicUser && publicUser.id) || cvxId || '');
+  if (!id) return null;
+  const base = { ...toLocalCustomer({ ...publicUser, id }), magic_token: token, convexId: id };
+  const idx = state.users.findIndex((u) => u.id === id || u.convexId === id);
+  if (idx >= 0) {
+    state.users[idx] = {
+      ...state.users[idx],
+      ...base,
+      id,
+      location: state.users[idx].location || (fallback && fallback.location) || null,
+    };
+  } else {
+    state.users.push({ ...base, location: (fallback && fallback.location) || null });
+  }
+  emit();
+  return state.users.find((u) => u.id === id) || null;
 }
 export const waMessage = (user, magicLink) =>
   `Namaste ${(user.name || '').split(' ')[0]}, welcome to 85 Lansdowne 🖤 Your personal boutique link is ready — tap it when you're ready to browse:\n${location.origin}${magicLink}`;

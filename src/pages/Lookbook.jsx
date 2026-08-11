@@ -6,6 +6,7 @@ import {
   validateLookbook, getCustomerSession, saveCustomerSession, clearCustomerSession,
   allCatalogue, likeItem, checkout, submitGmbReview, submitProductReview,
   getData, subscribe, customerLedger,
+  validateMagicToken, syncMagicLinkCustomer,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import AccessDenied from './AccessDenied.jsx';
@@ -65,14 +66,35 @@ export default function Lookbook() {
         setCustomer(u); 
         return; 
       }
-      // Token invalid or customer not found — redirect to join with params preserved
-      navigate(`/join?id=${id}&token=${token}`, { replace: true });
+      
+      // Fallback: Validate against Convex for merchant-created clients (local-only
+      // check above may fail because the client exists in the Convex users table,
+      // not in this browser's localStorage). Convex validateMagicToken checks the
+      // 256-bit token + 180-day lifespan — on success we sync the backend customer
+      // into local state so likes/checkout/ledger target the right user, then open
+      // the module DIRECTLY (NO /join redirect).
+      validateMagicToken(id, token, Date.now()).then((res) => {
+        if (res && res.user) {
+          const synced = syncMagicLinkCustomer(res.user, token, res.user.id);
+          saveCustomerSession(id, token);
+          setCustomer(synced || res.user);
+        } else {
+          // Truly invalid token (id doesn't exist in Convex OR local) → join form
+          navigate(`/join?id=${id}&token=${token}`, { replace: true });
+        }
+      });
       return;
     }
 
     // No params: check existing session
     const s = getCustomerSession();
-    if (s) { const u = validateLookbook(s.id, s.token); if (u) { setCustomer(u); return; } }
+    if (s) { 
+      const u = validateLookbook(s.id, s.token); 
+      if (u) { 
+        setCustomer(u); 
+        return; 
+      }
+    }
 
     // No params and no valid session: show invitation page (public landing)
     setDenied(true);

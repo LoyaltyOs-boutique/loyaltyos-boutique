@@ -1,20 +1,26 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { onboardCustomer, waMessage, waDigits } from '../../lib/db.js';
+import { onboardCustomerRemote, waMessage, waDigits } from '../../lib/db.js';
 import { COUNTRIES, BRAND } from '../../data/seed.js';
 
 export default function Onboarding() {
   const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '' });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
+  const [creating, setCreating] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
 
-  const submit = (e) => {
+  // Magic-link fix: creates the client on Convex (ONE profile per WhatsApp
+  // number) and mints a backend-issued 256-bit token, so the client's personal
+  // module opens DIRECTLY from any device — no local-only validation.
+  const submit = async (e) => {
     e.preventDefault();
     if (!f.name.trim() || !f.whatsapp.trim()) return;
-    const res = onboardCustomer(f);
+    setCreating(true);
+    const res = await onboardCustomerRemote(f);
     setResult(res);
+    setCreating(false);
     setCopied(false);
     confetti({ particleCount: 120, spread: 90, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF'] });
   };
@@ -86,7 +92,9 @@ export default function Onboarding() {
               <label className="label">Staff note (optional)</label>
               <input className="input" value={f.note} onChange={set('note')} placeholder="e.g. prefers ivory & blushed tones" />
             </div>
-            <button className="btn-ink w-full" type="submit">Generate magic link</button>
+            <button className="btn-ink w-full" type="submit" disabled={creating}>
+              {creating ? 'Minting secure link…' : 'Generate magic link'}
+            </button>
           </form>
         </section>
 
