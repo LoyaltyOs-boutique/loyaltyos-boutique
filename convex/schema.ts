@@ -119,4 +119,19 @@ export default defineSchema({
     clicks_count: v.optional(v.number()),
     sent_at: v.optional(v.number()),
   }),
+
+  /**
+   * Step 5 — PRD §8 Settings (centralized).
+   * Singleton-per-key pattern: exactly ONE document per settings group,
+   * keyed by `key` ("tier_rules" | "templates" | "general"). `value` holds
+   * the full JSON payload for that group (defaults + overrides merged in
+   * convex/settings.ts). Upserted via the `by_key` index so the table stays
+   * bounded (max one row per known key) — scalable and simple for callers.
+   */
+  settings: defineTable({
+    key: v.string(), // "tier_rules" | "templates" | "general"
+    value: v.any(), // JSON payload for that settings group
+    updated_at: v.number(), // epoch ms — last write (mutations set Date.now())
+    updated_by: v.optional(v.string()), // actor identifier (e.g. merchant email) when known
+  }).index("by_key", ["key"]), // singleton lookup per settings group
 });
