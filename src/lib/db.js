@@ -1,4 +1,4 @@
-  // In-browser persistence layer — mirrors the full relational schema (users, orders,
+// In-browser persistence layer — mirrors the full relational schema (users, orders,
 // pointsLedger, reviews, campaigns, tickets, events). Swappable for a real
 // Express + Prisma backend later via the same function surface.
 //
@@ -434,10 +434,111 @@ export function createTicket({ ownerId, category, priority, message }) {
   emit();
   return t;
 }
+
+/* ---------- Settings → Convex bridge (Step 5.5, PRD §8) ---------- */
+// Contract parity: the Settings UI (Settings.jsx) calls saveTierSettings
+// SYNCHRONOUSLY with a per-tier patch { key: value } and reads
+// db.settings.tiers[tierKey][key]. So we keep that exact surface: local-first
+// render via emit(), then a background Convex write-through (mirroring the
+// merchantLogin bridge pattern from Step 3.5 and the CRM bridge from Step 4.5).
+// When online, api.settings.* (convex/settings.ts, pleasant-cobra-560) is the
+// source of truth; the localStorage copy is the offline/seed cache.
+
+// Compute the FULL UI-model loyalty_rules payload from local state — the exact
+// shape convex/settings.ts loyaltyRulesValidator accepts (tiers keyed by
+// global|silver|gold|platinum with purchasePercent/birthdayBonus/gmbPoints/
+// productReviewPoints/on). Missing tiers fall back to the seed defaults so the
+// backend always receives a complete, valid document.
+const loyaltyRulesPayload = () => ({
+  tiers: {
+    global: { ...(state.settings.tiers.global || {}) },
+    silver: { ...(state.settings.tiers.silver || {}) },
+    gold: { ...(state.settings.tiers.gold || {}) },
+    platinum: { ...(state.settings.tiers.platinum || {}) },
+  },
+});
+
+// Re-hydrate the local settings cache from the Convex merged settings doc
+// (background, after a write-through or hydrate succeeds). Keeps db.settings in
+// sync so components reading it synchronously always render the backend truth.
+function refreshSettingsFromConvex(merged) {
+  if (!merged || !merged.loyalty_rules || !merged.loyalty_rules.tiers) return false;
+  state.settings.tiers = merged.loyalty_rules.tiers;
+  emit();
+  return true;
+}
+
+/**
+ * Persist a tier-rule patch. SYNCHRONOUS local-first (the UI contract):
+ * update the in-memory/localStorage copy instantly, then write the full
+ * loyalty_rules payload to Convex in the background and refresh from the
+ * backend's merged response. Never breaks the UI when offline.
+ */
 export function saveTierSettings(tierKey, patch) {
   if (!state.settings.tiers[tierKey]) return;
   state.settings.tiers[tierKey] = { ...state.settings.tiers[tierKey], ...patch };
   emit();
+  const client = getConvex();
+  if (client) {
+    try {
+      client
+        .mutation(api.settings.updateSettings, { settings: loyaltyRulesPayload() })
+        .then((merged) => refreshSettingsFromConvex(merged))
+        .catch(() => { /* offline — local tier settings stay in effect */ });
+    } catch { /* same */ }
+  }
+}
+
+/**
+ * Seed the local settings cache from Convex (Step 5.5 hydration bridge).
+ * Called once on module load (like hydrateCustomers in Step 4.5): renders the
+ * localStorage seed instantly, then swaps in live Convex settings when the
+ * query resolves. If Convex has never had loyalty_rules written
+ * (updated_at.loyalty_rules === null), the local seed is written through to
+ * Convex so the backend becomes the source of truth with identical values.
+ */
+let settingsHydrating = false;
+export function hydrateSettings() {
+  if (settingsHydrating) return;
+  const client = getConvex();
+  if (!client) return;
+  settingsHydrating = true;
+  client.query(api.settings.getSettings)
+    .then((merged) => {
+      settingsHydrating = false;
+      if (!merged || !merged.loyalty_rules || !merged.loyalty_rules.tiers) return;
+      // First successful hydrate → if Convex was empty, seed it with local values
+      // so the settings page stays pixel-identical while Convex becomes the truth.
+      if (merged.updated_at && merged.updated_at.loyalty_rules === null) {
+        client.mutation(api.settings.updateSettings, { settings: loyaltyRulesPayload() })
+          .then((seeded) => { if (seeded) refreshSettingsFromConvex(seeded); })
+          .catch(() => { /* offline — keep seed */ });
+        return;
+      }
+      refreshSettingsFromConvex(merged);
+    })
+    .catch(() => { settingsHydrating = false; /* offline — stay on localStorage seed */ });
+}
+
+/** Full effective settings from Convex (async). Falls back to null when offline/error. */
+export function getSettings() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.settings.getSettings).catch(() => null);
+}
+
+/** Update a global WhatsApp message template on Convex (async, PRD §8). */
+export function updateTemplate(templateKey, text) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.settings.updateTemplate, { templateKey, text }).catch(() => null);
+}
+
+/** Restore defaults on Convex (async) — deletes all settings docs, defaults fallback. */
+export function resetSettings() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.settings.resetSettings).catch(() => null);
 }
 
 /* ---------- Derived ---------- */
@@ -556,3 +657,8 @@ state = load();
 // the localStorage seed instantly, then emit() swaps in the live Convex rows
 // (merchant CRM + Delight Desk) as soon as the query resolves.
 hydrateCustomers();
+// Step 5.5 Settings bridge: hydrate loyalty_rules from Convex in the background
+// too. /merchant/settings renders the localStorage seed instantly, then swaps
+// in the live Convex settings (with a seed-on-first-hydrate when Convex is
+// empty) — same hydration approach as the CRM bridge above.
+hydrateSettings();

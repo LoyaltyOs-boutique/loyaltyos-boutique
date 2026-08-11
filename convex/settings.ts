@@ -2,36 +2,39 @@ import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/s
 import { v } from "convex/values";
 
 /**
- * LoyaltyOS Boutique — Centralized Settings backend (Step 5, PRD §8)
+ * LoyaltyOS Boutique — Centralized Settings backend (Step 5 + Step 5.5, PRD §8)
  * Source        : PRD §8 Settings (editable loyalty tiers, point redemption
  *                 value, store details, global message templates)
  * Design spec   : docs/superpowers/specs/2026-08-06-loyaltyos-design.md
  *                 (Decision #5 — "Merchant can tune thresholds in Settings
  *                 without schema changes")
  * Amendment     : docs/superpowers/specs/2026-08-07-convex-amendment-design.md
- *                 (Loyalty Rules Engine table: earning rate, tiers, bonuses)
+ *                 (Express/PG → Convex)
+ * Step 5.5      : Aligns the backend to the ACTUAL merchant Settings UI model
+ *                 (src/pages/merchant/Settings.jsx) — per-tier loyalty rules
+ *                 (purchasePercent / birthdayBonus / gmbPoints /
+ *                 productReviewPoints / on) with a "global" fallback tier.
+ *                 The UI is the source of the model; the backend adapts.
  *
  * ARCHITECTURE (scalable + clean):
  *   - Singleton-per-key pattern: the `settings` table holds at most ONE
- *     document per settings group (`tier_rules` | `templates` | `general`),
- *     looked up via the `by_key` index. Bounded table — never grows with
- *     usage, no unbounded list fields.
- *   - Defaults as the single source of truth: DEFAULT_TIERS and
- *     DEFAULT_TEMPLATES live here (exported). getSettings merges stored
- *     overrides on top of defaults, so the config is COMPLETE even when the
- *     DB is empty (fresh deployment → defaults fallback). Stored wins.
+ *     document per settings group (`loyalty_rules` | `templates`), looked up
+ *     via the `by_key` index. Bounded table — never grows with usage.
+ *   - Defaults as the single source of truth: DEFAULT_SETTINGS (mirrors the
+ *     approved seed values in src/data/seed.js) and DEFAULT_TEMPLATES live
+ *     here (exported). getSettings merges stored overrides on top of the
+ *     defaults, so the config is COMPLETE even when the DB is empty (fresh
+ *     deployment → defaults fallback). Stored wins.
  *   - Upsert helper centralizes the get-or-patch/get-or-insert logic — one
  *     implementation, reused by every settings mutation (no duplication).
  *   - Read merge is shared: getSettings and every mutation return the same
  *     merged shape via readMergedSettings(), so callers always get the full
  *     effective config after a write.
  *
- * CURRENCY INVARIANT (Global Constraint): all money/earning fields are
- * INTEGER PAISE. `earnPer100Paise` = 10,000 → 1 pt per ₹100 (Task 2).
- *
- * TIER ENUM: stored tier keys follow the schema enum
- * (silver | gold | platinum); display labels (Silver/Gold/Platinum) are
- * configurable per tier below.
+ * TIER MODEL (Step 5.5): stored keys follow the Settings UI enum
+ * (global | silver | gold | platinum). `global` is the fallback rule used by
+ * the points engine when a tier has no override; `on` (boolean) enables a
+ * tier's own rule set in the UI.
  */
 
 // ============================================================================
@@ -44,95 +47,111 @@ import { v } from "convex/values";
  * for store details / point redemption value per PRD §8).
  */
 export const SETTINGS_KEYS = {
-  TIER_RULES: "tier_rules",
+  LOYALTY_RULES: "loyalty_rules",
   TEMPLATES: "templates",
-  GENERAL: "general",
 } as const;
 
 /** Union type of the known settings group keys. */
 export type SettingsKey = (typeof SETTINGS_KEYS)[keyof typeof SETTINGS_KEYS];
 
 // ============================================================================
-// SECTION 2 — Tier rules (PRD §8 + design spec Decision #5)
+// SECTION 2 — Loyalty rules (the merchant Settings UI model, Step 5.5)
 // ============================================================================
 
-/** Tier keys — match the users.tier schema enum (silver | gold | platinum). */
-export const TIER_KEYS = ["silver", "gold", "platinum"] as const;
+/** Tier keys — match the Settings UI tabs (global default + three tiers). */
+export const TIER_KEYS = ["global", "silver", "gold", "platinum"] as const;
 
-/** Union type of the loyalty tier keys. */
+/** Union type of the loyalty rule tier keys. */
 export type TierKey = (typeof TIER_KEYS)[number];
 
 /**
- * A single loyalty tier rule.
+ * A single loyalty rule group — the exact shape the Settings UI edits.
+ * All fields optional so partial patches merge cleanly over the defaults.
  *
- * @field label            — display label (e.g. "Silver").
- * @field multiplier       — points earning multiplier (1x / 1.5x / 2x).
- * @field earnPer100Paise  — points earned per ₹100 (10,000 paise) spent.
- * @field minPoints        — minimum points required to reach this tier.
+ * @field purchasePercent     — points earned per ₹100 of order value (e.g. 5 → 5 pts/₹100).
+ * @field birthdayBonus       — flat bonus points awarded on a customer's birthday.
+ * @field gmbPoints           — bonus points per approved Google review.
+ * @field productReviewPoints — bonus points per in-app product review.
+ * @field on                  — UI toggle; true → the tier's own rule set applies
+ *                              (silver/gold/platinum only — global is always on).
  */
-export interface TierConfig {
-  label: string;
-  multiplier: number;
-  earnPer100Paise: number;
-  minPoints: number;
-}
+export const tierRuleValidator = v.object({
+  purchasePercent: v.optional(v.number()),
+  birthdayBonus: v.optional(v.number()),
+  gmbPoints: v.optional(v.number()),
+  productReviewPoints: v.optional(v.number()),
+  on: v.optional(v.boolean()),
+});
 
-/**
- * Validator for a partial tier-config override sent by the merchant.
- * All fields optional — only the provided fields are patched onto the
- * existing (default or stored) tier rule.
- */
-export const tierConfigOverrideValidator = v.object({
-  label: v.optional(v.string()),
-  multiplier: v.optional(v.number()),
-  earnPer100Paise: v.optional(v.number()),
-  minPoints: v.optional(v.number()),
+/** Validator for the complete `loyalty_rules` payload the Settings UI sends. */
+export const loyaltyRulesValidator = v.object({
+  tiers: v.object({
+    global: v.object({
+      purchasePercent: v.optional(v.number()),
+      birthdayBonus: v.optional(v.number()),
+      gmbPoints: v.optional(v.number()),
+      productReviewPoints: v.optional(v.number()),
+    }),
+    silver: tierRuleValidator,
+    gold: tierRuleValidator,
+    platinum: tierRuleValidator,
+  }),
 });
 
 /**
- * DEFAULT TIERS — board-approved defaults.
- * Mirrors the Task 2 points engine: ₹100 = 1 pt (10,000 paise), tier bands
- * 0–999 / 1000–2999 / 3000+, multipliers 1x / 1.5x / 2x.
- * (Design spec display names Ivory/Champagne/Noir ↔ stored silver/gold/
- *  platinum enum per schema.)
+ * DEFAULT SETTINGS — board-approved defaults, mirroring the seed values in
+ * src/data/seed.js so a fresh deployment renders identically to the demo.
  */
-export const DEFAULT_TIERS: Record<TierKey, TierConfig> = {
-  silver: { label: "Silver", multiplier: 1, earnPer100Paise: 10000, minPoints: 0 },
-  gold: { label: "Gold", multiplier: 1.5, earnPer100Paise: 10000, minPoints: 1000 },
-  platinum: { label: "Platinum", multiplier: 2, earnPer100Paise: 10000, minPoints: 3000 },
+export const DEFAULT_SETTINGS: {
+  tiers: Record<
+    TierKey,
+    {
+      purchasePercent: number;
+      birthdayBonus: number;
+      gmbPoints: number;
+      productReviewPoints: number;
+      on?: boolean;
+    }
+  >;
+} = {
+  tiers: {
+    global: { purchasePercent: 5, birthdayBonus: 200, gmbPoints: 500, productReviewPoints: 150 },
+    silver: { purchasePercent: 4, birthdayBonus: 150, gmbPoints: 400, productReviewPoints: 100, on: true },
+    gold: { purchasePercent: 5, birthdayBonus: 200, gmbPoints: 500, productReviewPoints: 150, on: true },
+    platinum: { purchasePercent: 7, birthdayBonus: 350, gmbPoints: 750, productReviewPoints: 250, on: true },
+  },
 };
 
 /**
- * Merge stored tier overrides over the defaults.
+ * Merge stored loyalty-rule overrides over the defaults.
  * Per-tier shallow merge — only known fields of the correct type are copied,
  * so a corrupt/invalid stored payload can never break the config.
  */
-function mergeTierRules(
-  stored: Partial<Record<TierKey, Partial<TierConfig>>> | undefined,
-): Record<TierKey, TierConfig> {
-  const merged = { ...DEFAULT_TIERS } as Record<TierKey, TierConfig>;
+function mergeLoyaltyRules(
+  stored: Partial<Record<TierKey, Record<string, unknown>>> | undefined,
+): typeof DEFAULT_SETTINGS["tiers"] {
+  const merged: typeof DEFAULT_SETTINGS["tiers"] = {
+    ...DEFAULT_SETTINGS.tiers,
+    silver: { ...DEFAULT_SETTINGS.tiers.silver },
+    gold: { ...DEFAULT_SETTINGS.tiers.gold },
+    platinum: { ...DEFAULT_SETTINGS.tiers.platinum },
+  };
   if (!stored) return merged;
   for (const key of TIER_KEYS) {
     const override = stored[key];
     if (!override || typeof override !== "object") continue;
-    merged[key] = {
-      label:
-        typeof override.label === "string"
-          ? override.label
-          : DEFAULT_TIERS[key].label,
-      multiplier:
-        typeof override.multiplier === "number"
-          ? override.multiplier
-          : DEFAULT_TIERS[key].multiplier,
-      earnPer100Paise:
-        typeof override.earnPer100Paise === "number"
-          ? override.earnPer100Paise
-          : DEFAULT_TIERS[key].earnPer100Paise,
-      minPoints:
-        typeof override.minPoints === "number"
-          ? override.minPoints
-          : DEFAULT_TIERS[key].minPoints,
-    };
+    const target = merged[key];
+    // Numeric fields — copy only when a valid number is provided.
+    for (const numField of ["purchasePercent", "birthdayBonus", "gmbPoints", "productReviewPoints"] as const) {
+      const val = (override as Record<string, unknown>)[numField];
+      if (typeof val === "number") {
+        (target as Record<string, unknown>)[numField] = val;
+      }
+    }
+    // Boolean toggle — copy only when a valid boolean is provided.
+    if (typeof override.on === "boolean") {
+      target.on = override.on;
+    }
   }
   return merged;
 }
@@ -239,28 +258,30 @@ async function upsertSettings(
  * The effective (merged) settings — the single response shape for
  * getSettings and every settings mutation.
  *
- * The settings table is bounded by design (one doc per known key, ~3 rows),
+ * The settings table is bounded by design (one doc per known key, ~2 rows),
  * so `.collect()` is safe here and the table cannot grow with usage.
  */
 async function readMergedSettings(ctx: QueryCtx | MutationCtx) {
   const docs = await ctx.db.query("settings").collect();
   const byKey = new Map(docs.map((doc) => [doc.key, doc.value]));
 
-  const tierStored = byKey.get(SETTINGS_KEYS.TIER_RULES) as
-    | Partial<Record<TierKey, Partial<TierConfig>>>
+  const storedRules = byKey.get(SETTINGS_KEYS.LOYALTY_RULES) as
+    | Partial<Record<TierKey, Record<string, unknown>>>
     | undefined;
   const templateStored = byKey.get(SETTINGS_KEYS.TEMPLATES) as
     | Partial<Record<TemplateKey, string>>
     | undefined;
 
   return {
-    tier_rules: mergeTierRules(tierStored),
+    loyalty_rules: {
+      tiers: mergeLoyaltyRules(storedRules),
+    },
     templates: mergeTemplates(templateStored),
     // Last-write timestamps per group (epoch ms) — null when never customized.
     updated_at: {
-      tier_rules:
-        byKey.has(SETTINGS_KEYS.TIER_RULES)
-          ? docs.find((d) => d.key === SETTINGS_KEYS.TIER_RULES)!.updated_at
+      loyalty_rules:
+        byKey.has(SETTINGS_KEYS.LOYALTY_RULES)
+          ? docs.find((d) => d.key === SETTINGS_KEYS.LOYALTY_RULES)!.updated_at
           : null,
       templates:
         byKey.has(SETTINGS_KEYS.TEMPLATES)
@@ -277,7 +298,7 @@ async function readMergedSettings(ctx: QueryCtx | MutationCtx) {
 /**
  * Get the complete effective settings.
  * Merges stored overrides over defaults — ALWAYS returns the full config
- * (tier_rules + templates), even when the DB is empty (defaults fallback).
+ * (loyalty_rules + templates), even when the DB is empty (defaults fallback).
  */
 export const getSettings = query({
   args: {},
@@ -285,46 +306,31 @@ export const getSettings = query({
 });
 
 /**
- * Update a single tier's config (partial patch, e.g. { multiplier: 2 }).
- * Validates that numeric fields are provided as numbers and non-negative,
- * persists the override as a singleton `tier_rules` doc, and returns the
- * new merged settings.
+ * Update the merchant loyalty rules (Step 5.5) — the exact payload shape the
+ * Settings UI edits. Persists as a singleton `loyalty_rules` doc and returns
+ * the new merged settings.
  */
-export const updateTierConfig = mutation({
+export const updateSettings = mutation({
   args: {
-    tierKey: v.union(
-      v.literal("silver"),
-      v.literal("gold"),
-      v.literal("platinum"),
-    ),
-    config: tierConfigOverrideValidator,
+    settings: loyaltyRulesValidator,
   },
-  handler: async (ctx, { tierKey, config }) => {
-    // Semantic validation on top of the type validator.
-    if (config.multiplier !== undefined && config.multiplier < 0) {
-      throw new Error("Multiplier must be zero or greater.");
-    }
-    if (config.minPoints !== undefined && config.minPoints < 0) {
-      throw new Error("minPoints must be zero or greater.");
-    }
-    if (config.earnPer100Paise !== undefined && config.earnPer100Paise < 0) {
-      throw new Error("earnPer100Paise must be zero or greater.");
+  handler: async (ctx, { settings }) => {
+    // Keep only the known tier keys + known numeric keys so a malformed
+    // client payload can never pollute the stored document.
+    const nextValue: Partial<Record<TierKey, Record<string, unknown>>> = {};
+    for (const key of TIER_KEYS) {
+      const tier = settings.tiers[key] as Record<string, unknown> | undefined;
+      if (!tier) continue;
+      const clean: Record<string, unknown> = {};
+      for (const numField of ["purchasePercent", "birthdayBonus", "gmbPoints", "productReviewPoints"] as const) {
+        const val = tier[numField];
+        if (typeof val === "number") clean[numField] = val;
+      }
+      if (typeof tier.on === "boolean") clean.on = tier.on;
+      if (Object.keys(clean).length > 0) nextValue[key] = clean;
     }
 
-    // Merge onto the currently stored tier_rules payload (if any).
-    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.TIER_RULES);
-    const stored = existing?.value as
-      | Partial<Record<TierKey, Partial<TierConfig>>>
-      | undefined;
-    const nextValue: Partial<Record<TierKey, Partial<TierConfig>>> = {
-      ...(stored ?? {}),
-      [tierKey]: {
-        ...(stored?.[tierKey] ?? {}),
-        ...config,
-      },
-    };
-
-    await upsertSettings(ctx, SETTINGS_KEYS.TIER_RULES, nextValue);
+    await upsertSettings(ctx, SETTINGS_KEYS.LOYALTY_RULES, nextValue);
     return readMergedSettings(ctx);
   },
 });
@@ -360,7 +366,7 @@ export const updateTemplate = mutation({
 
 /**
  * Restore defaults: delete every settings document.
- * getSettings then falls back to DEFAULT_TIERS + DEFAULT_TEMPLATES, so the
+ * getSettings then falls back to DEFAULT_SETTINGS + DEFAULT_TEMPLATES, so the
  * config returned afterwards is exactly the board-approved defaults.
  */
 export const resetSettings = mutation({
