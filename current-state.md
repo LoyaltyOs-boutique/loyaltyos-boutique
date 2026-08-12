@@ -12,6 +12,7 @@
 - memory-bank sync (58fab8a)
 - amendment complete (b7a1d2c)
 - ledger rules (5431d99)
+- baseline tag v1-baseline + current-state.md (edc5f63) - HEAD
 
 ## NEXT (ordered)
 1. Step 6 Lookbook Catalogue + Join wiring

@@ -6,7 +6,7 @@
 |---|---|---|
 | Backend | **Convex** (serverless TS) | Deployment `pleasant-cobra-560.eu-west-1.convex.cloud`; team `loyaltyos-boutique`; queries/mutations/actions all run as transactions |
 | Database | **Convex document DB** | Tables in `convex/schema.ts`; indexes + realtime subscribe built in; no Redis needed |
-| Auth | **Convex Auth** | `convex/auth.ts` — passkeys/OTP/email-link for merchant + customer auth |
+| Auth | **Custom Convex functions** | `convex/auth.ts` — bcrypt merchant login, magic-link 180-day, Resend password reset, anti-enumeration |
 | Frontend | React 18 + Vite 5.4.21 + Tailwind 3 | Existing `src/`; Ma'am's UI — **27.74 kB luxury CSS, minimal edits** |
 | Styling tokens | BG `#F8F6F3`, panel `#FFFFFF`, border `#EDEBE7`, gold `#C5A880`, ink `#111111` | DM Sans (UI) + Playfair Display (headings) |
 | Email | **Resend** | From `digital@mouldinnovation.com`; domain `mouldinnovation.com` verified via Cloudflare DNS |
@@ -35,7 +35,7 @@
 |---|---|
 | Earn | 1 pt per ₹100 |
 | Redeem | 1 pt = ₹1 (configurable) |
-| Ivory / Champagne / Noir | 0–999 (1x) / 1000–2999 (1.5x) / 3000+ (2x) |
+| silver / gold / platinum | 1x / 1.5x / 2x multiplier, minPoints 0 / 1000 / 3000 (ivory/champagne/noir are display labels only) |
 | Review / GMB / Testimonial | +150 / +300 / ₹500 credit |
 | Birthday / Referral | +500 / +300 |
 

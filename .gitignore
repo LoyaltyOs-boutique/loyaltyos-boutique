@@ -4,3 +4,6 @@ dist
 .env
 .env.local
 superpowers.zip
+*.log
+preview.*
+test-tmp/

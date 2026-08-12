@@ -14,12 +14,12 @@
 | 2 | Points engine service (TDD) | ✅ Complete (`e2ff5b9`, 30/30 tests) |
 | 3 | Auth middleware + merchant login | ✅ Superseded — done as Step 3 on Convex |
 | 4 | Dashboard endpoints | ⏳ Pending (Step 4+) |
-| 5 | Customers (CRM) CRUD + confidential records | ⏳ Pending (Step 4, Module 1) |
+| 5 | Customers (CRM) CRUD + confidential records | ✅ Complete (Steps 4 + 4.5, commits 87d6c68 + a53958a) |
 | 6 | Atomic order creation + points accrual/redemption | ⏳ Pending (Step 7, Module 7) |
 | 7 | Settings endpoints | ✅ Complete (Steps 5 + 5.5) |
 | 8 | Insights endpoints | ⏳ Pending |
 | 9 | Campaigns + reach estimation + send | ⏳ Pending |
-| 10 | Lookbooks + import stubs | ⏳ Pending (Step 5, Module 2) |
+| 10 | Lookbooks + import stubs | ⏳ Pending (Step 6, Module 2) |
 | 11 | Customer Portal API | ⏳ Pending |
 | 12 | Frontend scaffold (Vite PWA, tokens, routing) | ✅ Complete (Phase 0, Ma'am's frontend intact) |
 | 13 | Frontend: Dashboard, Settings, Portal home | ⏳ Pending |
