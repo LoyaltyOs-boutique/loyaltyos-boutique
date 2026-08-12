@@ -17,3 +17,15 @@ LEDGER RULES (STRICT): One line per task. Format: 'Task <N>: complete (commits <
 BANNED PHRASES in ledger: 'untouched', 'intact', 'zero edits' - unless accompanied by actual git diff --stat output (e.g. 'git diff v1-baseline..HEAD -- src/ | wc -l = 0').
 Every 'tester verified' claim MUST name the exact command run + paste its output.
 Verification is DIFF-SCOPED: backend-only step -> no frontend build; small UI change -> no convex run suite.
+
+# NEW HARD RULES (2026-08-12)
+
+ASK-BEFORE-EDIT RULE: Before editing ANY file, list the exact files you will change and get user confirmation. Unless user explicitly said 'proceed without asking'.
+
+LEDGER-COMPLETE RULE: A task is NOT complete until committed with a hash AND both ledgers (memory-bank/progress.md + .superpowers/sdd/progress.md) have an entry naming that hash.
+
+NO-REDO RULE: When starting a new session, FIRST read current-state.md. If task already completed per current-state/ledger, DO NOT redo it. Proceed to next incomplete item.
+
+NO-UNREQUESTED-WORK RULE: Do NOT create extra files (e2e scripts, temp logs, design docs) unless asked. Delete temp files before finishing.
+
+DUPLICATE-CHECK RULE: Before committing ledger updates, verify no duplicate 'Task .*: complete' lines exist.
