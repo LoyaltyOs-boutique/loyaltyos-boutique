@@ -12,3 +12,8 @@ Whenever user gives ANY new project/folder in future:
 6. Never start coding without HARD-GATE approval
 
 This rule applies to ALL future projects. This is standing instruction from Ma'am.
+
+LEDGER RULES (STRICT): One line per task. Format: 'Task <N>: complete (commits <base7>..<head7>, review clean)'. No duplicate lines - check with: grep -c 'Task .*: complete' .superpowers/sdd/progress.md must equal unique task count.
+BANNED PHRASES in ledger: 'untouched', 'intact', 'zero edits' - unless accompanied by actual git diff --stat output (e.g. 'git diff v1-baseline..HEAD -- src/ | wc -l = 0').
+Every 'tester verified' claim MUST name the exact command run + paste its output.
+Verification is DIFF-SCOPED: backend-only step -> no frontend build; small UI change -> no convex run suite.
