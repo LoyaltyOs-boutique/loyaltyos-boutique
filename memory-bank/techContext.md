@@ -1,25 +1,33 @@
 # Tech Context — LoyaltyOS
 
-## Tech Stack (approved in design spec)
+## Current Tech Stack (post 2026-08-07 Convex amendment)
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Frontend | React 18 + TypeScript (Vite, PWA) | Zustand state; Recharts charts; Tailwind with luxury tokens |
+| Backend | **Convex** (serverless TS) | Deployment `pleasant-cobra-560.eu-west-1.convex.cloud`; team `loyaltyos-boutique`; queries/mutations/actions all run as transactions |
+| Database | **Convex document DB** | Tables in `convex/schema.ts`; indexes + realtime subscribe built in; no Redis needed |
+| Auth | **Convex Auth** | `convex/auth.ts` — passkeys/OTP/email-link for merchant + customer auth |
+| Frontend | React 18 + Vite 5.4.21 + Tailwind 3 | Existing `src/`; Ma'am's UI — **27.74 kB luxury CSS, minimal edits** |
 | Styling tokens | BG `#F8F6F3`, panel `#FFFFFF`, border `#EDEBE7`, gold `#C5A880`, ink `#111111` | DM Sans (UI) + Playfair Display (headings) |
-| Backend | Node.js 20 + Express (REST) | JWT merchant auth; OTP/passwordless customer portal |
-| Database | PostgreSQL 16 | Atomic order+points transactions; DDL in `PRD.md` §6 |
-| Cache/session | Redis | Sessions, campaign reach cache, rate limiting |
-| Integrations | WhatsApp Business API, Razorpay, GMB, Instagram Graph, S3-compatible storage | v1: WhatsApp + Razorpay primary; IG/CSV/PDF import stubs |
-| Deploy | Docker Compose → VPS | Caddy/Nginx HTTPS; nightly pg_dump |
+| Email | **Resend** | From `digital@mouldinnovation.com`; domain `mouldinnovation.com` verified via Cloudflare DNS |
+| Deploy | **Vercel** (`loyaltyos-boutique-three.vercel.app`) + **GitHub** (`LoyaltyOs-boutique/loyaltyos-boutique`) | Frontend statics on Vercel; Convex cloud manages DB/functions/HTTPS |
+| File storage | Convex file storage | Campaign creatives (replaces S3 stub) |
+
+### Superseded / Archived
+
+> **Express/PostgreSQL/Redis/Docker stack is ARCHIVED.** The original self-hosted
+> Node.js 20 + Express (REST) + PostgreSQL 16 + Redis + Docker Compose → VPS design
+> was **superseded 2026-08-07** by the approved Convex amendment
+> (`docs/superpowers/specs/2026-08-07-convex-amendment-design.md`, Design Decisions #2, #3, #8).
+> Do not reintroduce express/PG/Redis/Docker config for new work.
 
 ## Key Technical Invariants
 
-- Order creation, points accrual, redemption: **one DB transaction** (atomic).
+- Billing + points accrual/redemption: **atomic in one DB transaction** — a Convex mutation runs as a single transaction.
 - `points_transactions` immutable ledger; balance derived with `balance_after`.
-- Money stored as `NUMERIC(12,2)` — never floats.
+- Money stored as fixed-point (₹ in paise / decimal) — never floats.
 - `staff_notes` + `customer_measurements` confidential — merchant routes only.
-- POS works offline via PWA + local queue, synced when back online.
-- Client search < 300 ms @ 10k customers; dashboard < 1 s.
+- Customers unique by mobile number (`mobile-unique` constraint in Convex schema).
 
 ## Loyalty Rule Constants (from spec/PRD)
 
@@ -31,13 +39,17 @@
 | Review / GMB / Testimonial | +150 / +300 / ₹500 credit |
 | Birthday / Referral | +500 / +300 |
 
-## Environment Variables (`apps/api/.env.example`)
+## Environment / Secrets
 
-`DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, `JWT_REFRESH_SECRET`, `WHATSAPP_TOKEN`, `RAZORPAY_KEY`; web: `VITE_API_URL`.
+- `VITE_CONVEX_URL` → `https://pleasant-cobra-560.eu-west-1.convex.cloud`
+- `.env.local` (gitignored — secrets never committed)
+- Convex deployment env vars for Resend API key
 
 ## Development Setup
 
 ```bash
-docker compose up -d db redis
-cd apps/api && npm install && npm test
-cd apps/web && npm install && npm run dev
+npm install
+npx convex dev          # runs local + links Convex deployment
+npm run dev             # Vite dev server
+npx convex deploy       # deploy backend functions
+npm run build           # Vite build (CSS stays ~27.74 kB)

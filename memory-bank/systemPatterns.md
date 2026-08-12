@@ -2,23 +2,31 @@
 
 ## Architecture Pattern
 
-Monorepo: `apps/api` (Express REST) + `apps/web` (React 18 PWA) + `docker-compose.yml` (PostgreSQL 16 + Redis 7). API routes grouped by domain (auth, dashboard, customers, lookbooks, campaigns, orders, insights, settings, portal, webhooks); pure logic in `services/` (points engine, reach estimator, WhatsApp wrapper, ledger).
+Single Vite app (`src/` React 18 + Tailwind 3) + **Convex** backend (`convex/`). No monorepo, no Express, no PostgreSQL, no Redis, no Docker. Frontend calls Convex functions directly via the Convex client; Vercel hosts frontend statics, Convex cloud hosts DB/functions/HTTPS.
+
+## Convex Function Patterns
+
+- **query** — reads only; reactive (frontend `useQuery` subscribes to live data). Used for dashboard, customer lists, settings, lookbooks.
+- **mutation** — writes; runs as a single atomic transaction. Billing + points accrual/redemption happen inside one mutation so an order/points pair can never diverge.
+- **action** — for external side-effects not allowed inside transactions: **external fetch** (e.g., WhatsApp API, gateway calls, Resend email send via `fetch`/SDK).
 
 ## Data Patterns
 
-- **Points are authoritative in `customers.points`**; `points_transactions` entries written atomically in the same transaction as the order — a points/order pair can never diverge.
-- **Tier is computed** from points against `tiers` ranges (or maintained by trigger); thresholds editable in Settings.
-- **Confidentiality:** `staff_notes` + `customer_measurements` read only by merchant routes; customer portal exposes read-only measurement slice, never notes.
-- **Money:** `NUMERIC(12,2)`, never floats.
-- **Reserved orders** (`orders.status = 'Reserved'`) support the portal "Reserve & Pay in Store" flow.
+- **Customers are unique by mobile number** (`mobile-unique` constraint in `convex/schema.ts`) — single customer record per phone.
+- **Settings are singleton-per-key** (`convex/settings.ts`) — one doc per settings key, upserted by key.
+- **Points/ledger:** `points_transactions` immutable ledger; balance derived with `balance_after`. Write path is a single Convex mutation (atomic).
+- **Confidentiality:** `staff_notes` + `customer_measurements` exposed only via merchant queries; customer portal never returns notes.
+- **Money:** fixed-point (₹ in paise / decimal), never floats.
+- **Reserved orders** support the portal "Reserve & Pay in Store" flow.
 
 ## Workflow Patterns (spec-driven)
 
 1. **HARD-GATE:** no code until design presented and approved by user. Applies to EVERY project regardless of perceived simplicity.
-2. **Spec → Plan → Execute:** approved spec saved to `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` and committed; implementation plan saved to `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` with Global Constraints copied verbatim; execute per task (TDD: failing test → pass → commit).
-3. **Ledger for memory:** progress tracked in `.superpowers/sdd/progress.md` with exact line formats — `Task <N>: complete (commits <base7>..<head7>, review clean)`, `Task <N>: fix round <R>/5 (...)`, `Task <N>: minor (deferred): ...`, `Task <N>: parked — ...`, `Task <N>: BLOCKED — ...`. A task is DONE iff it has a `Task <N>: complete` line. Trust the ledger and `git log` over recollection.
-4. **Every new project/folder:** FIRST scan for spec-driven compliance (`.clinerules`, `.superpowers/sdd/progress.md`, `docs/superpowers/specs/`, `docs/superpowers/plans/`, `memory-bank/`, git repo). If NOT spec-driven or < 50% spec-driven, FIRST clone and convert to spec-driven (create `.clinerules`, ledger, specs/, plans/, memory-bank 6 files, `.worklogs/`, `tasks.md`, git init).
-5. **Verification steps in every plan task:** run command + expected output.
+2. **Spec → Plan → Ledger → TDD:** approved spec saved to `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` (with Design Decisions table) and committed; implementation plan saved to `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` with Global Constraints copied verbatim; execute per task — failing test → pass → commit.
+3. **Findability for Codegen:** short targeted list of source file paths (e.g. `convex/schema.ts`, `convex/customers.ts`, `convex/settings.ts`, `convex/auth.ts`) to check if task falls under any existing spec/feature.
+4. **Ledger for memory — CANONICAL:** progress is tracked in `.superpowers/sdd/progress.md` with exact line formats — `Task <N>: complete (commits <base7>..<head7>, review clean)`, `Task <N>: fix round <R>/5 (...)`, `Task <N>: minor (deferred): ...`, `Task <N>: parked — ...`, `Task <N>: BLOCKED — ...`. A task is DONE iff it has a `Task <N>: complete` line. `memory-bank/progress.md` is a **mirror only** — the canonical ledger is `.superpowers/sdd/progress.md`. Trust the ledger and `git log` over recollection.
+5. **Every new project/folder:** FIRST scan for spec-driven compliance (`.clinerules`, `.superpowers/sdd/progress.md`, `docs/superpowers/specs/`, `docs/superpowers/plans/`, `memory-bank/`, git repo). If NOT spec-driven or < 50% spec-driven, FIRST clone and convert to spec-driven (create `.clinerules`, ledger, specs/, plans/, memory-bank 6 files, `.worklogs/`, `tasks.md`, git init).
+6. **Verification steps in every plan task:** run command + expected output.
 
 ---
 
