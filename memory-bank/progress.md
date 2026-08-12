@@ -58,3 +58,4 @@
 - 2026-08-12: Governance - LEDGER RULES added to .clinerules (5431d99)
 - 2026-08-12: Governance - baseline tag v1-baseline + current-state.md (edc5f63)
 - 2026-08-12: Governance - docs hygiene fix (current-state HEAD, CRM task complete, tier/auth wording, gitignore) (f5041bb)
+- 2026-08-12: Task <N>: complete (commits 2055831, review clean) — .clinerules updated with 5 new hard rules (ASK-BEFORE-EDIT, LEDGER-COMPLETE, NO-REDO, NO-UNREQUESTED-WORK, DUPLICATE-CHECK).
