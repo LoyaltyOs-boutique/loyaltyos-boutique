@@ -11,6 +11,8 @@
 import type * as auth from "../auth.js";
 import type * as customers from "../customers.js";
 import type * as lookbooks from "../lookbooks.js";
+import type * as orders from "../orders.js";
+import type * as reviews from "../reviews.js";
 import type * as settings from "../settings.js";
 
 import type {
@@ -23,6 +25,8 @@ declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   customers: typeof customers;
   lookbooks: typeof lookbooks;
+  orders: typeof orders;
+  reviews: typeof reviews;
   settings: typeof settings;
 }>;
 
