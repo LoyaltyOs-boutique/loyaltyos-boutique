@@ -133,5 +133,18 @@ export default defineSchema({
     value: v.any(), // JSON payload for that settings group
     updated_at: v.number(), // epoch ms — last write (mutations set Date.now())
     updated_by: v.optional(v.string()), // actor identifier (e.g. merchant email) when known
-  }).index("by_key", ["key"]), // singleton lookup per settings group
+    }).index("by_key", ["key"]), // singleton lookup per settings group
+
+  /** PRD Module 3 — Reviews & Testimonials. */
+  reviews: defineTable({
+    user_id: v.id("users"),
+    type: v.union(v.literal("product"), v.literal("gmb"), v.literal("testimonial")),
+    text: v.string(),
+    rating: v.optional(v.number()),
+    status: v.union(v.literal("pending"), v.literal("approved"), v.literal("declined")),
+    points_awarded: v.optional(v.number()),
+    created_at: v.number(),
+  })
+    .index("by_user", ["user_id"])
+    .index("by_status", ["status"]),
 });
