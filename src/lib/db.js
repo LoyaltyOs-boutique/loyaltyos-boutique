@@ -299,18 +299,159 @@ export function getUpcomingAnniversaries(days) {
   return client.query(api.customers.getUpcomingAnniversaries, { days }).catch(() => []);
 }
 
-/* ---------- Catalogue ---------- */
+/* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */
+// Contract parity: function names mirror convex/lookbooks.ts (Step 6) so the
+// frontend surface (Catalogue.jsx) stays identical. Initial render = localStorage
+// seed, then hydrateCatalogue() swaps in live Convex items.
+
 export function allCatalogue() { return [...state.catalogueItems]; }
-export function addCatalogueItem({ title, price, image_url, instagram_link, source }) {
-  const item = { id: uid('it'), handle: uid('it').toLowerCase(), title, price: Number(price) || 0, image_url: image_url || '', instagram_link: instagram_link || '', source: source || 'manual', likes: 0 };
+
+/** Full lookbook list from Convex (async). */
+export function getLookbooks() {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.lookbooks.getLookbooks).catch(() => []);
+}
+
+/** Full lookbook + items from Convex (async). */
+export function getLookbookById(id) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.lookbooks.getLookbookById, { id }).catch(() => null);
+}
+
+/** Create lookbook on Convex (async). */
+export function createLookbook(args) {
+  const client = getConvex();
+  if (!client) return Promise.resolve({ ok: false });
+  return client.mutation(api.lookbooks.createLookbook, args).catch(() => ({ ok: false }));
+}
+
+/** Patch lookbook on Convex (async). */
+export function updateLookbook(id, patch) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.lookbooks.updateLookbook, { id, ...patch }).catch(() => null);
+}
+
+/** Delete lookbook + items on Convex (async). */
+export function deleteLookbook(id) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.lookbooks.deleteLookbook, { id }).catch(() => null);
+}
+
+/** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
+export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id }) {
+  // 1. Optimistic update (INR price for local UI)
+  const item = {
+    id: uid('it'),
+    handle: uid('it').toLowerCase(),
+    title,
+    price: Number(price) || 0,
+    image_url: image_url || '',
+    instagram_link: instagram_link || '',
+    source: source || 'manual',
+    likes: 0,
+    lookbook_id
+  };
   state.catalogueItems.unshift(item);
   pushEvent('owner', 'catalogue', `New lookbook item added · ${title} (₹${item.price})`);
   emit();
+
+  // 2. Convex write-through (PAISE integer)
+  const client = getConvex();
+  if (client) {
+    // If no lookbook_id provided, we try to find one or ignore (PRD says item must have lookbook)
+    // For the demo / standalone catalogue, we expect the caller to provide it or the first lookbook.
+    client.query(api.lookbooks.getLookbooks).then((lbs) => {
+      const lbId = lookbook_id || (lbs && lbs[0] ? lbs[0]._id : null);
+      if (lbId) {
+        client.mutation(api.lookbooks.addCatalogueItem, {
+          lookbook_id: lbId,
+          title,
+          price: Math.round((Number(price) || 0) * 100),
+          image_url: image_url || '',
+          instagram_link: instagram_link || undefined
+        }).then((cvxId) => {
+          // Stamp the real ID so subsequent deletes/updates target Convex
+          const idx = state.catalogueItems.findIndex((i) => i.id === item.id);
+          if (idx >= 0) {
+            state.catalogueItems[idx].convexId = cvxId;
+            state.catalogueItems[idx].id = cvxId; // Swap local ID for Convex ID
+            persist();
+          }
+        }).catch(() => { /* offline — keep local */ });
+      }
+    });
+  }
   return item;
 }
+
+/** Patch catalogue item on Convex (async). */
+export function updateCatalogueItem(id, patch) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  const p = { ...patch };
+  if (p.price !== undefined) p.price = Math.round(Number(p.price) * 100);
+  return client.mutation(api.lookbooks.updateCatalogueItem, { id, ...p }).catch(() => null);
+}
+
+/** Delete item with optimistic update + Convex write-through (Step 6.2). */
 export function removeCatalogueItem(id) {
+  const item = state.catalogueItems.find((i) => i.id === id);
+  const convexId = item ? (item.convexId || (String(id).startsWith('it_') ? null : id)) : null;
+
+  // 1. Optimistic remove
   state.catalogueItems = state.catalogueItems.filter((i) => i.id !== id);
   emit();
+
+  // 2. Convex delete
+  if (convexId) {
+    const client = getConvex();
+    if (client) {
+      client.mutation(api.lookbooks.deleteCatalogueItem, { id: convexId })
+        .catch(() => { /* offline */ });
+    }
+  }
+}
+
+/** Background hydrate catalogue items from all lookbooks (Step 6.2). */
+let catalogueHydrating = false;
+export function hydrateCatalogue() {
+  if (catalogueHydrating) return;
+  const client = getConvex();
+  if (!client) return;
+  catalogueHydrating = true;
+
+  client.query(api.lookbooks.getLookbooks)
+    .then(async (lookbooks) => {
+      if (!Array.isArray(lookbooks)) { catalogueHydrating = false; return; }
+      const allItems = [];
+      for (const lb of lookbooks) {
+        const detail = await client.query(api.lookbooks.getLookbookById, { id: lb._id });
+        if (detail && detail.items) {
+          allItems.push(...detail.items.map((i) => ({
+            id: i._id,
+            convexId: i._id,
+            handle: i._id.toLowerCase(),
+            title: i.title,
+            price: (i.price || 0) / 100, // Paise to INR
+            image_url: i.image_url,
+            instagram_link: i.instagram_link || '',
+            source: lb.source || 'manual',
+            likes: 0,
+            lookbook_id: lb._id
+          })));
+        }
+      }
+      if (allItems.length > 0) {
+        state.catalogueItems = allItems;
+        emit();
+      }
+      catalogueHydrating = false;
+    })
+    .catch(() => { catalogueHydrating = false; });
 }
 
 /* ---------- Customer actions ---------- */
@@ -745,3 +886,7 @@ hydrateCustomers();
 // in the live Convex settings (with a seed-on-first-hydrate when Convex is
 // empty) — same hydration approach as the CRM bridge above.
 hydrateSettings();
+// Step 6.2 Catalogue bridge: hydrate catalogue items from Convex in the
+// background. /merchant/catalogue renders the localStorage seed instantly, then
+// swaps in the live Convex items as lookbooks are fetched.
+hydrateCatalogue();
