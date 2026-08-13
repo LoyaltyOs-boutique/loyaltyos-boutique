@@ -792,9 +792,31 @@ function createLocalCustomer({ name, whatsapp, calling, birthday, anniversary, c
   return { user, magicLink };
 }
 
-/** Synchronous local-only onboarding — used by the /join self-onboarding flow (KEEP UNCHANGED). */
+/**
+ * Onboarding (Join flow): creates a local profile (synchronous) then triggers
+ * a Convex write-through (async) to persist the customer (mobile-unique check).
+ * Keeps sync return shape so /join doesn't need to be async.
+ */
 export function onboardCustomer(f) {
-  return createLocalCustomer(f);
+  const local = createLocalCustomer(f);
+  const client = getConvex();
+  if (client) {
+    const mobile = waDigits(f.whatsapp || f.calling);
+    client
+      .mutation(api.customers.createCustomer, {
+        mobile,
+        name: (f.name || 'New Client').trim(),
+        ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
+        ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
+      })
+      .then((res) => {
+        if (res.ok) {
+          syncMagicLinkCustomer(res.customer, local.user.magic_token, res.id);
+        }
+      })
+      .catch(() => { /* offline — keep local */ });
+  }
+  return local;
 }
 
 /**
