@@ -54,3 +54,4 @@
 - 2026-08-12: Governance - baseline tag v1-baseline + current-state.md (edc5f63)
 - 2026-08-12: Governance - docs hygiene fix (current-state HEAD, CRM task complete, tier/auth wording, gitignore) (f5041bb)
 - Task <N>: complete (commits 2055831, review clean) — .clinerules updated with 5 new hard rules (ASK-BEFORE-EDIT, LEDGER-COMPLETE, NO-REDO, NO-UNREQUESTED-WORK, DUPLICATE-CHECK).
+- Task 6.2: complete (commits ad07b0a, review clean) — Wire Merchant Catalogue frontend to Convex. 8 Convex lookbooks functions bridged in `src/lib/db.js` (`getLookbooks`/`getLookbookById`/`createLookbook`/`updateLookbook`/`deleteLookbook`/`addCatalogueItem`/`updateCatalogueItem`/`deleteCatalogueItem` -> `api.lookbooks.*`), local-first hydration bridge `hydrateCatalogue()` mirrors Step 3.5/4.5/5.5 pattern, build **27.74 kB CSS** exact. Zero component edits — Catalogue.jsx unchanged.

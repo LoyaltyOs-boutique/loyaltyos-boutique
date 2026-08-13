@@ -1,4 +1,4 @@
-# LoyaltyOS Boutique - Current State (2026-08-12)
+# LoyaltyOS Boutique - Current State (2026-08-13)
 
 ## DONE
 - Phase 0 frontend (v1-baseline = c227573)
@@ -13,10 +13,10 @@
 - amendment complete (b7a1d2c)
 - ledger rules (5431d99)
 - baseline tag v1-baseline + current-state.md (edc5f63) - HEAD
+- Step 6.2 Lookbook Catalogue frontend wired (ad07b0a)
 
 ## NEXT (ordered)
-1. Step 6 Lookbook Catalogue + Join wiring
-2. Step 7 Checkout + Billing
+1. Step 7 Checkout + Billing
 3. Step 8 Reviews
 4. Step 9 Support
 5. Step 10 Final Security + Deploy
