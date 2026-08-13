@@ -10,6 +10,7 @@
 
 import type * as auth from "../auth.js";
 import type * as customers from "../customers.js";
+import type * as lookbooks from "../lookbooks.js";
 import type * as settings from "../settings.js";
 
 import type {
@@ -21,6 +22,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   customers: typeof customers;
+  lookbooks: typeof lookbooks;
   settings: typeof settings;
 }>;
 
