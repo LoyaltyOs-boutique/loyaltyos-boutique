@@ -512,9 +512,41 @@ export function checkout({ userId, items, pointsApplied, paymentMethod }) {
   state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: pointsEarned, reason: `Purchase · ${items[0]?.title || 'order'} (${rule.purchasePercent}% rule)`, createdAt: now() });
   pushEvent(userId, 'purchase', `${user.name} placed an order · ${items[0]?.title || 'lookbook'} ${paymentMethod === 'online' ? 'paid online' : 'reserved in store'} ₹${finalTotal.toLocaleString('en-IN')}`);
   emit();
+
+  // Convex write-through
+  const client = getConvex();
+  if (client) {
+    client.mutation(api.orders.createOrder, {
+      user_id: convexUserId(userId),
+      subtotal_paise: Math.round(subtotal * 100),
+      payment_method: paymentMethod === 'online' ? 'online' : 'offline',
+      points_applied: pointsApplied
+    }).catch((err) => console.error('[checkout] Convex mutation failed:', err));
+  }
+
   return order;
 }
 
+/** Get all orders (async). */
+export function getOrders() {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.orders.getOrders).catch(() => []);
+}
+
+/** Get orders for today (async). */
+export function getTodayOrders() {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.orders.getTodayOrders).catch(() => []);
+}
+
+/** Get today's summary (async). */
+export function getTodaySummary() {
+  const client = getConvex();
+  if (!client) return Promise.resolve({ order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 });
+  return client.query(api.orders.getTodaySummary).catch(() => ({ order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 }));
+}
 /* ---------- Reviews ---------- */
 export function submitGmbReview(userId, stars, review_text) {
   const user = state.users.find((u) => u.id === userId);
