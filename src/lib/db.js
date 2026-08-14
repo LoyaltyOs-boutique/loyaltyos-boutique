@@ -547,41 +547,253 @@ export function getTodaySummary() {
   if (!client) return Promise.resolve({ order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 });
   return client.query(api.orders.getTodaySummary).catch(() => ({ order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 }));
 }
-/* ---------- Reviews ---------- */
+/* ---------- Reviews → Convex bridge (Step 8.2) ---------- */
+// Contract parity: function names mirror convex/reviews.ts (Step 8.1) so the
+// frontend surface stays identical. Components (Dashboard.jsx, Customers.jsx,
+// Lookbook.jsx) call pendingGmbReviews()/setReviewStatus()/submitGmbReview()/
+// submitProductReview() SYNCHRONOUSLY, so we use the local-first bridge pattern
+// (Steps 4.5/5.5/6.2/7.2): localStorage is the initial render, and a background
+// hydrate merges live Convex rows into state and emits — the UI then re-renders
+// with real backend data WITHOUT any component edits.
+
+// Map local platform → Convex type
+const platformToType = (platform) => {
+  if (platform === 'gmb') return 'gmb';
+  if (platform === 'in-app') return 'product';
+  return 'testimonial';
+};
+
+// Map Convex type → local platform
+const typeToPlatform = (type) => {
+  if (type === 'gmb') return 'gmb';
+  if (type === 'product') return 'in-app';
+  return 'testimonial';
+};
+
+// Map local status → Convex status
+const localToConvexStatus = (status) => {
+  if (status === 'resolved') return 'declined';
+  return status;
+};
+
+// Convert a Convex review doc to local shape
+function toLocalReview(cvx) {
+  return {
+    id: cvx._id,
+    convexId: cvx._id,
+    _isConvex: true,
+    userId: cvx.user_id,
+    catalogueItemId: null, // Convex doesn't have this field yet
+    platform: typeToPlatform(cvx.type),
+    stars: cvx.rating ?? 5,
+    review_text: cvx.text,
+    status: cvx.status,
+    createdAt: new Date(cvx.created_at).toISOString(),
+  };
+}
+
+// Merge a single Convex review into state.reviews (idempotent).
+// Matches by convexId so a re-hydrate refreshes instead of duplicating.
+function mergeConvexReview(cvx, silent = false) {
+  if (!cvx || !cvx._id) return false;
+  const local = toLocalReview(cvx);
+  const idx = state.reviews.findIndex((r) => r.convexId === cvx._id);
+  if (idx >= 0) {
+    const prev = state.reviews[idx];
+    // Keep local id for UI features; take authoritative fields + convexId from backend.
+    state.reviews[idx] = {
+      ...prev,
+      ...local,
+      id: prev.id,
+      convexId: cvx._id,
+    };
+  } else {
+    state.reviews.unshift(local);
+  }
+  if (!silent) emit();
+  return true;
+}
+
+// Background hydrate (Step 8.2): pull reviews from Convex and merge into local state.
+// Components keep their synchronous contract — initial render = localStorage seed,
+// then emit() swaps in live Convex data.
+let reviewsHydrating = false;
+export function hydrateReviews() {
+  if (reviewsHydrating) return;
+  const client = getConvex();
+  if (!client) return;
+  reviewsHydrating = true;
+  client.query(api.reviews.getPendingReviews)
+    .then((rows) => {
+      reviewsHydrating = false;
+      if (!Array.isArray(rows)) return;
+      let changed = false;
+      for (const r of rows) changed = mergeConvexReview(r, true) || changed;
+      if (changed) emit();
+    })
+    .catch(() => { reviewsHydrating = false; /* offline — stay on localStorage seed */ });
+}
+
+// Re-hydrate when a review mutation succeeds so the list reflects the backend immediately.
+function refreshFromConvexReview(doc) {
+  mergeConvexReview(doc);
+  return doc;
+}
+
+/** Full pending reviews from Convex (async). Falls back to [] when offline/error. */
+export function getPendingReviews() {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.reviews.getPendingReviews).catch(() => []);
+}
+
+/** Full reviews with optional status filter from Convex (async). */
+export function getReviews({ status }) {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.reviews.getReviews, { status }).catch(() => []);
+}
+
+/** Approve review on Convex (async). Returns { ok, points_awarded }. */
+export function approveReview(id) {
+  const client = getConvex();
+  if (!client) return Promise.resolve({ ok: false });
+  return client.mutation(api.reviews.approveReview, { id }).catch(() => ({ ok: false }));
+}
+
+/** Decline review on Convex (async). Returns { ok }. */
+export function declineReview(id) {
+  const client = getConvex();
+  if (!client) return Promise.resolve({ ok: false });
+  return client.mutation(api.reviews.declineReview, { id }).catch(() => ({ ok: false }));
+}
+
+/** Create review on Convex (async). Returns Convex review doc. */
+export function createReview(review) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.reviews.createReview, review).catch(() => null);
+}
+
+/* ---------- Reviews (local-first, components call these SYNCHRONOUSLY) ---------- */
+// These functions keep the EXACT same signatures and return shapes so components need ZERO changes.
+// They do optimistic local updates, then write through to Convex in the background.
+
 export function submitGmbReview(userId, stars, review_text) {
   const user = state.users.find((u) => u.id === userId);
   if (!user) return null;
   const rule = state.settings.tiers[user.tier] || state.settings.tiers.global;
   const bonus = rule.gmbPoints;
-  state.reviews.unshift({ id: uid('r'), userId, catalogueItemId: null, platform: 'gmb', stars, review_text, status: 'pending', createdAt: now() });
+
+  // 1. Optimistic local create
+  const review = { id: uid('r'), userId, catalogueItemId: null, platform: 'gmb', stars, review_text, status: 'pending', createdAt: now() };
+  state.reviews.unshift(review);
   user.points += bonus;
   state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: bonus, reason: 'Google Review bonus', createdAt: now() });
   pushEvent(userId, 'review', `${user.name} posted a Google review (${stars}★) — awaiting approval`);
   pushEvent(userId, 'points', `${user.name} earned ${bonus} pts · Google Review bonus`);
   emit();
-  return { bonus, review: state.reviews[0] };
+
+  // 2. Convex write-through
+  const client = getConvex();
+  if (client) {
+    client.mutation(api.reviews.createReview, {
+      user_id: user.convexId || userId,
+      type: 'gmb',
+      text: review_text,
+      rating: stars,
+    }).then((cvxReview) => {
+      if (cvxReview) {
+        // Stamp the real Convex ID so subsequent approve/decline targets the backend
+        const idx = state.reviews.findIndex((r) => r.id === review.id);
+        if (idx >= 0) {
+          state.reviews[idx].convexId = cvxReview._id;
+          state.reviews[idx].id = cvxReview._id;
+          persist();
+        }
+      }
+    }).catch(() => { /* offline — keep local */ });
+  }
+
+  return { bonus, review };
 }
+
 export function submitProductReview(userId, catalogueItemId, stars, review_text) {
   const user = state.users.find((u) => u.id === userId);
   const item = state.catalogueItems.find((i) => i.id === catalogueItemId);
   if (!user || !item) return null;
   const rule = state.settings.tiers[user.tier] || state.settings.tiers.global;
   const bonus = rule.productReviewPoints;
-  state.reviews.unshift({ id: uid('r'), userId, catalogueItemId, platform: 'in-app', stars, review_text, status: 'approved', createdAt: now() });
+
+  // 1. Optimistic local create
+  const review = { id: uid('r'), userId, catalogueItemId, platform: 'in-app', stars, review_text, status: 'approved', createdAt: now() };
+  state.reviews.unshift(review);
   user.points += bonus;
   state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: bonus, reason: `Product review · ${item.title}`, createdAt: now() });
   pushEvent(userId, 'review', `${user.name} reviewed ${item.title} (${stars}★)`);
   pushEvent(userId, 'points', `${user.name} earned ${bonus} pts · Product review`);
   emit();
-  return { bonus, review: state.reviews[0] };
+
+  // 2. Convex write-through
+  const client = getConvex();
+  if (client) {
+    client.mutation(api.reviews.createReview, {
+      user_id: user.convexId || userId,
+      type: 'product',
+      text: review_text,
+      rating: stars,
+    }).then((cvxReview) => {
+      if (cvxReview) {
+        const idx = state.reviews.findIndex((r) => r.id === review.id);
+        if (idx >= 0) {
+          state.reviews[idx].convexId = cvxReview._id;
+          state.reviews[idx].id = cvxReview._id;
+          persist();
+        }
+      }
+    }).catch(() => { /* offline — keep local */ });
+  }
+
+  return { bonus, review };
 }
+
 export function setReviewStatus(id, status) {
   const r = state.reviews.find((x) => x.id === id);
   if (!r) return;
+
+  // 1. Optimistic local update
+  const prevStatus = r.status;
   r.status = status;
   const user = state.users.find((u) => u.id === r.userId);
   if (user) pushEvent(user.id, 'review', `${user.name}'s Google review ${status}`);
   emit();
+
+  // 2. Convex write-through (only for pending → approved/declined transitions)
+  if (prevStatus === 'pending' && (status === 'approved' || status === 'declined' || status === 'resolved')) {
+    const client = getConvex();
+    const convexId = r.convexId || (r._isConvex ? r.id : null);
+    if (client && convexId) {
+      const cvxStatus = localToConvexStatus(status);
+      if (cvxStatus === 'approved') {
+        client.mutation(api.reviews.approveReview, { id: convexId })
+          .then((res) => {
+            if (res && res.ok) {
+              // Points already awarded locally; Convex also updated user points.
+              // Refresh review from Convex to get authoritative points_awarded.
+              refreshFromConvexReview({ ...r, _id: convexId, status: 'approved', points_awarded: res.points_awarded });
+            }
+          })
+          .catch(() => { /* offline — local status stays */ });
+      } else {
+        // declined or resolved → Convex 'declined'
+        client.mutation(api.reviews.declineReview, { id: convexId })
+          .then(() => {
+            refreshFromConvexReview({ ...r, _id: convexId, status: 'declined' });
+          })
+          .catch(() => { /* offline — local status stays */ });
+      }
+    }
+  }
 }
 
 /* ---------- Campaigns ---------- */
@@ -944,3 +1156,7 @@ hydrateSettings();
 // background. /merchant/catalogue renders the localStorage seed instantly, then
 // swaps in the live Convex items as lookbooks are fetched.
 hydrateCatalogue();
+// Step 8.2 Reviews bridge: hydrate pending reviews from Convex in the
+// background. /merchant/dashboard and /merchant/customers render the
+// localStorage seed instantly, then swap in live Convex reviews.
+hydrateReviews();
