@@ -39,4 +39,4 @@
 - Task 6.3: complete (commits 3baa5bc..5b6e461, review clean)
 - Task 7.1: complete (commits fe1ae9b, review clean)
 - Task 8.1: complete (commits 3c8450b, review clean) — Reviews backend (convex/reviews.ts + schema.ts) implemented with atomic create/approve/decline/point-credit; tested via npx convex run; build 27.74 kB CSS; diff vs main only convex/reviews.ts + schema.ts.
-- Task 8.2: complete (commits b4ec695, review clean) — Wire reviews frontend to Convex (db.js reviews functions -> api.reviews.*); hydration pattern; build 27.74 kB CSS; diff vs main only src/lib/db.js.
+- Task 8.2: complete (commits 829c9fb, review clean) — Wire reviews frontend to Convex (db.js reviews functions -> api.reviews.*); hydration pattern; build 27.74 kB CSS; diff vs main only src/lib/db.js.
