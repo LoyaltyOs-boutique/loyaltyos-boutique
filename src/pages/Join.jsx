@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { onboardCustomer, waMessage, waDigits, customerById } from '../lib/db.js';
+import { onboardCustomerRemote, waMessage, waDigits, customerById } from '../lib/db.js';
 import { COUNTRIES, BRAND } from '../data/seed.js';
 
 const input = 'w-full border border-line bg-white px-3 py-3 text-sm outline-none focus:border-ink transition-colors placeholder:text-steel/50';
