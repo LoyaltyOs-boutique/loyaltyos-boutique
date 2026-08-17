@@ -1056,10 +1056,13 @@ function createLocalCustomer({ name, whatsapp, calling, birthday, anniversary, c
  * Keeps sync return shape so /join doesn't need to be async.
  */
 export function onboardCustomer(f) {
+  const mobile = waDigits(f.whatsapp || f.calling);
+  const digits = mobile.replace(/\D/g, '');
+  if (digits.length !== 10) return { error: "Please enter a valid 10-digit mobile number" };
+
   const local = createLocalCustomer(f);
   const client = getConvex();
   if (client) {
-    const mobile = waDigits(f.whatsapp || f.calling);
     client
       .mutation(api.customers.createCustomer, {
         mobile,
@@ -1100,6 +1103,7 @@ export async function onboardCustomerRemote(f) {
       ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
       ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
     });
+    if (created && !created.ok) return { error: created.error };
     const cvxId = created && (created.ok ? created.id : created.existingId);
 
     // Rotate/issue the 256-bit magic token on Convex (180-day validity).

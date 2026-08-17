@@ -303,8 +303,11 @@ export const createCustomer = mutation({
     custom_tags: v.optional(v.array(v.string())),
   },
   handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags }) => {
-    const normalized = normalizeMobile(mobile);
-    if (!normalized) throw new Error("Mobile number is required.");
+    const digits = mobile.replace(/\D/g, '');
+    if (digits.length !== 10) {
+      return { ok: false, error: "Please enter a valid 10-digit mobile number" };
+    }
+    const normalized = digits;
     const customerName = name.trim();
     if (!customerName) throw new Error("Customer name is required.");
 

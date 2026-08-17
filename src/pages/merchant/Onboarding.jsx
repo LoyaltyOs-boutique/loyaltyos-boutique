@@ -21,6 +21,10 @@ export default function Onboarding() {
     const res = await onboardCustomerRemote(f);
     setResult(res);
     setCreating(false);
+    if (res.error) {
+      alert(res.error);
+      return;
+    }
     setCopied(false);
     confetti({ particleCount: 120, spread: 90, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF'] });
   };

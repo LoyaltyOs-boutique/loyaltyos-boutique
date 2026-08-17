@@ -34,6 +34,10 @@ export default function Join() {
     e.preventDefault();
     if (!f.name.trim() || !f.whatsapp.trim()) return;
     const res = onboardCustomer(f);
+    if (res.error) {
+      alert(res.error);
+      return;
+    }
     setResult(res);
     confetti({ particleCount: 150, spread: 100, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF', '#F5EFE6'] });
   };
