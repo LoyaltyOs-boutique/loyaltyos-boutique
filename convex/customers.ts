@@ -318,9 +318,10 @@ export const createCustomer = mutation({
       .first();
     if (existing) {
       return {
-        ok: false,
-        error: "This WhatsApp number already has a profile",
+        ok: true,
+        isExisting: true,
         existingId: existing._id,
+        customer: toMerchantCustomer(existing),
       };
     }
 

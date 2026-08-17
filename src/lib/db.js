@@ -1103,8 +1103,15 @@ export async function onboardCustomerRemote(f) {
       ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
       ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
     });
-    if (created && !created.ok) return { error: created.error };
-    const cvxId = created && (created.ok ? created.id : created.existingId);
+    // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
+    if (created && !created.ok) {
+        return { error: created.error };
+    }
+    
+    // If it's a duplicate or new, we proceed to magic token generation.
+    // If it's a new customer, created.id is the new one.
+    // If it's existing, created.existingId is the existing one.
+    const cvxId = created && (created.id || created.existingId);
 
     // Rotate/issue the 256-bit magic token on Convex (180-day validity).
     const linkRes = await client.mutation(api.auth.generateMagicToken, {
