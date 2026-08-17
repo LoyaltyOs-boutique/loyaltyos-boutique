@@ -22,6 +22,7 @@ class Boundary extends Component {
   }
 }
 import Lookbook from './pages/Lookbook.jsx';
+import PublicLookbook from './pages/PublicLookbook.jsx';
 import AccessDenied from './pages/AccessDenied.jsx';
 import Login from './pages/Login.jsx';
 import Join from './pages/Join.jsx';
@@ -48,6 +49,7 @@ export default function App() {
         <Route path="/login" element={<Login />} />
         <Route path="/join" element={<Join />} />
         <Route path="/lookbook" element={<Lookbook />} />
+        <Route path="/lookbook/public/:lookbookId" element={<PublicLookbook />} />
         <Route
           path="/merchant/dashboard"
           element={<MerchantGuard><Shell><Dashboard /></Shell></MerchantGuard>}

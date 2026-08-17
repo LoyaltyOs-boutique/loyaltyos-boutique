@@ -16,9 +16,20 @@ export default function Catalogue() {
   const [igImg, setIgImg] = useState('');
   const [igUrl, setIgUrl] = useState('');
   const [bulkMsg, setBulkMsg] = useState('');
-  const [csvPreview, setCsvPreview] = useState(null);
-  const csvRef = useRef(null);
-  const pdfRef = useRef(null);
+    const [csvPreview, setCsvPreview] = useState(null);
+    const [copiedId, setCopiedId] = useState(null);
+    const csvRef = useRef(null);
+    const pdfRef = useRef(null);
+    const copyPublicLink = (lookbookId) => {
+        const url = `${window.location.origin}/lookbook/public/${lookbookId}`;
+        navigator.clipboard.writeText(url);
+        setCopiedId(lookbookId);
+        setTimeout(() => setCopiedId(null), 1600);
+    };
+    const waShareLink = (lookbookId) => {
+        const url = `${window.location.origin}/lookbook/public/${lookbookId}`;
+        return `https://wa.me/?text=${encodeURIComponent(`Check out this lookbook: ${url}`)}`;
+    };
 
   const addManual = () => {
     if (!manual.title || !manual.price) return;
@@ -136,6 +147,14 @@ export default function Catalogue() {
                     <button onClick={() => { if (confirm(`Remove "${i.title}" from the shared catalogue?`)) removeCatalogueItem(i.id); }} className="btn-ghost !py-1 !px-3 text-[9px]">
                       Remove
                     </button>
+                  </div>
+                  <div className="flex items-center gap-2 mt-3">
+                    <button onClick={() => copyPublicLink(i.lookbook_id)} className="btn-ghost !py-1 !px-2 text-[9px] flex-1">
+                      {copiedId === i.lookbook_id ? '✓ Copied' : '🔗 Copy Link'}
+                    </button>
+                    <a href={waShareLink(i.lookbook_id)} target="_blank" rel="noreferrer" className="btn-gold !py-1 !px-2 text-[9px] flex items-center justify-center" aria-label="WhatsApp">
+                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg>
+                    </a>
                   </div>
                   {i.instagram_link && i.instagram_link !== '#' && <a href={i.instagram_link} target="_blank" rel="noreferrer" className="text-[10px] text-gold tracking-wide2 uppercase mt-1 inline-block">View post ↗</a>}
                 </div>
