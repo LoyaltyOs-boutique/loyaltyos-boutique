@@ -114,10 +114,12 @@ export default function Lookbook() {
   const maxRedeem = Math.min(customer.points, subtotal);
   const discount = Math.min(points, subtotal);
   const finalTotal = subtotal - discount;
-  const waLink = (item) =>
-    `https://wa.me/${BRAND.wa}?text=${encodeURIComponent(
-      `Hi! I'm interested in the ${item.title} from 85 Lansdowne. My Customer ID is ${customer.id.toUpperCase()}.`
+  const waLink = (item) => {
+    const namePart = customer.name ? `, I'm ${customer.name}` : '';
+    return `https://wa.me/${BRAND.wa}?text=${encodeURIComponent(
+      `Hi${namePart}! I'm interested in the ${item.title} from 85 Lansdowne.`
     )}`;
+  };
 
   const addToCart = (item) => {
     setCart((c) => {
