@@ -3,7 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import {
   getData, subscribe, customers, customerLedger, adjustPoints, addStaffNote,
   pendingGmbReviews, setReviewStatus, waMessage, waDigits,
-  updateCustomerProfile,
+  updateCustomerProfile, updateMeasurements,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
 import { Modal, TierBadge, Tag, Stars, Empty } from '../../components/ui.jsx';
@@ -25,6 +25,8 @@ export default function Customers() {
   const [tab, setTab] = useState('basic');
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState({});
+  const [isEditingProfiling, setIsEditingProfiling] = useState(false);
+  const [editMeasurements, setEditMeasurements] = useState({});
   const navigate = useNavigate();
   const [copiedId, setCopiedId] = useState(null);
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
@@ -64,6 +66,19 @@ export default function Customers() {
     await updateCustomerProfile(active.id, patch);
     setIsEditing(false);
     setEditForm({});
+  };
+
+  const handleSaveProfiling = async () => {
+    if (!active) return;
+    const patch = {};
+    if (editMeasurements.bust !== undefined && editMeasurements.bust !== '') patch.bust = Number(editMeasurements.bust);
+    if (editMeasurements.waist !== undefined && editMeasurements.waist !== '') patch.waist = Number(editMeasurements.waist);
+    if (editMeasurements.hip !== undefined && editMeasurements.hip !== '') patch.hip = Number(editMeasurements.hip);
+    if (editMeasurements.height !== undefined) patch.height = editMeasurements.height.trim();
+    if (editMeasurements.blouse_size !== undefined) patch.blouse_size = editMeasurements.blouse_size.trim();
+    await updateMeasurements(active.id, patch);
+    setIsEditingProfiling(false);
+    setEditMeasurements({});
   };
 
   return (
@@ -161,6 +176,9 @@ export default function Customers() {
             {tab === 'basic' && !isEditing && active && (
               <button onClick={() => { setEditForm({ name: active.name, birthday: active.birthday || '', anniversary: active.anniversary || '', tier: active.tier, custom_tags: active.custom_tags || [] }); setIsEditing(true); }} className="btn-ghost !px-3 !py-1.5 text-[10px] ml-auto">Edit</button>
             )}
+            {tab === 'profiling' && !isEditingProfiling && active && (
+              <button onClick={() => { setEditMeasurements({ bust: active.measurements?.bust || '', waist: active.measurements?.waist || '', hip: active.measurements?.hips || '', height: active.measurements?.height || '', blouse_size: active.measurements?.blouse_size || '' }); setIsEditingProfiling(true); }} className="btn-ghost !px-3 !py-1.5 text-[10px] ml-auto">Edit</button>
+            )}
           </div>
 
           {tab === 'basic' && (
@@ -230,17 +248,53 @@ export default function Customers() {
 
           {tab === 'profiling' && (
             <div>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-5">
-                <Info label="Bust" value={active.measurements?.bust || '—'} />
-                <Info label="Waist" value={active.measurements?.waist || '—'} />
-                <Info label="Hips" value={active.measurements?.hips || '—'} />
-                <Info label="Size tag" value={active.measurements?.size || '—'} />
-              </div>
-              <div className="grid sm:grid-cols-2 gap-4">
-                <Info label="Preferred colours" value={active.measurements?.colours?.join(' · ') || '—'} />
-                <Info label="Preferred fabrics" value={active.measurements?.fabrics?.join(' · ') || '—'} />
-              </div>
-              <p className="text-[10px] tracking-wide2 uppercase text-steel mt-5">Confidential — visible to boutique staff only.</p>
+              {!isEditingProfiling ? (
+                <>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-5">
+                    <Info label="Bust" value={active.measurements?.bust || '—'} />
+                    <Info label="Waist" value={active.measurements?.waist || '—'} />
+                    <Info label="Hips" value={active.measurements?.hips || '—'} />
+                    <Info label="Size tag" value={active.measurements?.size || '—'} />
+                  </div>
+                  <div className="grid sm:grid-cols-2 gap-4">
+                    <Info label="Preferred colours" value={active.measurements?.colours?.join(' · ') || '—'} />
+                    <Info label="Preferred fabrics" value={active.measurements?.fabrics?.join(' · ') || '—'} />
+                  </div>
+                  <p className="text-[10px] tracking-wide2 uppercase text-steel mt-5">Confidential — visible to boutique staff only.</p>
+                </>
+              ) : (
+                <>
+                  <div className="sm:col-span-2">
+                    <div className="flex items-center justify-between mb-4">
+                      <span className="label">Edit measurements</span>
+                      <div className="flex gap-2">
+                        <button onClick={() => { setEditMeasurements({}); setIsEditingProfiling(false); }} className="btn-ghost !px-3 !py-1.5 text-[10px]">Cancel</button>
+                        <button onClick={handleSaveProfiling} className="btn-gold !px-3 !py-1.5 text-[10px]">Save</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="label">Bust (cm)</label>
+                    <input className="input" type="number" step="0.1" value={editMeasurements.bust || ''} onChange={(e) => setEditMeasurements({ ...editMeasurements, bust: e.target.value })} placeholder="e.g. 92" />
+                  </div>
+                  <div>
+                    <label className="label">Waist (cm)</label>
+                    <input className="input" type="number" step="0.1" value={editMeasurements.waist || ''} onChange={(e) => setEditMeasurements({ ...editMeasurements, waist: e.target.value })} placeholder="e.g. 74" />
+                  </div>
+                  <div>
+                    <label className="label">Hips (cm)</label>
+                    <input className="input" type="number" step="0.1" value={editMeasurements.hip || ''} onChange={(e) => setEditMeasurements({ ...editMeasurements, hip: e.target.value })} placeholder="e.g. 98" />
+                  </div>
+                  <div>
+                    <label className="label">Height</label>
+                    <input className="input" value={editMeasurements.height || ''} onChange={(e) => setEditMeasurements({ ...editMeasurements, height: e.target.value })} placeholder="e.g. 165cm" />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="label">Blouse size</label>
+                    <input className="input" value={editMeasurements.blouse_size || ''} onChange={(e) => setEditMeasurements({ ...editMeasurements, blouse_size: e.target.value })} placeholder="e.g. 36" />
+                  </div>
+                </>
+              )}
             </div>
           )}
 

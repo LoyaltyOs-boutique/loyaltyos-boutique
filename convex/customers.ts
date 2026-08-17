@@ -221,6 +221,7 @@ export const updateCustomerProfile = mutation({
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
     tier: v.optional(v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum"))),
+    custom_tags: v.optional(v.array(v.string())),
   },
   handler: async (ctx, { userId, ...patch }) => {
     const doc = await getCustomerDoc(ctx, userId);
@@ -230,6 +231,7 @@ export const updateCustomerProfile = mutation({
     if (patch.birthday !== undefined) update.birthday = patch.birthday.trim();
     if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
     if (patch.tier !== undefined) update.tier = patch.tier;
+    if (patch.custom_tags !== undefined) update.custom_tags = patch.custom_tags.map((t: string) => t.trim()).filter(Boolean);
     await ctx.db.patch(userId, update);
     return toMerchantCustomer({ ...doc, ...update });
   },
