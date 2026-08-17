@@ -299,6 +299,15 @@ export function updateCustomTags(userId, tags) {
     .catch(() => null);
 }
 
+/** Update customer profile on Convex (async). */
+export function updateCustomerProfile(userId, patch) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.mutation(api.customers.updateCustomerProfile, { userId: convexUserId(userId), ...patch })
+    .then((updated) => (updated ? refreshFromConvexSheet(updated) : updated))
+    .catch(() => null);
+}
+
 /** Delight Queue — customers with a birthday within the next `days` days (async). */
 export function getUpcomingBirthdays(days) {
   const client = getConvex();

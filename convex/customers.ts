@@ -213,6 +213,28 @@ export const updateCustomTags = mutation({
   },
 });
 
+/** Update customer profile (name, birthday, anniversary, tier). */
+export const updateCustomerProfile = mutation({
+  args: {
+    userId: v.id("users"),
+    name: v.optional(v.string()),
+    birthday: v.optional(v.string()),
+    anniversary: v.optional(v.string()),
+    tier: v.optional(v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum"))),
+  },
+  handler: async (ctx, { userId, ...patch }) => {
+    const doc = await getCustomerDoc(ctx, userId);
+    if (!doc) return null;
+    const update: any = {};
+    if (patch.name !== undefined) update.name = patch.name.trim();
+    if (patch.birthday !== undefined) update.birthday = patch.birthday.trim();
+    if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
+    if (patch.tier !== undefined) update.tier = patch.tier;
+    await ctx.db.patch(userId, update);
+    return toMerchantCustomer({ ...doc, ...update });
+  },
+});
+
 /** Delight Queue — customers with a birthday within the next `days` days. */
 export const getUpcomingBirthdays = query({
   args: { days: v.optional(v.number()) },

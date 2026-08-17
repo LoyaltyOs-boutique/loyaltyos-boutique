@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import {
   getData, subscribe, customers, customerLedger, adjustPoints, addStaffNote,
   pendingGmbReviews, setReviewStatus, waMessage, waDigits,
+  updateCustomerProfile,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
 import { Modal, TierBadge, Tag, Stars, Empty } from '../../components/ui.jsx';
@@ -22,6 +23,8 @@ export default function Customers() {
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState('basic');
+  const [isEditing, setIsEditing] = useState(false);
+  const [editForm, setEditForm] = useState({});
   const navigate = useNavigate();
   const [copiedId, setCopiedId] = useState(null);
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
@@ -49,6 +52,19 @@ export default function Customers() {
   const rows = list.slice(safePage * PAGE, safePage * PAGE + PAGE);
   const pending = pendingGmbReviews();
   const active = selected ? db.users.find((u) => u.id === selected) : null;
+
+  const handleSave = async () => {
+    if (!active) return;
+    const patch = {};
+    if (editForm.name !== undefined) patch.name = editForm.name.trim();
+    if (editForm.birthday !== undefined) patch.birthday = editForm.birthday.trim();
+    if (editForm.anniversary !== undefined) patch.anniversary = editForm.anniversary.trim();
+    if (editForm.tier !== undefined) patch.tier = editForm.tier;
+    if (editForm.custom_tags !== undefined) patch.custom_tags = editForm.custom_tags;
+    await updateCustomerProfile(active.id, patch);
+    setIsEditing(false);
+    setEditForm({});
+  };
 
   return (
     <div className="space-y-8">
@@ -136,32 +152,79 @@ export default function Customers() {
 
       {active && (
         <Modal open onClose={() => setSelected(null)} title={active.name} wide>
-          <div className="flex gap-2 flex-wrap mb-5">
+          <div className="flex gap-2 flex-wrap mb-5 items-center">
             {['basic', 'profiling', 'notes', 'ledger', 'points'].map((t) => (
               <button key={t} onClick={() => setTab(t)} className={cls('px-4 py-2 text-[10px] tracking-wide2 uppercase border transition-colors', tab === t ? 'border-ink bg-ink text-white' : 'border-line text-steel hover:border-ink hover:text-ink')}>
                 {t === 'basic' ? 'Basic info' : t === 'profiling' ? 'Boutique profiling' : t === 'notes' ? 'Staff notes' : t === 'ledger' ? 'Activity ledger' : 'Points tool'}
               </button>
             ))}
+            {tab === 'basic' && !isEditing && active && (
+              <button onClick={() => { setEditForm({ name: active.name, birthday: active.birthday || '', anniversary: active.anniversary || '', tier: active.tier, custom_tags: active.custom_tags || [] }); setIsEditing(true); }} className="btn-ghost !px-3 !py-1.5 text-[10px] ml-auto">Edit</button>
+            )}
           </div>
 
           {tab === 'basic' && (
             <div className="grid sm:grid-cols-2 gap-4">
-              <Info label="Name" value={active.name} />
-              <Info label="Mobile" value={active.mobile} />
-              <Info label="Birthday" value={parseMD(active.birthday)} />
-              <Info label="Anniversary" value={parseMD(active.anniversary)} />
-              <Info label="Points balance" value={active.points.toLocaleString('en-IN') + ' pts'} />
-              <Info label="Tier" value={<TierBadge tier={active.tier} />} />
-              <div className="sm:col-span-2">
-                <div className="label">Magic link (personal WhatsApp access)</div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-xs text-gold select-all border border-line bg-mist px-3 py-2 min-w-0 max-w-full break-all">{magicUrl(active)}</span>
-                  <button onClick={() => openLookbook(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">Open lookbook 👁</button>
-                  <button onClick={() => copyLink(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">{copiedId === active.id ? '✓ Copied' : 'Copy'}</button>
-                  <a href={shareWa(active)} target="_blank" rel="noreferrer" className="btn-gold !px-3 !py-1.5 text-[9px]">WhatsApp <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
-                </div>
-              </div>
-              <div className="sm:col-span-2"><Info label="Custom tags" value={<div className="flex gap-2 flex-wrap">{active.custom_tags?.length ? active.custom_tags.map((t) => <Tag key={t}>{t}</Tag>) : <span className="text-steel">—</span>}</div>} /></div>
+              {!isEditing ? (
+                <>
+                  <Info label="Name" value={active.name} />
+                  <Info label="Mobile" value={active.mobile} />
+                  <Info label="Birthday" value={parseMD(active.birthday)} />
+                  <Info label="Anniversary" value={parseMD(active.anniversary)} />
+                  <Info label="Points balance" value={active.points.toLocaleString('en-IN') + ' pts'} />
+                  <Info label="Tier" value={<TierBadge tier={active.tier} />} />
+                  <div className="sm:col-span-2">
+                    <div className="label">Magic link (personal WhatsApp access)</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs text-gold select-all border border-line bg-mist px-3 py-2 min-w-0 max-w-full break-all">{magicUrl(active)}</span>
+                      <button onClick={() => openLookbook(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">Open lookbook 👁</button>
+                      <button onClick={() => copyLink(active)} className="btn-ghost !px-3 !py-1.5 text-[9px]">{copiedId === active.id ? '✓ Copied' : 'Copy'}</button>
+                      <a href={shareWa(active)} target="_blank" rel="noreferrer" className="btn-gold !px-3 !py-1.5 text-[9px]">WhatsApp <svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
+                    </div>
+                  </div>
+                  <div className="sm:col-span-2"><Info label="Custom tags" value={<div className="flex gap-2 flex-wrap">{active.custom_tags?.length ? active.custom_tags.map((t) => <Tag key={t}>{t}</Tag>) : <span className="text-steel">—</span>}</div>} /></div>
+                </>
+              ) : (
+                <>
+                  <div className="sm:col-span-2">
+                    <div className="flex items-center justify-between mb-4">
+                      <span className="label">Edit basic info</span>
+                      <div className="flex gap-2">
+                        <button onClick={() => { setEditForm({}); setIsEditing(false); }} className="btn-ghost !px-3 !py-1.5 text-[10px]">Cancel</button>
+                        <button onClick={handleSave} className="btn-gold !px-3 !py-1.5 text-[10px]">Save</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="label">Name</label>
+                    <input className="input" value={editForm.name || active.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} />
+                  </div>
+                  <div>
+                    <label className="label">Mobile (unique - not editable)</label>
+                    <input className="input bg-mist" value={active.mobile} readOnly />
+                  </div>
+                  <div>
+                    <label className="label">Birthday (M-D)</label>
+                    <input className="input" value={editForm.birthday || active.birthday || ''} onChange={(e) => setEditForm({ ...editForm, birthday: e.target.value })} placeholder="e.g. 8-15" />
+                  </div>
+                  <div>
+                    <label className="label">Anniversary (M-D)</label>
+                    <input className="input" value={editForm.anniversary || active.anniversary || ''} onChange={(e) => setEditForm({ ...editForm, anniversary: e.target.value })} placeholder="e.g. 12-25" />
+                  </div>
+                  <div>
+                    <label className="label">Tier</label>
+                    <select className="input" value={editForm.tier || active.tier} onChange={(e) => setEditForm({ ...editForm, tier: e.target.value })}>
+                      <option value="silver">Silver</option>
+                      <option value="gold">Gold</option>
+                      <option value="platinum">Platinum</option>
+                    </select>
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="label">Custom tags (comma-separated)</label>
+                    <input className="input" value={editForm.custom_tags ? editForm.custom_tags.join(', ') : (active.custom_tags || []).join(', ')} onChange={(e) => setEditForm({ ...editForm, custom_tags: e.target.value.split(',').map(t => t.trim()).filter(Boolean) })} placeholder="e.g. VIP, Saree Enthusiast" />
+                  </div>
+                </>
+              )}
             </div>
           )}
 
