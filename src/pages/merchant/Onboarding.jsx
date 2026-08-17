@@ -9,7 +9,8 @@ export default function Onboarding() {
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
   const [creating, setCreating] = useState(false);
-  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const [mobileError, setMobileError] = useState('');
+  const set = (k) => (e) => { setF({ ...f, [k]: e.target.value }); if (k === 'whatsapp') setMobileError(''); };
 
   // Magic-link fix: creates the client on Convex (ONE profile per WhatsApp
   // number) and mints a backend-issued 256-bit token, so the client's personal
@@ -19,12 +20,43 @@ export default function Onboarding() {
     if (!f.name.trim() || !f.whatsapp.trim()) return;
     setCreating(true);
     const res = await onboardCustomerRemote(f);
-    setResult(res);
     setCreating(false);
     if (res.error) {
-      alert(res.error);
+      // If existing customer (duplicate mobile), generate magic link and show it
+          if (res.existingId) {
+        const client = await import('../../lib/db.js').then(m => m.getConvex());
+        if (client) {
+          const { api } = await import('../../../convex/_generated/api.js');
+          const linkRes = await client.mutation(api.auth.generateMagicToken, {
+            mobile: waDigits(f.whatsapp || f.calling),
+            baseUrl: location.origin,
+          });
+          if (linkRes && linkRes.user) {
+            const { syncMagicLinkCustomer } = await import('../../lib/db.js');
+            const synced = syncMagicLinkCustomer(linkRes.user, linkRes.token, linkRes.user.id, {
+              location: { city: f.city || '', country: f.country || 'India' },
+            });
+            if (synced) {
+              setResult({ user: synced, magicLink: `/lookbook?id=${linkRes.user.id}&token=${linkRes.token}` });
+              setCopied(false);
+              confetti({ particleCount: 120, spread: 90, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF'] });
+              return;
+            }
+          }
+        }
+        // Fallback to local
+        const { createLocalCustomer } = await import('../../lib/db.js');
+        const local = createLocalCustomer(f);
+        setResult(local);
+        setCopied(false);
+        confetti({ particleCount: 120, spread: 90, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF'] });
+        return;
+      }
+      // Invalid number - show inline error
+      setMobileError(res.error);
       return;
     }
+    setResult(res);
     setCopied(false);
     confetti({ particleCount: 120, spread: 90, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF'] });
   };
@@ -63,7 +95,8 @@ export default function Onboarding() {
             <div className="grid sm:grid-cols-2 gap-3">
               <div>
                 <label className="label">WhatsApp number *</label>
-                <input className="input" inputMode="tel" value={f.whatsapp} onChange={set('whatsapp')} placeholder="+91 98…" required />
+                <input className={`input ${mobileError ? 'border-red-500' : ''}`} inputMode="tel" value={f.whatsapp} onChange={set('whatsapp')} placeholder="+91 98…" required />
+                {mobileError && <div className="text-red-600 text-xs mt-1">{mobileError}</div>}
               </div>
               <div>
                 <label className="label">Calling number</label>
