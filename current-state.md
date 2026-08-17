@@ -13,6 +13,7 @@
 - amendment complete (b7a1d2c)
 - ledger rules (5431d99)
 - baseline tag v1-baseline + current-state.md (edc5f63) - HEAD
+- Fix 2: Mobile number validation + India country code +91 normalization + Onboarding UI error display (53abcc6..8588abf)
 - Step 6.2 Lookbook Catalogue frontend wired (ad07b0a)
 
 ## NEXT (ordered)
