@@ -118,7 +118,16 @@ export function merchantByEmail(email) {
 }
 export function validateLookbook(id, token) {
   const u = state.users.find((x) => x.role === 'customer' && x.id === id && x.magic_token === token);
-  return u ? { ...u } : null;
+  if (!u) return null;
+
+  // PRD §3.2 — Enforce 180-day expiry locally if the creation timestamp is known.
+  // Missing timestamp preserves current behavior (token match only) for seed users.
+  if (u.magic_token_created_at) {
+    const expired = Date.now() > u.magic_token_created_at + 180 * 86400000;
+    if (expired) return null;
+  }
+
+  return { ...u };
 }
 export function customerById(id) { return state.users.find((x) => x.id === id); }
 
@@ -182,7 +191,10 @@ function toLocalCustomer(c) {
     custom_tags: c.custom_tags ?? [],
     measurements: c.measurements ?? {},
     staff_notes: (c.staff_notes || []).map(noteToLocal),
-    password_hash: null, magic_token: null, chat: [], location: null,
+    password_hash: null,
+    magic_token: c.magic_token ?? null,
+    magic_token_created_at: c.magic_token_created_at ?? null,
+    chat: [], location: null,
     role: 'customer',
   };
 }
@@ -201,15 +213,17 @@ function mergeConvexCustomer(cvx, silent = false) {
   );
   if (idx >= 0) {
     const prev = state.users[idx];
-    // Keep the local id (magic links/ledger) + local-only fields; take the
-    // authoritative CRM fields + convexId from the backend sheet.
+    // PRD §3.2 — Careful merge: preserve existing local magic_token and its
+    // timestamp if Convex projection has them; otherwise keep local values.
+    // Never overwrite with null/undefined from Convex.
     state.users[idx] = {
       ...prev,
       ...local,
       id: prev.id,
       convexId: cvx.id,
       password_hash: prev.password_hash,
-      magic_token: prev.magic_token,
+      magic_token: local.magic_token ?? prev.magic_token,
+      magic_token_created_at: local.magic_token_created_at ?? prev.magic_token_created_at,
       whatsapp: prev.whatsapp || local.whatsapp,
       chat: prev.chat || [],
       location: prev.location,
@@ -1120,7 +1134,12 @@ export async function onboardCustomerRemote(f) {
 export function syncMagicLinkCustomer(publicUser, token, cvxId, fallback) {
   const id = String((publicUser && publicUser.id) || cvxId || '');
   if (!id) return null;
-  const base = { ...toLocalCustomer({ ...publicUser, id }), magic_token: token, convexId: id };
+  const base = {
+    ...toLocalCustomer({ ...publicUser, id }),
+    magic_token: token,
+    magic_token_created_at: publicUser.magic_token_created_at || null,
+    convexId: id,
+  };
   const idx = state.users.findIndex((u) => u.id === id || u.convexId === id);
   if (idx >= 0) {
     state.users[idx] = {
