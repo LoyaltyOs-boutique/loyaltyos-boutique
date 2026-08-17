@@ -62,3 +62,4 @@
 - 2026-08-13: Step 7.1 complete (commit fe1ae9b, review clean) — Orders backend (convex/orders.ts) with atomic order+points engine; verified via npx convex run; build 27.74 kB CSS; diff vs main ONLY convex/orders.ts.
 - 2026-08-14: Task 8.1: complete (commits 3c8450b..HEAD, review clean) — Reviews backend (convex/reviews.ts + schema.ts) implemented with atomic create/approve/decline/point-credit; tested via npx convex run; build 27.74 kB CSS; diff vs main only convex/reviews.ts + schema.ts.
 - 2026-08-14: Task 8.2: complete (commits 829c9fb, review clean) — Wire reviews frontend to Convex (db.js reviews functions -> api.reviews.*); hydration pattern; build 27.74 kB CSS; diff vs main only src/lib/db.js.
+- 2026-08-17: Task 9: complete (commit f033b30, review clean) — Fix: magic link 180-day session - preserve magic_token_created_at through hydration + expiry check in validateLookbook.
