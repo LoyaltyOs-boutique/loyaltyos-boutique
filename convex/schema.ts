@@ -143,6 +143,7 @@ export default defineSchema({
     rating: v.optional(v.number()),
     status: v.union(v.literal("pending"), v.literal("approved"), v.literal("declined")),
     points_awarded: v.optional(v.number()),
+    catalogue_item_id: v.optional(v.id("catalogue_items")), // which product this review is about (type "product" only)
     created_at: v.number(),
   })
     .index("by_user", ["user_id"])
