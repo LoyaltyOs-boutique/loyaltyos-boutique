@@ -41,6 +41,9 @@
 - GitHub: https://github.com/LoyaltyOs-boutique/loyaltyos-boutique
 - Resend: https://resend.com/emails
 
+## NOTES / DEFERRED
+- Review rules fix (one review per product + points only after approval + no double credit) - DEFERRED per Ma'am - will be done at the VERY END (last step before final). Branch was deleted; work was never merged.
+
 ## SESSION READ ORDER
 1. current-state.md
 2. memory-bank/
