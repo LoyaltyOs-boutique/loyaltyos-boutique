@@ -91,6 +91,11 @@ export default defineSchema({
     kind: v.optional(
       v.union(v.literal("catalogue"), v.literal("designer"), v.literal("pdf")),
     ),
+    // Gate 2 (Step B) — public Vercel Blob URL for a PDF-kind lookbook
+    // (kind: "pdf"). Optional: only set when a PDF was actually uploaded via
+    // lookbooks.generatePdfUploadUrl -> createPdfLookbook; catalogue/designer
+    // lookbooks never set this field.
+    pdf_url: v.optional(v.string()),
   }),
 
   /** PRD §6 Table `catalogue_items` — items inside a lookbook. */

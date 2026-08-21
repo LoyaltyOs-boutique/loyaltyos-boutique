@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook } from '../../lib/db.js';
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty } from '../../components/ui.jsx';
@@ -14,10 +14,15 @@ export default function Catalogue() {
   const db = useDb();
   const items = allCatalogue();
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
+  // Step C — Manual Entry "Add to" target: 'all' = Current catalogue (no lookbook_id),
+  // '__new__' = create a new designer lookbook (name from newLookbookName), else an existing lookbook _id.
+  const [addTo, setAddTo] = useState('all');
+  const [newLookbookName, setNewLookbookName] = useState('');
   const [igImg, setIgImg] = useState('');
   const [igUrl, setIgUrl] = useState('');
   const [bulkMsg, setBulkMsg] = useState('');
     const [csvPreview, setCsvPreview] = useState(null);
+    const [pdfUploading, setPdfUploading] = useState(false);
     const [copiedId, setCopiedId] = useState(null);
     const [selected, setSelected] = useState('all'); // 'all' = Current catalogue, else lookbook _id
     const [lookbookOptions, setLookbookOptions] = useState([]);
@@ -66,17 +71,35 @@ export default function Catalogue() {
     // Grid items: all when on "Current catalogue", else filtered to the chosen lookbook.
     const shownItems = isLookbookSelected ? items.filter((i) => i.lookbook_id === selected) : items;
 
-  const addManual = () => {
+  const addManual = async () => {
     if (!manual.title || !manual.price) return;
-    addCatalogueItem({ ...manual, source: 'manual' });
+    // Step C — resolve which lookbook the piece is assigned to:
+    //  'all'      → Current catalogue (no lookbook_id, unchanged legacy behavior)
+    //  '__new__'  → create a new designer lookbook first, then use its _id
+    //  <_id>      → an existing designer lookbook
+    let lookbook_id;
+    if (addTo === '__new__') {
+      const name = newLookbookName.trim();
+      if (!name) return; // "+ New designer lookbook" chosen but no name typed — abort
+      const res = await createLookbook({ title: name, designer: name, source: 'manual', kind: 'designer' });
+      if (!res || !res.ok || !res.id) return; // creation failed — don't orphan the piece
+      lookbook_id = res.id;
+      // Refresh Step A selector so the new lookbook is immediately pickable elsewhere.
+      getLookbooksForSelector().then((rows) => { if (Array.isArray(rows)) setLookbookOptions(rows); });
+    } else if (addTo !== 'all') {
+      lookbook_id = addTo;
+    }
+    addCatalogueItem({ ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) });
     setManual({ title: '', price: '', image_url: '', instagram_link: '' });
+    setAddTo('all');
+    setNewLookbookName('');
   };
   const addIg = () => {
     if (!igImg) return;
     addCatalogueItem({ title: 'Instagram Style Post', price: 0, image_url: igImg, instagram_link: igUrl || '#', source: 'instagram' });
     setIgImg(''); setIgUrl('');
   };
-  const onCsv = (f) => {
+  const onCsvParse = (f) => {
     if (!f) return;
     const r = new FileReader();
     r.onload = () => {
@@ -89,6 +112,41 @@ export default function Catalogue() {
       setBulkMsg(`Imported ${added} items from ${f.name}.`);
     };
     r.readAsText(f);
+  };
+
+  // Gate 2, Step B — PDF linesheet upload. Prompts for a lookbook name (no new
+  // modal UI, per frontend-strict spirit — plain prompt() is the approved minimal
+  // pattern since nothing suitable already exists in this file), reads the file as
+  // raw bytes, then hands off to the generatePdfUploadUrl Convex action via db.js.
+  const onPdfUpload = async (f) => {
+    if (!f) return;
+    const lookbookName = window.prompt('Name this PDF lookbook (shown to clients):');
+    if (!lookbookName || !lookbookName.trim()) return; // cancelled/empty — abort cleanly, no upload attempt
+    setPdfUploading(true);
+    setBulkMsg('Uploading PDF…');
+    try {
+      const bytes = await f.arrayBuffer();
+      const res = await uploadPdfLookbook(bytes, f.name, lookbookName.trim());
+      if (res && res.ok) {
+        setBulkMsg(`"${lookbookName.trim()}" PDF lookbook uploaded successfully.`);
+        // Refresh the Step A selector so the new PDF-lookbook is pickable right away.
+        getLookbooksForSelector().then((rows) => { if (Array.isArray(rows)) setLookbookOptions(rows); });
+      } else {
+        setBulkMsg('PDF upload failed — please try again.');
+      }
+    } catch (err) {
+      setBulkMsg(`PDF upload failed: ${err?.message || 'please try again.'}`);
+    } finally {
+      setPdfUploading(false);
+    }
+  };
+
+  // File-type router for the CSV/PDF linesheet card — dispatches to the
+  // unchanged CSV parser or the new PDF upload flow based on extension.
+  const onBulkFile = (f) => {
+    if (!f) return;
+    if (f.name.toLowerCase().endsWith('.pdf')) { onPdfUpload(f); return; }
+    onCsvParse(f);
   };
 
   return (
@@ -106,11 +164,11 @@ export default function Catalogue() {
           <h3 className="luxe-title text-lg mb-3">Bulk loader</h3>
           <div
             onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => { e.preventDefault(); onCsv(e.dataTransfer.files?.[0]); }}
+            onDrop={(e) => { e.preventDefault(); onBulkFile(e.dataTransfer.files?.[0]); }}
             onClick={() => csvRef.current?.click()}
             className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
           >
-            <input ref={csvRef} type="file" accept=".csv,.pdf,text/csv" className="hidden" onChange={(e) => onCsv(e.target.files?.[0])} />
+            <input ref={csvRef} type="file" accept=".csv,.pdf,text/csv" className="hidden" onChange={(e) => onBulkFile(e.target.files?.[0])} />
             <div className="text-2xl mb-2">📄</div>
             <div className="text-sm">Drag & drop a CSV / PDF linesheet</div>
             <div className="text-xs text-steel mt-1">Columns: Title, Price, Image URL</div>
@@ -124,8 +182,8 @@ export default function Catalogue() {
             </div>
           )}
           {bulkMsg && <div className="text-xs text-gold mt-2">{bulkMsg}</div>}
-          <button onClick={() => pdfRef.current?.click()} className="btn-ghost w-full mt-3">Upload PDF linesheet</button>
-          <input ref={pdfRef} type="file" accept=".pdf" className="hidden" onChange={() => setBulkMsg('PDF linesheet received — image URLs must be added from the Instagram flow for a shoppable feed.')} />
+          <button onClick={() => pdfRef.current?.click()} disabled={pdfUploading} className="btn-ghost w-full mt-3">{pdfUploading ? 'Uploading…' : 'Upload PDF linesheet'}</button>
+          <input ref={pdfRef} type="file" accept=".pdf" className="hidden" onChange={(e) => onPdfUpload(e.target.files?.[0])} />
         </section>
 
         <section className="card p-6">
@@ -157,7 +215,18 @@ export default function Catalogue() {
             </div>
             <div><label className="label">Image URL</label><input className="input" value={manual.image_url} onChange={(e) => setManual({ ...manual, image_url: e.target.value })} /></div>
             <div><label className="label">Instagram link (optional)</label><input className="input" value={manual.instagram_link} onChange={(e) => setManual({ ...manual, instagram_link: e.target.value })} /></div>
-            <button onClick={addManual} className="btn-ink w-full" disabled={!manual.title || !manual.price}>Add to catalogue</button>
+            <div>
+              <label className="label">Add to</label>
+              <select className="input" value={addTo} onChange={(e) => setAddTo(e.target.value)}>
+                <option value="all">Current catalogue</option>
+                {designerLookbooks.map((lb) => <option key={lb._id} value={lb._id}>{lb.name}</option>)}
+                <option value="__new__">+ New designer lookbook</option>
+              </select>
+            </div>
+            {addTo === '__new__' && (
+              <div><label className="label">New lookbook name</label><input className="input" value={newLookbookName} onChange={(e) => setNewLookbookName(e.target.value)} placeholder="e.g. Sabyasachi · Spring" /></div>
+            )}
+            <button onClick={addManual} className="btn-ink w-full" disabled={!manual.title || !manual.price || (addTo === '__new__' && !newLookbookName.trim())}>Add to catalogue</button>
           </div>
         </section>
       </div>

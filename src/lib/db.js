@@ -351,6 +351,20 @@ export function getLookbooksForSelector() {
 }
 
 /**
+ * Upload a PDF linesheet as a new PDF-kind lookbook (Gate 2, Step B).
+ * `generatePdfUploadUrl` is an ACTION (not a mutation) — invoke with client.action,
+ * same pattern as forgotPassword() above. Unlike forgotPassword (anti-enumeration,
+ * always resolves ok:true), this bridge PROPAGATES real errors so the Catalogue.jsx
+ * upload card can show the failure to the merchant instead of silently swallowing it
+ * (see CLAUDE.md §12 lesson 4 — fallback only on network failure, not validation errors).
+ */
+export function uploadPdfLookbook(file, filename, lookbookName) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.lookbooks.generatePdfUploadUrl, { file, filename, lookbookName });
+}
+
+/**
  * Fetch a single catalogue piece by its Convex id (async).
  * No backend query exists for a lone item, so we walk the lookbooks client-side
  * (allowed: db.js is the data-layer bridge) and return the first matching piece,
