@@ -23,6 +23,8 @@ export default function Catalogue() {
   const [bulkMsg, setBulkMsg] = useState('');
     const [csvPreview, setCsvPreview] = useState(null);
     const [pdfUploading, setPdfUploading] = useState(false);
+    const [pendingPdfFile, setPendingPdfFile] = useState(null);
+    const [pdfNameInput, setPdfNameInput] = useState('');
     const [copiedId, setCopiedId] = useState(null);
     const [selected, setSelected] = useState('all'); // 'all' = Current catalogue, else lookbook _id
     const [lookbookOptions, setLookbookOptions] = useState([]);
@@ -114,13 +116,13 @@ export default function Catalogue() {
     r.readAsText(f);
   };
 
-  // Gate 2, Step B — PDF linesheet upload. Prompts for a lookbook name (no new
-  // modal UI, per frontend-strict spirit — plain prompt() is the approved minimal
-  // pattern since nothing suitable already exists in this file), reads the file as
-  // raw bytes, then hands off to the generatePdfUploadUrl Convex action via db.js.
-  const onPdfUpload = async (f) => {
+  // Gate 2, Step B — PDF linesheet upload. Selecting/dropping a PDF stages it in
+  // `pendingPdfFile` and shows an inline luxury-styled name field in the card
+  // (see JSX below) instead of a native window.prompt(). Confirming there calls
+  // this with the typed name, reads the file as raw bytes, then hands off to the
+  // generatePdfUploadUrl Convex action via db.js — upload logic unchanged.
+  const onPdfUpload = async (f, lookbookName) => {
     if (!f) return;
-    const lookbookName = window.prompt('Name this PDF lookbook (shown to clients):');
     if (!lookbookName || !lookbookName.trim()) return; // cancelled/empty — abort cleanly, no upload attempt
     setPdfUploading(true);
     setBulkMsg('Uploading PDF…');
@@ -138,16 +140,21 @@ export default function Catalogue() {
       setBulkMsg(`PDF upload failed: ${err?.message || 'please try again.'}`);
     } finally {
       setPdfUploading(false);
+      setPendingPdfFile(null);
+      setPdfNameInput('');
     }
   };
 
   // File-type router for the CSV/PDF linesheet card — dispatches to the
-  // unchanged CSV parser or the new PDF upload flow based on extension.
+  // unchanged CSV parser, or stages the PDF for inline name entry.
   const onBulkFile = (f) => {
     if (!f) return;
-    if (f.name.toLowerCase().endsWith('.pdf')) { onPdfUpload(f); return; }
+    if (f.name.toLowerCase().endsWith('.pdf')) { setPendingPdfFile(f); setPdfNameInput(''); return; }
     onCsvParse(f);
   };
+
+  const confirmPdfUpload = () => { onPdfUpload(pendingPdfFile, pdfNameInput); };
+  const cancelPdfUpload = () => { setPendingPdfFile(null); setPdfNameInput(''); };
 
   return (
     <div className="space-y-10">
@@ -181,9 +188,30 @@ export default function Catalogue() {
               </table>
             </div>
           )}
+          {pendingPdfFile && (
+            <div className="mt-3 space-y-2">
+              <label className="label">Name this PDF lookbook (shown to clients)</label>
+              <input
+                className="input"
+                placeholder="e.g. Sabyasachi · Spring Linesheet"
+                value={pdfNameInput}
+                onChange={(e) => setPdfNameInput(e.target.value)}
+                autoFocus
+              />
+              <div className="text-[10px] text-steel truncate">Selected: {pendingPdfFile.name}</div>
+              <div className="flex items-center gap-2">
+                <button onClick={confirmPdfUpload} disabled={pdfUploading || !pdfNameInput.trim()} className="btn-ink flex-1">
+                  {pdfUploading ? 'Uploading…' : 'Confirm & Upload'}
+                </button>
+                <button onClick={cancelPdfUpload} disabled={pdfUploading} className="btn-ghost flex-1">Cancel</button>
+              </div>
+            </div>
+          )}
           {bulkMsg && <div className="text-xs text-gold mt-2">{bulkMsg}</div>}
-          <button onClick={() => pdfRef.current?.click()} disabled={pdfUploading} className="btn-ghost w-full mt-3">{pdfUploading ? 'Uploading…' : 'Upload PDF linesheet'}</button>
-          <input ref={pdfRef} type="file" accept=".pdf" className="hidden" onChange={(e) => onPdfUpload(e.target.files?.[0])} />
+          {!pendingPdfFile && (
+            <button onClick={() => pdfRef.current?.click()} disabled={pdfUploading} className="btn-ghost w-full mt-3">{pdfUploading ? 'Uploading…' : 'Upload PDF linesheet'}</button>
+          )}
+          <input ref={pdfRef} type="file" accept=".pdf" className="hidden" onChange={(e) => { setPendingPdfFile(e.target.files?.[0] || null); setPdfNameInput(''); }} />
         </section>
 
         <section className="card p-6">

@@ -15,6 +15,13 @@ export default function PublicLookbook() {
     getLookbookById(lookbookId)
       .then((data) => {
         if (mounted) {
+          if (data && data.kind === 'pdf' && data.pdf_url) {
+            // PDF-kind lookbooks have no catalogue items — open the linesheet
+            // natively instead of rendering an (empty) items grid. Keep the
+            // loading spinner up until the browser navigates away.
+            window.location.replace(data.pdf_url);
+            return;
+          }
           if (data) setLookbook(data);
           else setError(true);
           setLoading(false);
