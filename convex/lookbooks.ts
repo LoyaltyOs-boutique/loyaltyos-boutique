@@ -47,6 +47,30 @@ export const getLookbooks = query({
   },
 });
 
+/**
+ * Gate 2 (Step A) — flat projection for the Catalogue.jsx lookbook/PDF selector
+ * dropdown. Returns only what the UI needs (_id, name, kind) — deliberately NOT
+ * the full lookbook doc, matching the toMerchantCustomer-style thin-projection
+ * pattern used elsewhere (see convex/customers.ts) to keep confidential/unused
+ * fields out of client responses.
+ *
+ * Note: the table's display-name field is `title`, but the design spec's
+ * selector shape is `{_id, name, kind}` — so we relabel title -> name here.
+ * The implicit "Current catalogue" pseudo-option is UI-only and NOT included
+ * in this list (it isn't a real lookbooks row).
+ */
+export const getLookbooksForSelector = query({
+  args: {},
+  handler: async (ctx) => {
+    const lookbooks = await ctx.db.query("lookbooks").collect();
+    return lookbooks.map((lb) => ({
+      _id: lb._id,
+      name: lb.title,
+      kind: lb.kind,
+    }));
+  },
+});
+
 /** Get lookbook + items (by_lookbook index). */
 export const getLookbookById = query({
   args: { id: v.id("lookbooks") },

@@ -368,3 +368,81 @@ export const createCustomer = mutation({
     };
   },
 });
+
+/**
+ * Gate 1 — Bulk CSV customer import.
+ * Reuses createCustomer's exact validation + duplicate-mobile-check logic
+ * (10-digit mobile required, by_mobile index lookup) row by row, so a bad
+ * or duplicate row is SKIPPED (reported back) rather than crashing the batch.
+ * Also skips duplicate mobiles appearing more than once within the same file.
+ *
+ * NOTE: city/country are accepted (CSV column parity with the onboarding
+ * form) but — matching createCustomer today — are not persisted; the users
+ * schema has no city/country fields yet.
+ */
+export const bulkCreateCustomers = mutation({
+  args: {
+    rows: v.array(
+      v.object({
+        name: v.string(),
+        whatsapp: v.string(),
+        birthday: v.optional(v.string()),
+        anniversary: v.optional(v.string()),
+        city: v.optional(v.string()),
+        country: v.optional(v.string()),
+      }),
+    ),
+  },
+  handler: async (ctx, { rows }) => {
+    const created: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
+    const skipped: Array<{ name: string; whatsapp: string; reason: string }> = [];
+    const seenInFile = new Set<string>();
+
+    for (const row of rows) {
+      const digits = row.whatsapp.replace(/\D/g, "");
+      const customerName = row.name.trim();
+
+      if (!customerName) {
+        skipped.push({ name: row.name, whatsapp: row.whatsapp, reason: "missing_name" });
+        continue;
+      }
+      if (digits.length !== 10) {
+        skipped.push({ name: customerName, whatsapp: row.whatsapp, reason: "invalid_mobile" });
+        continue;
+      }
+      if (seenInFile.has(digits)) {
+        skipped.push({ name: customerName, whatsapp: digits, reason: "duplicate_in_file" });
+        continue;
+      }
+
+      // Same duplicate-mobile-check as createCustomer: by_mobile index lookup.
+      const existing = await ctx.db
+        .query("users")
+        .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+        .first();
+      if (existing) {
+        skipped.push({ name: customerName, whatsapp: digits, reason: "duplicate_existing" });
+        continue;
+      }
+
+      seenInFile.add(digits);
+      const id = await ctx.db.insert("users", {
+        mobile: digits,
+        name: customerName,
+        role: "customer",
+        points: 0,
+        tier: "silver",
+        ...(row.birthday ? { birthday: row.birthday.trim() } : {}),
+        ...(row.anniversary ? { anniversary: row.anniversary.trim() } : {}),
+      });
+      created.push({ id, name: customerName, mobile: digits });
+    }
+
+    return {
+      created,
+      skipped,
+      createdCount: created.length,
+      skippedCount: skipped.length,
+    };
+  },
+});

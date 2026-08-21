@@ -84,6 +84,13 @@ export default defineSchema({
       v.literal("instagram"),
     ),
     created_at: v.optional(v.number()),
+    // Gate 2 (Step A) — distinguishes a designer-lookbook from a future PDF-lookbook
+    // for the Catalogue.jsx selector dropdown. Missing/undefined on existing rows =
+    // treated as "catalogue" grouping (unaffected), same optional-field pattern as
+    // reviews.catalogue_item_id above.
+    kind: v.optional(
+      v.union(v.literal("catalogue"), v.literal("designer"), v.literal("pdf")),
+    ),
   }),
 
   /** PRD §6 Table `catalogue_items` — items inside a lookbook. */
