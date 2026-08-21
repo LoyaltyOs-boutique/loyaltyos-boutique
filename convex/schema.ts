@@ -47,6 +47,8 @@ export default defineSchema({
       v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     ),
     custom_tags: v.optional(v.array(v.string())), // e.g. "Saree Enthusiast", "Needs Care"
+    whatsapp_consent: v.optional(v.boolean()), // Gate 1 — customer opted in to WhatsApp messages
+    is_deleted: v.optional(v.boolean()), // Gate 1 — soft-delete flag; missing/false = active
     measurements: v.optional(
       v.object({
         bust: v.optional(v.number()),
@@ -91,6 +93,8 @@ export default defineSchema({
     price: v.number(), // PAISE (₹12,500 → 1,250,000)
     image_url: v.string(),
     instagram_link: v.optional(v.string()),
+    size: v.optional(v.string()), // Gate 2 — e.g. "S", "M", "L", "Free Size"
+    colour: v.optional(v.string()), // Gate 2 — e.g. "Ivory", "Blush"
   }).index("by_lookbook", ["lookbook_id"]),
 
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */
