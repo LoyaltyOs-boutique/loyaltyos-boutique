@@ -49,6 +49,10 @@ import { v } from "convex/values";
 export const SETTINGS_KEYS = {
   LOYALTY_RULES: "loyalty_rules",
   TEMPLATES: "templates",
+  // Templates Phase 3 — merchant-replaceable Anniversary/Birthday card
+  // images. Deliberately NOT named "templates" — that key already means
+  // WhatsApp message-copy templates (PRD §8) and would silently collide.
+  TEMPLATE_CARDS: "template_cards",
 } as const;
 
 /** Union type of the known settings group keys. */
@@ -211,6 +215,49 @@ function mergeTemplates(
 }
 
 // ============================================================================
+// SECTION 3B — Template card images (Templates Phase 3)
+// Design spec: docs/superpowers/specs/2026-08-22-templates-phase3-replaceable-cards-design.md
+// ============================================================================
+
+/** Card type keys — the two merchant-replaceable card images. */
+export const TEMPLATE_CARD_KEYS = ["anniversary", "birthday"] as const;
+
+/** Union type of the template card keys. */
+export type TemplateCardKey = (typeof TEMPLATE_CARD_KEYS)[number];
+
+/** Validator for the card type argument. */
+export const templateCardKeyValidator = v.union(
+  v.literal("anniversary"),
+  v.literal("birthday"),
+);
+
+/**
+ * DEFAULT TEMPLATE CARDS — Ma'am's real card designs, already uploaded to
+ * Vercel Blob (Templates Phase 2). Used whenever the "template_cards"
+ * settings doc doesn't exist yet, or is missing one of the two fields —
+ * this guarantees getTemplateCardUrls/setTemplateCardUrl always resolve to
+ * a real URL, never null/undefined.
+ */
+export const DEFAULT_TEMPLATE_CARDS: Record<TemplateCardKey, string> = {
+  anniversary: "https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-v3-j8Wx0uuIVRtNeJ4HPnEgYzfBdoUWdi.png",
+  birthday: "https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-v3-ceGMUhD5Iwq0AP0f99yotycwhEBCJv.png",
+};
+
+/**
+ * Merge the stored "template_cards" value over the defaults — same
+ * missing-field-safe pattern as mergeTemplates above, so a partially
+ * written doc (or none at all) still resolves both fields to real URLs.
+ */
+function mergeTemplateCards(
+  stored: Partial<Record<TemplateCardKey, string>> | undefined,
+): Record<TemplateCardKey, string> {
+  return {
+    anniversary: stored?.anniversary || DEFAULT_TEMPLATE_CARDS.anniversary,
+    birthday: stored?.birthday || DEFAULT_TEMPLATE_CARDS.birthday,
+  };
+}
+
+// ============================================================================
 // SECTION 4 — Shared helpers (upsert + read-merge, no duplication)
 // ============================================================================
 
@@ -218,7 +265,7 @@ function mergeTemplates(
  * Fetch the singleton settings document for a group key, or null if it
  * has never been written (fresh deployment → defaults apply).
  */
-async function getSettingsDoc(ctx: MutationCtx, key: SettingsKey) {
+async function getSettingsDoc(ctx: QueryCtx | MutationCtx, key: SettingsKey) {
   return ctx.db
     .query("settings")
     .withIndex("by_key", (q) => q.eq("key", key))
@@ -361,6 +408,47 @@ export const updateTemplate = mutation({
 
     await upsertSettings(ctx, SETTINGS_KEYS.TEMPLATES, nextValue);
     return readMergedSettings(ctx);
+  },
+});
+
+/**
+ * Get the current active Anniversary/Birthday card image URLs
+ * (Templates Phase 3). Falls back to DEFAULT_TEMPLATE_CARDS for either
+ * field that's missing or if the doc has never been written — never
+ * returns null/undefined, matching the design spec's requirement that
+ * middleware.js's fail-open path always has a real URL to redirect to.
+ */
+export const getTemplateCardUrls = query({
+  args: {},
+  handler: async (ctx) => {
+    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.TEMPLATE_CARDS);
+    const stored = doc?.value as Partial<Record<TemplateCardKey, string>> | undefined;
+    return mergeTemplateCards(stored);
+  },
+});
+
+/**
+ * Replace ONE card type's active image URL, leaving the other untouched.
+ *
+ * CRITICAL: upsertSettings performs a WHOLE-VALUE overwrite, not a deep
+ * merge (see its implementation above) — so this reads the current merged
+ * value first and spreads it before overriding only `type`, exactly
+ * mirroring updateTemplate's read-merge-write pattern above. A naive
+ * upsertSettings(ctx, KEY, { [type]: url }) would silently wipe the other
+ * card type's stored URL — this is the bug the design spec's review caught.
+ */
+export const setTemplateCardUrl = mutation({
+  args: {
+    type: templateCardKeyValidator,
+    url: v.string(),
+  },
+  handler: async (ctx, { type, url }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.TEMPLATE_CARDS);
+    const stored = existing?.value as Partial<Record<TemplateCardKey, string>> | undefined;
+    const current = mergeTemplateCards(stored); // spread the full current state first
+    const nextValue: Record<TemplateCardKey, string> = { ...current, [type]: url }; // override only the changed field
+    await upsertSettings(ctx, SETTINGS_KEYS.TEMPLATE_CARDS, nextValue);
+    return nextValue;
   },
 });
 

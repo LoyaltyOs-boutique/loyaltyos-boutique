@@ -35,18 +35,30 @@ const escapeHtml = (s) =>
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 
-// Templates card-image paths — Gate 2 extension. Static lookup, no Convex
-// call needed (unlike the lookbook branches below) since these are two
-// fixed images, not per-record data.
-const TEMPLATE_CARDS = {
-  '/templates/card/anniversary': {
-    title: 'Happy Anniversary',
-    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-v3-j8Wx0uuIVRtNeJ4HPnEgYzfBdoUWdi.png',
-  },
-  '/templates/card/birthday': {
-    title: 'Happiest Birthday',
-    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-v3-ceGMUhD5Iwq0AP0f99yotycwhEBCJv.png',
-  },
+// Templates card-image paths — Gate 2 extension, Phase 3 (merchant-
+// replaceable cards). Titles are fixed per type (not merchant-editable,
+// per the design spec — only the image URL is). The Blob URL itself is
+// now read live from Convex (settings.getTemplateCardUrls) at request
+// time, so a merchant's card replacement takes effect immediately with
+// no redeploy — mirrors the /lookbook/* branches' ConvexHttpClient
+// pattern below.
+const TEMPLATE_CARD_TYPE_BY_PATH = {
+  '/templates/card/anniversary': 'anniversary',
+  '/templates/card/birthday': 'birthday',
+};
+
+const TEMPLATE_CARD_TITLES = {
+  anniversary: 'Happy Anniversary',
+  birthday: 'Happiest Birthday',
+};
+
+// Fallback only — used if the live Convex query fails/times out/throws.
+// Duplicated from convex/settings.ts's DEFAULT_TEMPLATE_CARDS (not
+// imported — middleware.js runs in a separate deployment context) so
+// this branch always has a real image to serve, never a broken link.
+const TEMPLATE_CARD_FALLBACKS = {
+  anniversary: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-v3-j8Wx0uuIVRtNeJ4HPnEgYzfBdoUWdi.png',
+  birthday: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-v3-ceGMUhD5Iwq0AP0f99yotycwhEBCJv.png',
 };
 
 function ogHtml({ title, description, image, url }) {
@@ -77,15 +89,32 @@ export default async function middleware(request) {
   // these two paths, so non-crawler requests redirect straight to the real
   // image instead of the generic next() fail-open used for /lookbook/*.
   const cardUrl = new URL(request.url);
-  const card = TEMPLATE_CARDS[cardUrl.pathname];
-  if (card) {
+  const cardType = TEMPLATE_CARD_TYPE_BY_PATH[cardUrl.pathname];
+  if (cardType) {
     try {
+      // Start from the hardcoded fallback, then try to replace it with the
+      // live setting. A Convex failure here must NOT fall through to
+      // next() (unlike /lookbook/*) — there's no SPA route for these paths,
+      // so we still need to return a valid response using the fallback.
+      let image = TEMPLATE_CARD_FALLBACKS[cardType];
+      const convexUrl = process.env.VITE_CONVEX_URL;
+      if (convexUrl) {
+        try {
+          const client = new ConvexHttpClient(convexUrl);
+          const urls = await client.query(api.settings.getTemplateCardUrls, {});
+          if (urls && urls[cardType]) image = urls[cardType];
+        } catch {
+          // Live query failed — keep the fallback already assigned above.
+        }
+      }
+
+      const title = TEMPLATE_CARD_TITLES[cardType];
       if (CRAWLER_UA_PATTERN.test(ua)) {
         const pageUrl = `${cardUrl.origin}${cardUrl.pathname}`;
-        const html = ogHtml({ title: card.title, description: '85 Lansdowne', image: card.image, url: pageUrl });
+        const html = ogHtml({ title, description: '85 Lansdowne', image, url: pageUrl });
         return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
       }
-      return new Response(null, { status: 302, headers: { location: card.image } });
+      return new Response(null, { status: 302, headers: { location: image } });
     } catch {
       // Never break — even though there's no SPA fallback for these paths,
       // erring toward "doesn't crash" over "doesn't redirect".

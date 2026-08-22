@@ -1,18 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
-import { getCustomers, uploadTemplateMedia } from '../../lib/db.js';
+import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl } from '../../lib/db.js';
 
 // Templates — Phase 1 (structure only). Design spec:
 // docs/superpowers/specs/2026-08-22-templates-section-phase1-design.md
 // Phase 2 (static card-image send) design spec:
 // docs/superpowers/specs/2026-08-22-templates-static-card-send-design.md
+// Phase 3 (merchant-replaceable card images) design spec:
+// docs/superpowers/specs/2026-08-22-templates-phase3-replaceable-cards-design.md
 
-// One-time Vercel Blob uploads of Ma'am's real card designs (see Phase 2
-// spec) — stable public URLs, hardcoded since the images don't change
-// per-customer.
 // Same-origin OG-preview paths (middleware.js) instead of the raw Blob URLs
 // directly — WhatsApp's crawler does not reliably unfurl bare media URLs
 // (same discovery as the PDF-lookbook case); these paths serve real OG tags
-// to crawlers and redirect real browsers straight to the image.
+// to crawlers and redirect real browsers straight to the image. These do
+// NOT need to change for Phase 3 — middleware.js now resolves them to the
+// CURRENT live card URL at request time (settings.getTemplateCardUrls), so
+// the stable same-origin path already always reflects a merchant's
+// replacement without any change here.
 const ANNIVERSARY_CARD_URL = `${window.location.origin}/templates/card/anniversary`;
 const BIRTHDAY_CARD_URL = `${window.location.origin}/templates/card/birthday`;
 //
@@ -122,13 +125,53 @@ function CardSelect({ options, selectedIdx, onSelect }) {
 /**
  * Anniversary / Birthday card — identical structure per the spec, only the
  * eyebrow/title/placeholder template/card options differ between instances.
+ *
+ * Phase 3: cardType is hardcoded per call site ('anniversary' or
+ * 'birthday' — never derived from shared/ambiguous state), so the
+ * "Replace card" control structurally cannot cross-contaminate the two
+ * types. currentImageUrl is the live active Blob URL (fetched once by the
+ * parent), shown as a preview so the merchant can see what's actually
+ * active — separate from cardOptions[].url, which stays the stable
+ * same-origin /templates/card/... path used for the wa.me send (unchanged
+ * by Phase 3 — middleware.js resolves it live).
  */
-function MomentCard({ eyebrow, title, template, customers, cardOptions }) {
+function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType, currentImageUrl }) {
   const [name, setName] = useState('');
   const [nickname, setNickname] = useState('');
   const [phone, setPhone] = useState('');
   const [message, setMessage] = useState('');
   const [selectedCardIdx, setSelectedCardIdx] = useState(0);
+
+  // Local optimistic copy of the active image — initialized from the
+  // parent's fetched value, updated immediately after a successful replace.
+  const [activeImageUrl, setActiveImageUrl] = useState(currentImageUrl || '');
+  useEffect(() => { setActiveImageUrl(currentImageUrl || ''); }, [currentImageUrl]);
+
+  const [replacing, setReplacing] = useState(false);
+  const [replaceMsg, setReplaceMsg] = useState('');
+  const replaceRef = useRef(null);
+
+  const onReplaceFile = async (f) => {
+    if (!f) return;
+    if (!f.type.startsWith('image/')) { setReplaceMsg('Only image files are supported.'); return; }
+    setReplacing(true);
+    setReplaceMsg('Uploading…');
+    try {
+      const bytes = await f.arrayBuffer();
+      const res = await uploadTemplateMedia(bytes, f.name, f.type);
+      if (res && res.ok) {
+        await setTemplateCardUrl(cardType, res.url); // cardType hardcoded per instance — never the other type
+        setActiveImageUrl(res.url); // optimistic — next send already uses the live-resolved same-origin path
+        setReplaceMsg('Card replaced.');
+      } else {
+        setReplaceMsg('Upload failed — please try again.');
+      }
+    } catch (err) {
+      setReplaceMsg(`Upload failed: ${err?.message || 'please try again.'}`);
+    } finally {
+      setReplacing(false);
+    }
+  };
 
   // Auto-fills the message textarea from the hardcoded Phase-1 placeholder
   // whenever name/nickname changes; merchant can still hand-edit it before
@@ -162,7 +205,22 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions }) {
           <textarea className="input" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} />
         </div>
         <CardSelect options={cardOptions} selectedIdx={selectedCardIdx} onSelect={setSelectedCardIdx} />
-        <button onClick={send} disabled={!phone.trim() || !message.trim()} className="btn-ink w-full">Send via WhatsApp</button>
+        <div>
+          <label className="label">Replace card</label>
+          {activeImageUrl && <img src={activeImageUrl} alt="Current card" className="mt-1 mb-2 h-28 w-full object-cover border border-line" />}
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => { e.preventDefault(); onReplaceFile(e.dataTransfer.files?.[0]); }}
+            onClick={() => replaceRef.current?.click()}
+            className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
+          >
+            <input ref={replaceRef} type="file" accept="image/*" className="hidden" onChange={(e) => onReplaceFile(e.target.files?.[0])} />
+            <div className="text-2xl mb-2">📎</div>
+            <div className="text-sm">Drag & drop a new card image</div>
+          </div>
+          {replaceMsg && <div className="text-xs text-gold mt-2">{replaceMsg}</div>}
+        </div>
+        <button onClick={send} disabled={!phone.trim() || !message.trim() || replacing} className="btn-ink w-full">Send via WhatsApp</button>
       </div>
     </section>
   );
@@ -230,10 +288,17 @@ function MediaCard({ customers }) {
 
 export default function Templates() {
   const [customers, setCustomers] = useState([]);
+  const [cardUrls, setCardUrls] = useState({ anniversary: '', birthday: '' });
 
   useEffect(() => {
     let mounted = true;
     getCustomers().then((rows) => { if (mounted && Array.isArray(rows)) setCustomers(rows); });
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    getTemplateCardUrls().then((urls) => { if (mounted && urls) setCardUrls(urls); });
     return () => { mounted = false; };
   }, []);
 
@@ -251,6 +316,8 @@ export default function Templates() {
           template="Happy anniversary, {name}! With love, 85 Lansdowne."
           customers={customers}
           cardOptions={[{ label: 'Anniversary card', url: ANNIVERSARY_CARD_URL }]}
+          cardType="anniversary"
+          currentImageUrl={cardUrls.anniversary}
         />
         <MomentCard
           eyebrow="Personal moment"
@@ -258,6 +325,8 @@ export default function Templates() {
           template="Happy birthday, {name}! With love, 85 Lansdowne."
           customers={customers}
           cardOptions={[{ label: 'Birthday card', url: BIRTHDAY_CARD_URL }]}
+          cardType="birthday"
+          currentImageUrl={cardUrls.birthday}
         />
         <MediaCard customers={customers} />
       </div>
