@@ -196,7 +196,6 @@ export default function Templates() {
   return (
     <div className="space-y-10">
       <div>
-        <div className="eyebrow mb-1">Anti-Shopify · Templates</div>
         <h1 className="luxe-title text-3xl">Templates</h1>
         <p className="text-sm text-steel mt-2">Send personal moments and media to your customers on WhatsApp.</p>
       </div>
