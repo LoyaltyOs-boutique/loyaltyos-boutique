@@ -365,6 +365,43 @@ export function uploadPdfLookbook(file, filename, lookbookName) {
 }
 
 /**
+ * Upload arbitrary media (video/image/PDF) for the Templates section's
+ * Video/Image/PDF Send card (Phase 1, structure only). Same PROPAGATE-real-
+ * errors bridge pattern as uploadPdfLookbook above — no silent fallback, no
+ * DB row to persist to (Phase 1 has no template-media table; the caller only
+ * needs the returned Blob URL to build the wa.me message text).
+ */
+export function uploadTemplateMedia(file, filename, contentType) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.templates.generateTemplateMediaUploadUrl, { file, filename, contentType });
+}
+
+/**
+ * Current active Anniversary/Birthday card image URLs (Templates Phase 3).
+ * Always resolves to real URLs (backend falls back to defaults) — falls
+ * back to [] here only on network/offline failure, same as
+ * getLookbooksForSelector above.
+ */
+export function getTemplateCardUrls() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.settings.getTemplateCardUrls).catch(() => null);
+}
+
+/**
+ * Replace one card type's active image URL (Templates Phase 3). Same
+ * PROPAGATE-real-errors pattern as uploadTemplateMedia/uploadPdfLookbook —
+ * no silent fallback, so the merchant sees a real failure instead of a
+ * silently-ignored replace.
+ */
+export function setTemplateCardUrl(type, url) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.settings.setTemplateCardUrl, { type, url });
+}
+
+/**
  * Fetch a single catalogue piece by its Convex id (async).
  * No backend query exists for a lone item, so we walk the lookbooks client-side
  * (allowed: db.js is the data-layer bridge) and return the first matching piece,

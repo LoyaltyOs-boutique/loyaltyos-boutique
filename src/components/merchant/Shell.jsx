@@ -10,6 +10,7 @@ const NAV = [
   { to: '/merchant/onboarding', label: 'Client Onboarding', icon: '✍' },
   { to: '/merchant/campaigns', label: 'WhatsApp Campaigns', icon: '✆' },
   { to: '/merchant/catalogue', label: 'Lookbook Manager', icon: '❖' },
+  { to: '/merchant/templates', label: 'Templates', icon: '▤' },
   { to: '/merchant/settings', label: 'Settings & Support', icon: '✦' },
 ];
 
