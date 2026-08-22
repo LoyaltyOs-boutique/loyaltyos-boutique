@@ -1,16 +1,87 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { onboardCustomerRemote, waMessage, waDigits } from '../../lib/db.js';
+import { useConvex } from 'convex/react';
+import { onboardCustomerRemote, waMessage, waDigits, getData, subscribe, customers } from '../../lib/db.js';
 import { COUNTRIES, BRAND } from '../../data/seed.js';
 
+const useDb = () => {
+  const [, setV] = useState(0);
+  useEffect(() => subscribe(() => setV((v) => v + 1)), []);
+  return getData();
+};
+
+/** Parse a free-text birthday/anniversary CSV cell into "M-D" (matches the single-add flow's format). */
+const csvToMD = (v) => {
+  if (!v) return '';
+  const trimmed = v.trim();
+  if (/^\d{1,2}-\d{1,2}$/.test(trimmed)) return trimmed; // already M-D
+  const d = new Date(trimmed);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getMonth() + 1}-${d.getDate()}`;
+};
+
 export default function Onboarding() {
+  useDb(); // hydrate local customer cache so CSV preview can detect duplicates
+  const convex = useConvex(); // shared client from <ConvexProvider> in main.jsx
   const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '' });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
   const [creating, setCreating] = useState(false);
   const [mobileError, setMobileError] = useState('');
   const set = (k) => (e) => { setF({ ...f, [k]: e.target.value }); if (k === 'whatsapp') setMobileError(''); };
+
+  // Gate 1 — CSV bulk import (same parsing pattern as Catalogue.jsx's onCsv()).
+  const [csvPreview, setCsvPreview] = useState(null); // {rows, toCreate, toSkip}
+  const [bulkResult, setBulkResult] = useState(null); // {createdCount, skippedCount, skipped}
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const csvRef = useRef(null);
+
+  const onBulkCsv = (file) => {
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      const lines = String(r.result).split(/\r?\n/).filter((l) => l.trim());
+      const dataLines = lines.length && /^name\s*,/i.test(lines[0]) ? lines.slice(1) : lines;
+      const existingMobiles = new Set(customers().map((c) => c.mobile));
+      const seen = new Set();
+      const rows = dataLines.map((line) => {
+        const [name = '', whatsapp = '', birthday = '', anniversary = '', city = '', country = ''] = line.split(',').map((c) => c.trim());
+        const digits = waDigits(whatsapp);
+        const invalid = !name || digits.length !== 10;
+        const isDup = !invalid && (existingMobiles.has(digits) || seen.has(digits));
+        if (!invalid) seen.add(digits);
+        return { name, whatsapp, birthday, anniversary, city, country: country || 'India', invalid, isDup };
+      }).filter((row) => row.name || row.whatsapp);
+      const toCreate = rows.filter((row) => !row.invalid && !row.isDup).length;
+      setCsvPreview({ rows, toCreate, toSkip: rows.length - toCreate });
+      setBulkResult(null);
+    };
+    r.readAsText(file);
+  };
+
+  const confirmBulkImport = async () => {
+    if (!csvPreview) return;
+    setBulkBusy(true);
+    try {
+      const { api } = await import('../../../convex/_generated/api.js');
+      const payload = csvPreview.rows
+        .filter((row) => !row.invalid)
+        .map((row) => ({
+          name: row.name,
+          whatsapp: row.whatsapp,
+          ...(row.birthday ? { birthday: csvToMD(row.birthday) } : {}),
+          ...(row.anniversary ? { anniversary: csvToMD(row.anniversary) } : {}),
+          ...(row.city ? { city: row.city } : {}),
+          ...(row.country ? { country: row.country } : {}),
+        }));
+      const res = await convex.mutation(api.customers.bulkCreateCustomers, { rows: payload });
+      setBulkResult(res);
+      setCsvPreview(null);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
 
   // Magic-link fix: creates the client on Convex (ONE profile per WhatsApp
   // number) and mints a backend-issued 256-bit token, so the client's personal
@@ -167,6 +238,61 @@ export default function Onboarding() {
           )}
         </section>
       </div>
+
+      {/* Gate 1 — CSV bulk import */}
+      <section className="card p-6">
+        <div className="eyebrow mb-1">Bulk onboarding</div>
+        <h3 className="luxe-title text-lg mb-3">Import clients from CSV</h3>
+        <div
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => { e.preventDefault(); onBulkCsv(e.dataTransfer.files?.[0]); }}
+          onClick={() => csvRef.current?.click()}
+          className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
+        >
+          <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => onBulkCsv(e.target.files?.[0])} />
+          <div className="text-2xl mb-2">📄</div>
+          <div className="text-sm">Drag & drop a client CSV</div>
+          <div className="text-xs text-steel mt-1">Columns: Name, WhatsApp, Birthday, Anniversary, City, Country</div>
+        </div>
+
+        {csvPreview && (
+          <div className="mt-4">
+            <div className="text-sm mb-2">
+              <span className="text-gold font-medium">{csvPreview.toCreate} new customers</span>
+              {csvPreview.toSkip > 0 && <span className="text-steel"> · {csvPreview.toSkip} skipped as duplicates/invalid</span>}
+            </div>
+            <div className="max-h-56 overflow-y-auto scroll-thin mb-3">
+              <table className="tbl text-xs">
+                <thead><tr><th>Name</th><th>WhatsApp</th><th>Status</th></tr></thead>
+                <tbody>
+                  {csvPreview.rows.map((row, i) => (
+                    <tr key={i}>
+                      <td>{row.name || '—'}</td>
+                      <td>{row.whatsapp || '—'}</td>
+                      <td className={row.invalid || row.isDup ? 'text-steel' : 'text-gold'}>
+                        {row.invalid ? 'Invalid mobile' : row.isDup ? 'Duplicate' : 'Will be created'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={confirmBulkImport} className="btn-ink flex-1" disabled={bulkBusy || csvPreview.toCreate === 0}>
+                {bulkBusy ? 'Importing…' : `Confirm import (${csvPreview.toCreate})`}
+              </button>
+              <button onClick={() => setCsvPreview(null)} className="btn-ghost flex-1" disabled={bulkBusy}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {bulkResult && (
+          <div className="mt-4 text-sm border border-line bg-mist px-4 py-3">
+            <span className="text-gold font-medium">{bulkResult.createdCount} customers created</span>
+            {bulkResult.skippedCount > 0 && <span className="text-steel"> · {bulkResult.skippedCount} skipped</span>}
+          </div>
+        )}
+      </section>
     </div>
   );
 }

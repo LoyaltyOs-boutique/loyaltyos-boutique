@@ -9,6 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@vercel/blob": "^2.8.0",
+    "@vercel/functions": "^3.9.5",
     "bcryptjs": "^3.0.3",
     "canvas-confetti": "^1.9.4",
     "convex": "^1.43.0",

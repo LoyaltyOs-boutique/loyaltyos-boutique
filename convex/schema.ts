@@ -47,6 +47,8 @@ export default defineSchema({
       v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     ),
     custom_tags: v.optional(v.array(v.string())), // e.g. "Saree Enthusiast", "Needs Care"
+    whatsapp_consent: v.optional(v.boolean()), // Gate 1 — customer opted in to WhatsApp messages
+    is_deleted: v.optional(v.boolean()), // Gate 1 — soft-delete flag; missing/false = active
     measurements: v.optional(
       v.object({
         bust: v.optional(v.number()),
@@ -82,6 +84,18 @@ export default defineSchema({
       v.literal("instagram"),
     ),
     created_at: v.optional(v.number()),
+    // Gate 2 (Step A) — distinguishes a designer-lookbook from a future PDF-lookbook
+    // for the Catalogue.jsx selector dropdown. Missing/undefined on existing rows =
+    // treated as "catalogue" grouping (unaffected), same optional-field pattern as
+    // reviews.catalogue_item_id above.
+    kind: v.optional(
+      v.union(v.literal("catalogue"), v.literal("designer"), v.literal("pdf")),
+    ),
+    // Gate 2 (Step B) — public Vercel Blob URL for a PDF-kind lookbook
+    // (kind: "pdf"). Optional: only set when a PDF was actually uploaded via
+    // lookbooks.generatePdfUploadUrl -> createPdfLookbook; catalogue/designer
+    // lookbooks never set this field.
+    pdf_url: v.optional(v.string()),
   }),
 
   /** PRD §6 Table `catalogue_items` — items inside a lookbook. */
@@ -91,6 +105,8 @@ export default defineSchema({
     price: v.number(), // PAISE (₹12,500 → 1,250,000)
     image_url: v.string(),
     instagram_link: v.optional(v.string()),
+    size: v.optional(v.string()), // Gate 2 — e.g. "S", "M", "L", "Free Size"
+    colour: v.optional(v.string()), // Gate 2 — e.g. "Ivory", "Blush"
   }).index("by_lookbook", ["lookbook_id"]),
 
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */

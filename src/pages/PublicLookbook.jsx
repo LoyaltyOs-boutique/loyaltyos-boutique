@@ -76,8 +76,10 @@ export default function PublicLookbook() {
           </p>
         </section>
 
-        {/* Product grid */}
-        {items.length > 0 ? (
+        {/* Product grid (or inline PDF preview for kind: "pdf" lookbooks) */}
+        {lookbook.kind === 'pdf' && lookbook.pdf_url ? (
+          <iframe src={lookbook.pdf_url} className="w-full h-[600px]" title="PDF preview" />
+        ) : items.length > 0 ? (
           <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-10">
             {items.map((item) => (
               <article key={item._id || item.id} className="animate-fadeUp group">

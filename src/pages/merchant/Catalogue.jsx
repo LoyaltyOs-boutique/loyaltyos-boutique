@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById } from '../../lib/db.js';
+import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty } from '../../components/ui.jsx';
 
@@ -13,13 +14,57 @@ export default function Catalogue() {
   const db = useDb();
   const items = allCatalogue();
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
+  // Step C — Manual Entry "Add to" target: 'all' = Current catalogue (no lookbook_id),
+  // '__new__' = create a new designer lookbook (name from newLookbookName), else an existing lookbook _id.
+  const [addTo, setAddTo] = useState('all');
+  const [newLookbookName, setNewLookbookName] = useState('');
   const [igImg, setIgImg] = useState('');
   const [igUrl, setIgUrl] = useState('');
   const [bulkMsg, setBulkMsg] = useState('');
     const [csvPreview, setCsvPreview] = useState(null);
+    const [pdfUploading, setPdfUploading] = useState(false);
+    const [pendingPdfFile, setPendingPdfFile] = useState(null);
+    const [pdfNameInput, setPdfNameInput] = useState('');
     const [copiedId, setCopiedId] = useState(null);
+    const [selected, setSelected] = useState('all'); // 'all' = Current catalogue, else lookbook _id
+    const [lookbookOptions, setLookbookOptions] = useState([]);
+    const [pdfUrl, setPdfUrl] = useState(null);
     const csvRef = useRef(null);
     const pdfRef = useRef(null);
+
+    // Load lookbook/PDF options for the selector dropdown.
+    useEffect(() => {
+        let mounted = true;
+        getLookbooksForSelector().then((rows) => { if (mounted && Array.isArray(rows)) setLookbookOptions(rows); });
+        return () => { mounted = false; };
+    }, []);
+
+    // getLookbooksForSelector only returns a thin {_id, name, kind} projection
+    // (no pdf_url) — fetch the full lookbook doc when a PDF is selected so the
+    // inline preview below has a real URL to point at.
+    useEffect(() => {
+        let mounted = true;
+        if (selected !== 'all') {
+            getLookbookById(selected).then((data) => { if (mounted) setPdfUrl(data && data.pdf_url ? data.pdf_url : null); });
+        } else {
+            setPdfUrl(null);
+        }
+        return () => { mounted = false; };
+    }, [selected]);
+
+    // Per-piece share → routes to that single piece (/lookbook/piece/:pieceId).
+    const copyPieceLink = (pieceId) => {
+        const url = `${window.location.origin}/lookbook/piece/${pieceId}`;
+        navigator.clipboard.writeText(url);
+        setCopiedId(pieceId);
+        setTimeout(() => setCopiedId(null), 1600);
+    };
+    const waPieceLink = (piece) => {
+        const url = `${window.location.origin}/lookbook/piece/${piece.id}`;
+        return `https://wa.me/?text=${encodeURIComponent(`Check out this ${piece.title}: ${url}`)}`;
+    };
+
+    // Lookbook-level share (existing correct route /lookbook/public/:lookbookId).
     const copyPublicLink = (lookbookId) => {
         const url = `${window.location.origin}/lookbook/public/${lookbookId}`;
         navigator.clipboard.writeText(url);
@@ -31,17 +76,46 @@ export default function Catalogue() {
         return `https://wa.me/?text=${encodeURIComponent(`Check out this lookbook: ${url}`)}`;
     };
 
-  const addManual = () => {
+    // Per-piece WhatsApp inquiry (Improvement 5 pattern — real boutique number).
+    const waInquireLink = (piece) =>
+        `https://wa.me/${BRAND.wa}?text=${encodeURIComponent(`Hi! I'm interested in the ${piece.title} from 85 Lansdowne.`)}`;
+
+    const designerLookbooks = lookbookOptions.filter((lb) => lb.kind !== 'pdf');
+    const pdfLookbooks = lookbookOptions.filter((lb) => lb.kind === 'pdf');
+    const selectedPdf = pdfLookbooks.find((lb) => lb._id === selected);
+    const isLookbookSelected = selected !== 'all';
+    // Grid items: all when on "Current catalogue", else filtered to the chosen lookbook.
+    const shownItems = isLookbookSelected ? items.filter((i) => i.lookbook_id === selected) : items;
+
+  const addManual = async () => {
     if (!manual.title || !manual.price) return;
-    addCatalogueItem({ ...manual, source: 'manual' });
+    // Step C — resolve which lookbook the piece is assigned to:
+    //  'all'      → Current catalogue (no lookbook_id, unchanged legacy behavior)
+    //  '__new__'  → create a new designer lookbook first, then use its _id
+    //  <_id>      → an existing designer lookbook
+    let lookbook_id;
+    if (addTo === '__new__') {
+      const name = newLookbookName.trim();
+      if (!name) return; // "+ New designer lookbook" chosen but no name typed — abort
+      const res = await createLookbook({ title: name, designer: name, source: 'manual', kind: 'designer' });
+      if (!res || !res.ok || !res.id) return; // creation failed — don't orphan the piece
+      lookbook_id = res.id;
+      // Refresh Step A selector so the new lookbook is immediately pickable elsewhere.
+      getLookbooksForSelector().then((rows) => { if (Array.isArray(rows)) setLookbookOptions(rows); });
+    } else if (addTo !== 'all') {
+      lookbook_id = addTo;
+    }
+    addCatalogueItem({ ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) });
     setManual({ title: '', price: '', image_url: '', instagram_link: '' });
+    setAddTo('all');
+    setNewLookbookName('');
   };
   const addIg = () => {
     if (!igImg) return;
     addCatalogueItem({ title: 'Instagram Style Post', price: 0, image_url: igImg, instagram_link: igUrl || '#', source: 'instagram' });
     setIgImg(''); setIgUrl('');
   };
-  const onCsv = (f) => {
+  const onCsvParse = (f) => {
     if (!f) return;
     const r = new FileReader();
     r.onload = () => {
@@ -55,6 +129,46 @@ export default function Catalogue() {
     };
     r.readAsText(f);
   };
+
+  // Gate 2, Step B — PDF linesheet upload. Selecting/dropping a PDF stages it in
+  // `pendingPdfFile` and shows an inline luxury-styled name field in the card
+  // (see JSX below) instead of a native window.prompt(). Confirming there calls
+  // this with the typed name, reads the file as raw bytes, then hands off to the
+  // generatePdfUploadUrl Convex action via db.js — upload logic unchanged.
+  const onPdfUpload = async (f, lookbookName) => {
+    if (!f) return;
+    if (!lookbookName || !lookbookName.trim()) return; // cancelled/empty — abort cleanly, no upload attempt
+    setPdfUploading(true);
+    setBulkMsg('Uploading PDF…');
+    try {
+      const bytes = await f.arrayBuffer();
+      const res = await uploadPdfLookbook(bytes, f.name, lookbookName.trim());
+      if (res && res.ok) {
+        setBulkMsg(`"${lookbookName.trim()}" PDF lookbook uploaded successfully.`);
+        // Refresh the Step A selector so the new PDF-lookbook is pickable right away.
+        getLookbooksForSelector().then((rows) => { if (Array.isArray(rows)) setLookbookOptions(rows); });
+      } else {
+        setBulkMsg('PDF upload failed — please try again.');
+      }
+    } catch (err) {
+      setBulkMsg(`PDF upload failed: ${err?.message || 'please try again.'}`);
+    } finally {
+      setPdfUploading(false);
+      setPendingPdfFile(null);
+      setPdfNameInput('');
+    }
+  };
+
+  // File-type router for the CSV/PDF linesheet card — dispatches to the
+  // unchanged CSV parser, or stages the PDF for inline name entry.
+  const onBulkFile = (f) => {
+    if (!f) return;
+    if (f.name.toLowerCase().endsWith('.pdf')) { setPendingPdfFile(f); setPdfNameInput(''); return; }
+    onCsvParse(f);
+  };
+
+  const confirmPdfUpload = () => { onPdfUpload(pendingPdfFile, pdfNameInput); };
+  const cancelPdfUpload = () => { setPendingPdfFile(null); setPdfNameInput(''); };
 
   return (
     <div className="space-y-10">
@@ -71,11 +185,11 @@ export default function Catalogue() {
           <h3 className="luxe-title text-lg mb-3">Bulk loader</h3>
           <div
             onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => { e.preventDefault(); onCsv(e.dataTransfer.files?.[0]); }}
+            onDrop={(e) => { e.preventDefault(); onBulkFile(e.dataTransfer.files?.[0]); }}
             onClick={() => csvRef.current?.click()}
             className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
           >
-            <input ref={csvRef} type="file" accept=".csv,.pdf,text/csv" className="hidden" onChange={(e) => onCsv(e.target.files?.[0])} />
+            <input ref={csvRef} type="file" accept=".csv,.pdf,text/csv" className="hidden" onChange={(e) => onBulkFile(e.target.files?.[0])} />
             <div className="text-2xl mb-2">📄</div>
             <div className="text-sm">Drag & drop a CSV / PDF linesheet</div>
             <div className="text-xs text-steel mt-1">Columns: Title, Price, Image URL</div>
@@ -88,9 +202,30 @@ export default function Catalogue() {
               </table>
             </div>
           )}
+          {pendingPdfFile && (
+            <div className="mt-3 space-y-2">
+              <label className="label">Name this PDF lookbook (shown to clients)</label>
+              <input
+                className="input"
+                placeholder="e.g. Sabyasachi · Spring Linesheet"
+                value={pdfNameInput}
+                onChange={(e) => setPdfNameInput(e.target.value)}
+                autoFocus
+              />
+              <div className="text-[10px] text-steel truncate">Selected: {pendingPdfFile.name}</div>
+              <div className="flex items-center gap-2">
+                <button onClick={confirmPdfUpload} disabled={pdfUploading || !pdfNameInput.trim()} className="btn-ink flex-1">
+                  {pdfUploading ? 'Uploading…' : 'Confirm & Upload'}
+                </button>
+                <button onClick={cancelPdfUpload} disabled={pdfUploading} className="btn-ghost flex-1">Cancel</button>
+              </div>
+            </div>
+          )}
           {bulkMsg && <div className="text-xs text-gold mt-2">{bulkMsg}</div>}
-          <button onClick={() => pdfRef.current?.click()} className="btn-ghost w-full mt-3">Upload PDF linesheet</button>
-          <input ref={pdfRef} type="file" accept=".pdf" className="hidden" onChange={() => setBulkMsg('PDF linesheet received — image URLs must be added from the Instagram flow for a shoppable feed.')} />
+          {!pendingPdfFile && (
+            <button onClick={() => pdfRef.current?.click()} disabled={pdfUploading} className="btn-ghost w-full mt-3">{pdfUploading ? 'Uploading…' : 'Upload PDF linesheet'}</button>
+          )}
+          <input ref={pdfRef} type="file" accept=".pdf" className="hidden" onChange={(e) => { setPendingPdfFile(e.target.files?.[0] || null); setPdfNameInput(''); }} />
         </section>
 
         <section className="card p-6">
@@ -122,17 +257,60 @@ export default function Catalogue() {
             </div>
             <div><label className="label">Image URL</label><input className="input" value={manual.image_url} onChange={(e) => setManual({ ...manual, image_url: e.target.value })} /></div>
             <div><label className="label">Instagram link (optional)</label><input className="input" value={manual.instagram_link} onChange={(e) => setManual({ ...manual, instagram_link: e.target.value })} /></div>
-            <button onClick={addManual} className="btn-ink w-full" disabled={!manual.title || !manual.price}>Add to catalogue</button>
+            <div>
+              <label className="label">Add to</label>
+              <select className="input" value={addTo} onChange={(e) => setAddTo(e.target.value)}>
+                <option value="all">Current catalogue</option>
+                {designerLookbooks.map((lb) => <option key={lb._id} value={lb._id}>{lb.name}</option>)}
+                <option value="__new__">+ New designer lookbook</option>
+              </select>
+            </div>
+            {addTo === '__new__' && (
+              <div><label className="label">New lookbook name</label><input className="input" value={newLookbookName} onChange={(e) => setNewLookbookName(e.target.value)} placeholder="e.g. Sabyasachi · Spring" /></div>
+            )}
+            <button onClick={addManual} className="btn-ink w-full" disabled={!manual.title || !manual.price || (addTo === '__new__' && !newLookbookName.trim())}>Add to catalogue</button>
           </div>
         </section>
       </div>
 
       {/* Catalogue grid */}
       <section>
-        <SectionTitle eyebrow={`${items.length} pieces live`} title="Current catalogue" />
-        {items.length ? (
+        <SectionTitle
+          eyebrow={`${(isLookbookSelected && !selectedPdf ? shownItems.length : items.length)} pieces live`}
+          title="Current catalogue"
+          right={
+            <div className="flex items-center gap-3">
+              <select
+                className="input !w-auto !py-1.5 text-xs"
+                value={selected}
+                onChange={(e) => setSelected(e.target.value)}
+              >
+                <option value="all">Current catalogue</option>
+                {designerLookbooks.map((lb) => <option key={lb._id} value={lb._id}>{lb.name}</option>)}
+                {pdfLookbooks.map((lb) => <option key={lb._id} value={lb._id}>{lb.name} (PDF)</option>)}
+              </select>
+              {isLookbookSelected && (
+                <div className="flex items-center gap-2">
+                  <button onClick={() => copyPublicLink(selected)} className="btn-ghost !py-1 !px-2 text-[9px]">
+                    {copiedId === selected ? '✓ Copied' : '🔗 Copy Link'}
+                  </button>
+                  <a href={waShareLink(selected)} target="_blank" rel="noreferrer" className="btn-gold !py-1 !px-2 text-[9px] flex items-center justify-center" aria-label="WhatsApp">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg>
+                  </a>
+                </div>
+              )}
+            </div>
+          }
+        />
+        {selectedPdf ? (
+          pdfUrl ? (
+            <iframe src={pdfUrl} className="w-full h-[600px]" title="PDF preview" />
+          ) : (
+            <Empty>Loading PDF preview…</Empty>
+          )
+        ) : shownItems.length ? (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-5">
-            {items.map((i) => (
+            {shownItems.map((i) => (
               <div key={i.id} className="card overflow-hidden group">
                 <div className="relative">
                   <img src={i.image_url} alt={i.title} className="aspect-[3/4] w-full object-cover" />
@@ -149,11 +327,19 @@ export default function Catalogue() {
                     </button>
                   </div>
                   <div className="flex items-center gap-2 mt-3">
-                    <button onClick={() => copyPublicLink(i.lookbook_id)} className="btn-ghost !py-1 !px-2 text-[9px] flex-1">
-                      {copiedId === i.lookbook_id ? '✓ Copied' : '🔗 Copy Link'}
+                    <button onClick={() => copyPieceLink(i.id)} className="btn-ghost !py-1 !px-2 text-[9px] flex-1">
+                      {copiedId === i.id ? '✓ Copied' : '🔗 Copy Link'}
                     </button>
-                    <a href={waShareLink(i.lookbook_id)} target="_blank" rel="noreferrer" className="btn-gold !py-1 !px-2 text-[9px] flex items-center justify-center" aria-label="WhatsApp">
+                    <a href={waPieceLink(i)} target="_blank" rel="noreferrer" className="btn-gold !py-1 !px-2 text-[9px] flex items-center justify-center" aria-label="WhatsApp">
                       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg>
+                    </a>
+                  </div>
+                  <div className="flex items-center gap-2 mt-2">
+                    <button onClick={() => alert('Coming soon')} className="btn-ink !py-1 !px-2 text-[9px] flex-1">
+                      Buy Now
+                    </button>
+                    <a href={waInquireLink(i)} target="_blank" rel="noreferrer" className="btn-ghost !py-1 !px-2 text-[9px] flex-1 text-center">
+                      Inquire
                     </a>
                   </div>
                   {i.instagram_link && i.instagram_link !== '#' && <a href={i.instagram_link} target="_blank" rel="noreferrer" className="text-[10px] text-gold tracking-wide2 uppercase mt-1 inline-block">View post ↗</a>}

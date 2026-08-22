@@ -343,6 +343,49 @@ export function getLookbookById(id) {
   return client.query(api.lookbooks.getLookbookById, { id }).catch(() => null);
 }
 
+/** Lookbook list for the Catalogue selector dropdown (async). Returns [{_id, name, kind}]. */
+export function getLookbooksForSelector() {
+  const client = getConvex();
+  if (!client) return Promise.resolve([]);
+  return client.query(api.lookbooks.getLookbooksForSelector).catch(() => []);
+}
+
+/**
+ * Upload a PDF linesheet as a new PDF-kind lookbook (Gate 2, Step B).
+ * `generatePdfUploadUrl` is an ACTION (not a mutation) — invoke with client.action,
+ * same pattern as forgotPassword() above. Unlike forgotPassword (anti-enumeration,
+ * always resolves ok:true), this bridge PROPAGATES real errors so the Catalogue.jsx
+ * upload card can show the failure to the merchant instead of silently swallowing it
+ * (see CLAUDE.md §12 lesson 4 — fallback only on network failure, not validation errors).
+ */
+export function uploadPdfLookbook(file, filename, lookbookName) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.lookbooks.generatePdfUploadUrl, { file, filename, lookbookName });
+}
+
+/**
+ * Fetch a single catalogue piece by its Convex id (async).
+ * No backend query exists for a lone item, so we walk the lookbooks client-side
+ * (allowed: db.js is the data-layer bridge) and return the first matching piece,
+ * shaped like a catalogue item (price kept in paise, as PublicLookbook expects).
+ */
+export function getCatalogueItemById(pieceId) {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.lookbooks.getLookbooks)
+    .then(async (lookbooks) => {
+      if (!Array.isArray(lookbooks)) return null;
+      for (const lb of lookbooks) {
+        const detail = await client.query(api.lookbooks.getLookbookById, { id: lb._id });
+        const match = detail?.items?.find((i) => i._id === pieceId);
+        if (match) return { ...match, lookbook_id: lb._id, lookbook_title: lb.title };
+      }
+      return null;
+    })
+    .catch(() => null);
+}
+
 /** Create lookbook on Convex (async). */
 export function createLookbook(args) {
   const client = getConvex();
