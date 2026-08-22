@@ -127,6 +127,7 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
   const onReplaceFile = async (f) => {
     if (!f) return;
     if (!f.type.startsWith('image/')) { setReplaceMsg('Only image files are supported.'); return; }
+    if (f.size > 5 * 1024 * 1024) { setReplaceMsg('Image is too large (over 5MB) — please use a smaller file.'); return; }
     setReplacing(true);
     setReplaceMsg('Uploading…');
     try {
