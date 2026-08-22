@@ -88,6 +88,21 @@ export const getLookbookById = query({
 });
 
 /**
+ * Get a single catalogue item by id (O(1) lookup).
+ * Server-side counterpart to src/lib/db.js's getCatalogueItemById() client
+ * helper (which scans all lookbooks) — needed by the OG-preview middleware,
+ * which cannot use client-side helpers.
+ */
+export const getCatalogueItemById = query({
+  args: { id: v.id("catalogue_items") },
+  handler: async (ctx, { id }) => {
+    const item = await ctx.db.get(id);
+    if (!item) return null;
+    return item;
+  },
+});
+
+/**
  * Create lookbook.
  * `kind` is optional (Gate 2 Step C): pass "designer" to tag a manually-created
  * designer-lookbook so it shows in the Step A selector's designer list; omit for

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById } from '../../lib/db.js';
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty } from '../../components/ui.jsx';
@@ -28,6 +28,7 @@ export default function Catalogue() {
     const [copiedId, setCopiedId] = useState(null);
     const [selected, setSelected] = useState('all'); // 'all' = Current catalogue, else lookbook _id
     const [lookbookOptions, setLookbookOptions] = useState([]);
+    const [pdfUrl, setPdfUrl] = useState(null);
     const csvRef = useRef(null);
     const pdfRef = useRef(null);
 
@@ -37,6 +38,19 @@ export default function Catalogue() {
         getLookbooksForSelector().then((rows) => { if (mounted && Array.isArray(rows)) setLookbookOptions(rows); });
         return () => { mounted = false; };
     }, []);
+
+    // getLookbooksForSelector only returns a thin {_id, name, kind} projection
+    // (no pdf_url) — fetch the full lookbook doc when a PDF is selected so the
+    // inline preview below has a real URL to point at.
+    useEffect(() => {
+        let mounted = true;
+        if (selected !== 'all') {
+            getLookbookById(selected).then((data) => { if (mounted) setPdfUrl(data && data.pdf_url ? data.pdf_url : null); });
+        } else {
+            setPdfUrl(null);
+        }
+        return () => { mounted = false; };
+    }, [selected]);
 
     // Per-piece share → routes to that single piece (/lookbook/piece/:pieceId).
     const copyPieceLink = (pieceId) => {
@@ -289,7 +303,11 @@ export default function Catalogue() {
           }
         />
         {selectedPdf ? (
-          <Empty>PDF lookbook — no in-app preview. Share the link above.</Empty>
+          pdfUrl ? (
+            <iframe src={pdfUrl} className="w-full h-[600px]" title="PDF preview" />
+          ) : (
+            <Empty>Loading PDF preview…</Empty>
+          )
         ) : shownItems.length ? (
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-5">
             {shownItems.map((i) => (
