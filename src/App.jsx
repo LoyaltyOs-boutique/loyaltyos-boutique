@@ -32,6 +32,7 @@ import Dashboard from './pages/merchant/Dashboard.jsx';
 import Customers from './pages/merchant/Customers.jsx';
 import Campaigns from './pages/merchant/Campaigns.jsx';
 import Catalogue from './pages/merchant/Catalogue.jsx';
+import Templates from './pages/merchant/Templates.jsx';
 import Settings from './pages/merchant/Settings.jsx';
 import Onboarding from './pages/merchant/Onboarding.jsx';
 
@@ -71,6 +72,10 @@ export default function App() {
         <Route
           path="/merchant/catalogue"
           element={<MerchantGuard><Shell><Catalogue /></Shell></MerchantGuard>}
+        />
+        <Route
+          path="/merchant/templates"
+          element={<MerchantGuard><Shell><Templates /></Shell></MerchantGuard>}
         />
         <Route
           path="/merchant/settings"
