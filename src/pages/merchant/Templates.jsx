@@ -3,6 +3,14 @@ import { getCustomers, uploadTemplateMedia } from '../../lib/db.js';
 
 // Templates — Phase 1 (structure only). Design spec:
 // docs/superpowers/specs/2026-08-22-templates-section-phase1-design.md
+// Phase 2 (static card-image send) design spec:
+// docs/superpowers/specs/2026-08-22-templates-static-card-send-design.md
+
+// One-time Vercel Blob uploads of Ma'am's real card designs (see Phase 2
+// spec) — stable public URLs, hardcoded since the images don't change
+// per-customer.
+const ANNIVERSARY_CARD_URL = 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-7tJIweUaVY9c5we5VYuwI6aFeBHTeZ.png';
+const BIRTHDAY_CARD_URL = 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-DNBiTSVXf9UiN8oJNBKMNWES2PcuWz.png';
 //
 // wa.me requires the full international number (no '+'); customer.mobile is
 // stored as bare 10 digits (no country code) — per the spec's resolution,
@@ -82,14 +90,41 @@ function CustomerSelect({ customers, name, setName, phone, setPhone }) {
 }
 
 /**
- * Anniversary / Birthday card — identical structure per the spec, only the
- * eyebrow/title/placeholder template differ between the two instances.
+ * Card-image selector — Phase 2 shows exactly one option per card type
+ * (Ma'am's real design), structured as an array so more options can be
+ * added later without restructuring. Same toggle-button visual pattern as
+ * CustomerSelect's Existing/Manual toggle above (verbatim class reuse).
  */
-function MomentCard({ eyebrow, title, template, customers }) {
+function CardSelect({ options, selectedIdx, onSelect }) {
+  return (
+    <div>
+      <label className="label">Choose a card</label>
+      <div className="flex items-center gap-2">
+        {options.map((opt, i) => (
+          <button
+            key={opt.url}
+            type="button"
+            onClick={() => onSelect(i)}
+            className={i === selectedIdx ? 'btn-ink !py-1 !px-2 text-[9px] flex-1' : 'btn-ghost !py-1 !px-2 text-[9px] flex-1'}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Anniversary / Birthday card — identical structure per the spec, only the
+ * eyebrow/title/placeholder template/card options differ between instances.
+ */
+function MomentCard({ eyebrow, title, template, customers, cardOptions }) {
   const [name, setName] = useState('');
   const [nickname, setNickname] = useState('');
   const [phone, setPhone] = useState('');
   const [message, setMessage] = useState('');
+  const [selectedCardIdx, setSelectedCardIdx] = useState(0);
 
   // Auto-fills the message textarea from the hardcoded Phase-1 placeholder
   // whenever name/nickname changes; merchant can still hand-edit it before
@@ -101,7 +136,11 @@ function MomentCard({ eyebrow, title, template, customers }) {
 
   const send = () => {
     if (!phone.trim() || !message.trim()) return;
-    window.open(buildWaLink(phone, message), '_blank');
+    // Card-image URL appended as a new line so WhatsApp unfurls it as a
+    // rich preview alongside the merchant's message (Phase 2 spec).
+    const cardUrl = cardOptions[selectedCardIdx]?.url;
+    const finalMessage = cardUrl ? `${message}\n${cardUrl}` : message;
+    window.open(buildWaLink(phone, finalMessage), '_blank');
   };
 
   return (
@@ -118,6 +157,7 @@ function MomentCard({ eyebrow, title, template, customers }) {
           <label className="label">Message</label>
           <textarea className="input" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} />
         </div>
+        <CardSelect options={cardOptions} selectedIdx={selectedCardIdx} onSelect={setSelectedCardIdx} />
         <button onClick={send} disabled={!phone.trim() || !message.trim()} className="btn-ink w-full">Send via WhatsApp</button>
       </div>
     </section>
@@ -206,12 +246,14 @@ export default function Templates() {
           title="Anniversary"
           template="Happy anniversary, {name}! With love, 85 Lansdowne."
           customers={customers}
+          cardOptions={[{ label: 'Anniversary card', url: ANNIVERSARY_CARD_URL }]}
         />
         <MomentCard
           eyebrow="Personal moment"
           title="Birthday"
           template="Happy birthday, {name}! With love, 85 Lansdowne."
           customers={customers}
+          cardOptions={[{ label: 'Birthday card', url: BIRTHDAY_CARD_URL }]}
         />
         <MediaCard customers={customers} />
       </div>
