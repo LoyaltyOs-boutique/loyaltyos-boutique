@@ -4,19 +4,28 @@ import { api } from './convex/_generated/api.js';
 
 // Gate 2 — WhatsApp/social link-preview cards (OG tags).
 // Spec: docs/superpowers/specs/2026-08-22-og-preview-middleware-design.md
+// Templates card-image extension spec:
+// docs/superpowers/specs/2026-08-22-templates-og-middleware-extension-design.md
 //
 // This is a client-side-rendered Vite SPA, so social crawlers (which read
 // only the initial static HTML and never execute JS) can never see dynamic
 // per-lookbook/per-piece OG tags via any React-based approach. This
-// middleware intercepts ONLY /lookbook/public/:id and /lookbook/piece/:pieceId
-// (see `matcher` below — every other path never invokes this file at all)
-// and, ONLY for a known crawler User-Agent, serves a small static HTML
-// response with real OG tags. Every other request — including non-crawler
-// traffic on these same two paths — must fall through to the normal SPA
-// completely unchanged.
+// middleware intercepts ONLY /lookbook/public/:id, /lookbook/piece/:pieceId,
+// /templates/card/anniversary, and /templates/card/birthday (see `matcher`
+// below — every other path never invokes this file at all) and, ONLY for a
+// known crawler User-Agent, serves a small static HTML response with real
+// OG tags. Every other (non-crawler) request on the /lookbook/* paths falls
+// through to the normal SPA completely unchanged. The two /templates/card/*
+// paths have no SPA route, so non-crawler requests there redirect straight
+// to the real image instead (see the TEMPLATE_CARDS branch below).
 export const config = {
   runtime: 'nodejs',
-  matcher: ['/lookbook/public/:id', '/lookbook/piece/:pieceId'],
+  matcher: [
+    '/lookbook/public/:id',
+    '/lookbook/piece/:pieceId',
+    '/templates/card/anniversary',
+    '/templates/card/birthday',
+  ],
 };
 
 const CRAWLER_UA_PATTERN = /whatsapp|facebookexternalhit|twitterbot|linkedinbot|slackbot|telegrambot/i;
@@ -25,6 +34,20 @@ const escapeHtml = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
+
+// Templates card-image paths — Gate 2 extension. Static lookup, no Convex
+// call needed (unlike the lookbook branches below) since these are two
+// fixed images, not per-record data.
+const TEMPLATE_CARDS = {
+  '/templates/card/anniversary': {
+    title: 'Happy Anniversary',
+    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-compressed-P3MIMmAmW15UIMhDI7Rxzh4n8Ylp4Q.png',
+  },
+  '/templates/card/birthday': {
+    title: 'Happiest Birthday',
+    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-compressed-70eIZsXmR3KW55ACGwP91WQi2sk7e5.png',
+  },
+};
 
 function ogHtml({ title, description, image, url }) {
   const t = escapeHtml(title);
@@ -48,6 +71,28 @@ ${imageTag}
 
 export default async function middleware(request) {
   const ua = request.headers.get('user-agent') || '';
+
+  // Templates card-image paths — handled entirely separately from the
+  // /lookbook/* logic below (which is untouched). No SPA route exists for
+  // these two paths, so non-crawler requests redirect straight to the real
+  // image instead of the generic next() fail-open used for /lookbook/*.
+  const cardUrl = new URL(request.url);
+  const card = TEMPLATE_CARDS[cardUrl.pathname];
+  if (card) {
+    try {
+      if (CRAWLER_UA_PATTERN.test(ua)) {
+        const pageUrl = `${cardUrl.origin}${cardUrl.pathname}`;
+        const html = ogHtml({ title: card.title, description: '85 Lansdowne', image: card.image, url: pageUrl });
+        return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+      }
+      return new Response(null, { status: 302, headers: { location: card.image } });
+    } catch {
+      // Never break — even though there's no SPA fallback for these paths,
+      // erring toward "doesn't crash" over "doesn't redirect".
+      return next();
+    }
+  }
+
   if (!CRAWLER_UA_PATTERN.test(ua)) {
     // Real browsers (and unrecognized bots) — untouched pass-through.
     return next();

@@ -9,8 +9,12 @@ import { getCustomers, uploadTemplateMedia } from '../../lib/db.js';
 // One-time Vercel Blob uploads of Ma'am's real card designs (see Phase 2
 // spec) — stable public URLs, hardcoded since the images don't change
 // per-customer.
-const ANNIVERSARY_CARD_URL = 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-7tJIweUaVY9c5we5VYuwI6aFeBHTeZ.png';
-const BIRTHDAY_CARD_URL = 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-DNBiTSVXf9UiN8oJNBKMNWES2PcuWz.png';
+// Same-origin OG-preview paths (middleware.js) instead of the raw Blob URLs
+// directly — WhatsApp's crawler does not reliably unfurl bare media URLs
+// (same discovery as the PDF-lookbook case); these paths serve real OG tags
+// to crawlers and redirect real browsers straight to the image.
+const ANNIVERSARY_CARD_URL = `${window.location.origin}/templates/card/anniversary`;
+const BIRTHDAY_CARD_URL = `${window.location.origin}/templates/card/birthday`;
 //
 // wa.me requires the full international number (no '+'); customer.mobile is
 // stored as bare 10 digits (no country code) — per the spec's resolution,
