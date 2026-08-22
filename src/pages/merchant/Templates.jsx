@@ -97,32 +97,6 @@ function CustomerSelect({ customers, name, setName, phone, setPhone }) {
 }
 
 /**
- * Card-image selector — Phase 2 shows exactly one option per card type
- * (Ma'am's real design), structured as an array so more options can be
- * added later without restructuring. Same toggle-button visual pattern as
- * CustomerSelect's Existing/Manual toggle above (verbatim class reuse).
- */
-function CardSelect({ options, selectedIdx, onSelect }) {
-  return (
-    <div>
-      <label className="label">Choose a card</label>
-      <div className="flex items-center gap-2">
-        {options.map((opt, i) => (
-          <button
-            key={opt.url}
-            type="button"
-            onClick={() => onSelect(i)}
-            className={i === selectedIdx ? 'btn-ink !py-1 !px-2 text-[9px] flex-1' : 'btn-ghost !py-1 !px-2 text-[9px] flex-1'}
-          >
-            {opt.label}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/**
  * Anniversary / Birthday card — identical structure per the spec, only the
  * eyebrow/title/placeholder template/card options differ between instances.
  *
@@ -140,7 +114,6 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
   const [nickname, setNickname] = useState('');
   const [phone, setPhone] = useState('');
   const [message, setMessage] = useState('');
-  const [selectedCardIdx, setSelectedCardIdx] = useState(0);
 
   // Local optimistic copy of the active image — initialized from the
   // parent's fetched value, updated immediately after a successful replace.
@@ -184,8 +157,11 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
   const send = () => {
     if (!phone.trim() || !message.trim()) return;
     // Card-image URL appended as a new line so WhatsApp unfurls it as a
-    // rich preview alongside the merchant's message (Phase 2 spec).
-    const cardUrl = cardOptions[selectedCardIdx]?.url;
+    // rich preview alongside the merchant's message (Phase 2 spec). Phase 3
+    // removed the CardSelect UI (always exactly one active card per type
+    // now, per the "Replace card" flow), so this reads the single option
+    // directly instead of an index into a former multi-option list.
+    const cardUrl = cardOptions[0]?.url;
     const finalMessage = cardUrl ? `${message}\n${cardUrl}` : message;
     window.open(buildWaLink(phone, finalMessage), '_blank');
   };
@@ -204,7 +180,6 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
           <label className="label">Message</label>
           <textarea className="input" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} />
         </div>
-        <CardSelect options={cardOptions} selectedIdx={selectedCardIdx} onSelect={setSelectedCardIdx} />
         <div>
           <label className="label">Replace card</label>
           {activeImageUrl && <img src={activeImageUrl} alt="Current card" className="mt-1 mb-2 h-28 w-full object-cover border border-line" />}
