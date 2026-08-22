@@ -41,11 +41,11 @@ const escapeHtml = (s) =>
 const TEMPLATE_CARDS = {
   '/templates/card/anniversary': {
     title: 'Happy Anniversary',
-    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-compressed-P3MIMmAmW15UIMhDI7Rxzh4n8Ylp4Q.png',
+    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/anniversary-card-v3-j8Wx0uuIVRtNeJ4HPnEgYzfBdoUWdi.png',
   },
   '/templates/card/birthday': {
     title: 'Happiest Birthday',
-    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-compressed-70eIZsXmR3KW55ACGwP91WQi2sk7e5.png',
+    image: 'https://kya9cip96sntdsv4.public.blob.vercel-storage.com/birthday-card-v3-ceGMUhD5Iwq0AP0f99yotycwhEBCJv.png',
   },
 };
 
