@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl } from '../../lib/db.js';
+import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl, getWhatsAppTemplates, sendWhatsAppTemplateMessage, sendWhatsAppServiceMessage } from '../../lib/db.js';
 
 // Templates — Phase 1 (structure only). Design spec:
 // docs/superpowers/specs/2026-08-22-templates-section-phase1-design.md
@@ -109,11 +109,13 @@ function CustomerSelect({ customers, name, setName, phone, setPhone }) {
  * same-origin /templates/card/... path used for the wa.me send (unchanged
  * by Phase 3 — middleware.js resolves it live).
  */
-function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType, currentImageUrl }) {
+function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType, currentImageUrl, waTemplate }) {
   const [name, setName] = useState('');
   const [nickname, setNickname] = useState('');
   const [phone, setPhone] = useState('');
   const [message, setMessage] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sendMsg, setSendMsg] = useState('');
 
   // Local optimistic copy of the active image — initialized from the
   // parent's fetched value, updated immediately after a successful replace.
@@ -155,16 +157,48 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
     setMessage(template.replace('{name}', who));
   }, [name, nickname, template]);
 
-  const send = () => {
-    if (!phone.trim() || !message.trim()) return;
-    // Card-image URL appended as a new line so WhatsApp unfurls it as a
-    // rich preview alongside the merchant's message (Phase 2 spec). Phase 3
-    // removed the CardSelect UI (always exactly one active card per type
-    // now, per the "Replace card" flow), so this reads the single option
-    // directly instead of an index into a former multi-option list.
-    const cardUrl = cardOptions[0]?.url;
+  // Card-image URL — same-origin OG-preview path (middleware.js resolves it
+  // to the current live card at request time), unchanged by this task.
+  const cardUrl = cardOptions[0]?.url;
+
+  // wa.me fallback — EXACTLY today's behavior, unchanged. Used both when no
+  // Cloud API template is configured yet (skip straight here) and when the
+  // Cloud API attempt fails for any reason (missing secrets, Meta rejection,
+  // network error).
+  const openWaLinkFallback = () => {
     const finalMessage = cardUrl ? `${message}\n${cardUrl}` : message;
     window.open(buildWaLink(phone, finalMessage), '_blank');
+  };
+
+  const send = async () => {
+    if (!phone.trim() || !message.trim()) return;
+
+    // No template configured for this card type yet → skip the Cloud API
+    // attempt entirely, go straight to wa.me (expected state until
+    // Ma'am/Saidul approve real templates in WhatsApp Manager — not an error).
+    if (!waTemplate) {
+      openWaLinkFallback();
+      return;
+    }
+
+    // Template IS configured → try the Cloud API send first.
+    // bodyParams: [name] only — a single fixed positional param is safer
+    // than [name, nickname] until real approved templates exist (nickname
+    // is often empty). Follow-up: revisit bodyParams shape once real
+    // templates are created/approved in WhatsApp Manager.
+    setSending(true);
+    setSendMsg('Sending…');
+    try {
+      await sendWhatsAppTemplateMessage(phone, waTemplate.name, waTemplate.language, cardUrl, [name.trim() || '{name}']);
+      setSendMsg('Sent via WhatsApp');
+    } catch (err) {
+      // Any failure (Meta rejection, network error, etc.) → fall back to the
+      // exact same wa.me link-open as today. Subtle note, not an alarm.
+      openWaLinkFallback();
+      setSendMsg('Sent via WhatsApp link');
+    } finally {
+      setSending(false);
+    }
   };
 
   return (
@@ -196,7 +230,8 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
           </div>
           {replaceMsg && <div className="text-xs text-gold mt-2">{replaceMsg}</div>}
         </div>
-        <button onClick={send} disabled={!phone.trim() || !message.trim() || replacing} className="btn-ink w-full">Send via WhatsApp</button>
+        <button onClick={send} disabled={!phone.trim() || !message.trim() || replacing || sending} className="btn-ink w-full">Send via WhatsApp</button>
+        {sendMsg && <div className="text-xs text-gold mt-2">{sendMsg}</div>}
       </div>
     </section>
   );
@@ -209,6 +244,8 @@ function MediaCard({ customers }) {
   const [uploading, setUploading] = useState(false);
   const [mediaUrl, setMediaUrl] = useState('');
   const [msg, setMsg] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sendMsg, setSendMsg] = useState('');
   const mediaRef = useRef(null);
 
   const onMediaFile = async (f) => {
@@ -233,10 +270,33 @@ function MediaCard({ customers }) {
     }
   };
 
-  const send = () => {
+  const buildMediaText = () =>
+    name.trim() ? `Hi ${name.trim()}! Sharing this with you from 85 Lansdowne: ${mediaUrl}` : `Sharing this with you from 85 Lansdowne: ${mediaUrl}`;
+
+  // wa.me fallback — EXACTLY today's behavior, unchanged.
+  const openWaLinkFallback = () => {
+    window.open(buildWaLink(phone, buildMediaText()), '_blank');
+  };
+
+  const send = async () => {
     if (!phone.trim() || !mediaUrl) return;
-    const text = name.trim() ? `Hi ${name.trim()}! Sharing this with you from 85 Lansdowne: ${mediaUrl}` : `Sharing this with you from 85 Lansdowne: ${mediaUrl}`;
-    window.open(buildWaLink(phone, text), '_blank');
+    // Always attempt the Cloud API service message first (Decision 1: no
+    // template-configured check needed — service messages don't require a
+    // pre-approved template, only an open 24h customer service window).
+    setSending(true);
+    setSendMsg('Sending…');
+    try {
+      await sendWhatsAppServiceMessage(phone, 'text', buildMediaText());
+      setSendMsg('Sent via WhatsApp');
+    } catch (err) {
+      // ANY failure (including the expected "no open 24h service window"
+      // Meta rejection) → fall back to the existing wa.me link-open exactly
+      // as today. Subtle note, not an alarm.
+      openWaLinkFallback();
+      setSendMsg("Sent via WhatsApp link instead — customer hasn't messaged recently");
+    } finally {
+      setSending(false);
+    }
   };
 
   return (
@@ -256,7 +316,8 @@ function MediaCard({ customers }) {
       {msg && <div className="text-xs text-gold mt-2">{msg}</div>}
       <div className="space-y-3 mt-4">
         <CustomerSelect customers={customers} name={name} setName={setName} phone={phone} setPhone={setPhone} />
-        <button onClick={send} disabled={uploading || !phone.trim() || !mediaUrl} className="btn-ink w-full">Send via WhatsApp</button>
+        <button onClick={send} disabled={uploading || sending || !phone.trim() || !mediaUrl} className="btn-ink w-full">Send via WhatsApp</button>
+        {sendMsg && <div className="text-xs text-gold mt-2">{sendMsg}</div>}
       </div>
     </section>
   );
@@ -265,6 +326,7 @@ function MediaCard({ customers }) {
 export default function Templates() {
   const [customers, setCustomers] = useState([]);
   const [cardUrls, setCardUrls] = useState({ anniversary: '', birthday: '' });
+  const [waTemplates, setWaTemplates] = useState({ anniversary: null, birthday: null });
 
   useEffect(() => {
     let mounted = true;
@@ -275,6 +337,16 @@ export default function Templates() {
   useEffect(() => {
     let mounted = true;
     getTemplateCardUrls().then((urls) => { if (mounted && urls) setCardUrls(urls); });
+    return () => { mounted = false; };
+  }, []);
+
+  // WhatsApp Cloud API: fetch which (if any) template is configured for each
+  // moment type. null = not configured yet (expected state) — MomentCard uses
+  // this to decide whether to attempt the Cloud API send or skip straight to
+  // the wa.me fallback. Same fetch-on-mount pattern as getTemplateCardUrls above.
+  useEffect(() => {
+    let mounted = true;
+    getWhatsAppTemplates().then((tpls) => { if (mounted && tpls) setWaTemplates(tpls); });
     return () => { mounted = false; };
   }, []);
 
@@ -294,6 +366,7 @@ export default function Templates() {
           cardOptions={[{ label: 'Anniversary card', url: ANNIVERSARY_CARD_URL }]}
           cardType="anniversary"
           currentImageUrl={cardUrls.anniversary}
+          waTemplate={waTemplates.anniversary}
         />
         <MomentCard
           eyebrow="Personal moment"
@@ -303,6 +376,7 @@ export default function Templates() {
           cardOptions={[{ label: 'Birthday card', url: BIRTHDAY_CARD_URL }]}
           cardType="birthday"
           currentImageUrl={cardUrls.birthday}
+          waTemplate={waTemplates.birthday}
         />
         <MediaCard customers={customers} />
       </div>

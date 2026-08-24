@@ -53,6 +53,12 @@ export const SETTINGS_KEYS = {
   // images. Deliberately NOT named "templates" — that key already means
   // WhatsApp message-copy templates (PRD §8) and would silently collide.
   TEMPLATE_CARDS: "template_cards",
+  // WhatsApp Cloud API integration — approved template METADATA (name +
+  // language) registered in WhatsApp Manager for Anniversary/Birthday sends.
+  // Distinct from both "templates" (message-copy text) and "template_cards"
+  // (card image URLs) — confirmed no collision (grep shows only those two
+  // existing string values in this file).
+  WHATSAPP_TEMPLATES: "whatsapp_templates",
 } as const;
 
 /** Union type of the known settings group keys. */
@@ -258,6 +264,58 @@ function mergeTemplateCards(
 }
 
 // ============================================================================
+// SECTION 3C — WhatsApp Cloud API template metadata
+// Design spec: docs/superpowers/specs/2026-08-24-whatsapp-cloud-api-design.md
+// ============================================================================
+
+/** Moment type keys — the two approved-template slots (mirrors TEMPLATE_CARD_KEYS). */
+export const WHATSAPP_TEMPLATE_TYPE_KEYS = ["anniversary", "birthday"] as const;
+
+/** Union type of the WhatsApp template type keys. */
+export type WhatsAppTemplateType = (typeof WHATSAPP_TEMPLATE_TYPE_KEYS)[number];
+
+/** Validator for the moment-type argument. */
+export const whatsAppTemplateTypeValidator = v.union(
+  v.literal("anniversary"),
+  v.literal("birthday"),
+);
+
+/** A single approved template's metadata — name + language, as registered in WhatsApp Manager. */
+export const whatsAppTemplateConfigValidator = v.object({
+  name: v.string(),
+  language: v.string(),
+});
+
+/** Shape of one stored (or default/empty) template config — null until approved & configured. */
+type WhatsAppTemplateConfig = { name: string; language: string } | null;
+
+/**
+ * DEFAULT WHATSAPP TEMPLATES — empty until Ma'am/Saidul create & approve real
+ * templates in WhatsApp Manager (Decision 2, manual — not automated here).
+ * null is a real, expected state: the frontend treats it as "no template
+ * configured yet" and falls back to the wa.me link (Decision 3), not an error.
+ */
+export const DEFAULT_WHATSAPP_TEMPLATES: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
+  anniversary: null,
+  birthday: null,
+};
+
+/**
+ * Merge the stored "whatsapp_templates" value over the defaults — same
+ * missing-field-safe pattern as mergeTemplateCards above, so a partially
+ * written doc (or none at all) still resolves both fields, defaulting any
+ * missing/unset entry to null rather than crashing or omitting the field.
+ */
+function mergeWhatsAppTemplates(
+  stored: Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>> | undefined,
+): Record<WhatsAppTemplateType, WhatsAppTemplateConfig> {
+  return {
+    anniversary: stored?.anniversary ?? DEFAULT_WHATSAPP_TEMPLATES.anniversary,
+    birthday: stored?.birthday ?? DEFAULT_WHATSAPP_TEMPLATES.birthday,
+  };
+}
+
+// ============================================================================
 // SECTION 4 — Shared helpers (upsert + read-merge, no duplication)
 // ============================================================================
 
@@ -448,6 +506,91 @@ export const setTemplateCardUrl = mutation({
     const current = mergeTemplateCards(stored); // spread the full current state first
     const nextValue: Record<TemplateCardKey, string> = { ...current, [type]: url }; // override only the changed field
     await upsertSettings(ctx, SETTINGS_KEYS.TEMPLATE_CARDS, nextValue);
+    return nextValue;
+  },
+});
+
+/**
+ * Get the current approved WhatsApp template metadata (name + language) for
+ * Anniversary/Birthday, or `{ anniversary: null, birthday: null }` if the
+ * settings doc doesn't exist yet (expected state before templates are
+ * approved in WhatsApp Manager — not an error).
+ */
+export const getWhatsAppTemplates = query({
+  args: {},
+  handler: async (ctx) => {
+    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const stored = doc?.value as
+      | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
+      | undefined;
+    return mergeWhatsAppTemplates(stored);
+  },
+});
+
+/**
+ * Set ONE moment type's approved template config, leaving the other
+ * untouched.
+ *
+ * Same read-merge-write discipline as setTemplateCardUrl above — reads the
+ * current merged value first and spreads it before overriding only `type`,
+ * so this does NOT risk the whole-value-overwrite bug that an earlier
+ * design review in this codebase specifically caught and fixed for
+ * setTemplateCardUrl. A naive upsertSettings(ctx, KEY, { [type]: config })
+ * would silently wipe the other moment type's stored config.
+ */
+export const setWhatsAppTemplate = mutation({
+  args: {
+    type: whatsAppTemplateTypeValidator,
+    config: whatsAppTemplateConfigValidator,
+  },
+  handler: async (ctx, { type, config }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const stored = existing?.value as
+      | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
+      | undefined;
+    const current = mergeWhatsAppTemplates(stored); // spread the full current state first
+    const nextValue: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
+      ...current,
+      [type]: config, // override only the changed field
+    };
+    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
+    return nextValue;
+  },
+});
+
+/**
+ * Clear ONE moment type's approved template config back to `null`, leaving
+ * the other untouched.
+ *
+ * WHY THIS EXISTS: `setWhatsAppTemplate`'s `config` argument is validated by
+ * whatsAppTemplateConfigValidator, which requires non-optional `name`/
+ * `language` strings — it CANNOT accept `null`, so there was no way to undo
+ * a test/placeholder value and restore the true "not configured yet" state.
+ * This mutation fills that gap with a dedicated, narrowly-scoped clear
+ * operation instead of loosening setWhatsAppTemplate's validator.
+ *
+ * Same read-merge-write discipline as setWhatsAppTemplate/setTemplateCardUrl
+ * above — reads the current merged value first and spreads it before
+ * overriding only `type` to null, so this does NOT risk the whole-value-
+ * overwrite bug an earlier design review in this codebase caught for
+ * setTemplateCardUrl. A naive upsertSettings(ctx, KEY, { [type]: null })
+ * would silently wipe the other moment type's stored config.
+ */
+export const clearWhatsAppTemplate = mutation({
+  args: {
+    type: whatsAppTemplateTypeValidator,
+  },
+  handler: async (ctx, { type }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const stored = existing?.value as
+      | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
+      | undefined;
+    const current = mergeWhatsAppTemplates(stored); // spread the full current state first
+    const nextValue: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
+      ...current,
+      [type]: null, // override only the changed field, back to "not configured"
+    };
+    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
     return nextValue;
   },
 });

@@ -15,6 +15,7 @@ import type * as orders from "../orders.js";
 import type * as reviews from "../reviews.js";
 import type * as settings from "../settings.js";
 import type * as templates from "../templates.js";
+import type * as whatsapp from "../whatsapp.js";
 
 import type {
   ApiFromModules,
@@ -30,6 +31,7 @@ declare const fullApi: ApiFromModules<{
   reviews: typeof reviews;
   settings: typeof settings;
   templates: typeof templates;
+  whatsapp: typeof whatsapp;
 }>;
 
 /**

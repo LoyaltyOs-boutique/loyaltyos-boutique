@@ -402,6 +402,56 @@ export function setTemplateCardUrl(type, url) {
 }
 
 /**
+ * Fetch the approved WhatsApp template metadata (name + language) for
+ * Anniversary/Birthday (WhatsApp Cloud API integration). Always resolves to
+ * a real object with both keys — `{ anniversary: null, birthday: null }` is
+ * the normal/expected "no template configured yet" state, not an error.
+ * Same query-with-catch-null pattern as getTemplateCardUrls above.
+ */
+export function getWhatsAppTemplates() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.settings.getWhatsAppTemplates).catch(() => null);
+}
+
+/**
+ * Send a pre-approved WhatsApp template message via the Cloud API
+ * (convex/whatsapp.ts). Same PROPAGATE-real-errors bridge pattern as
+ * uploadTemplateMedia/setTemplateCardUrl above — no try/catch-and-swallow
+ * here. Templates.jsx decides what to do on failure (fall back to the
+ * existing wa.me link-open), this bridge just forwards the Convex action
+ * call and its real success/error shape.
+ */
+export function sendWhatsAppTemplateMessage(to, templateName, languageCode, imageUrl, bodyParams) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.whatsapp.sendWhatsAppTemplateMessage, {
+    to,
+    templateName,
+    languageCode,
+    ...(imageUrl ? { imageUrl } : {}),
+    ...(bodyParams ? { bodyParams } : {}),
+  });
+}
+
+/**
+ * Send a free-form WhatsApp service message (only valid inside an open 24h
+ * customer service window — convex/whatsapp.ts, Decision 1: no session
+ * tracking, the real Meta rejection IS the signal). Same PROPAGATE-real-
+ * errors bridge pattern as sendWhatsAppTemplateMessage above.
+ */
+export function sendWhatsAppServiceMessage(to, type, text, imageUrl) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.whatsapp.sendWhatsAppServiceMessage, {
+    to,
+    type,
+    ...(text ? { text } : {}),
+    ...(imageUrl ? { imageUrl } : {}),
+  });
+}
+
+/**
  * Fetch a single catalogue piece by its Convex id (async).
  * No backend query exists for a lone item, so we walk the lookbooks client-side
  * (allowed: db.js is the data-layer bridge) and return the first matching piece,
