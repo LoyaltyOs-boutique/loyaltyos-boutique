@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia } from '../../lib/db.js';
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty } from '../../components/ui.jsx';
@@ -14,6 +14,11 @@ export default function Catalogue() {
   const db = useDb();
   const items = allCatalogue();
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
+  // Manual Entry — drag-drop media upload (mirrors Templates.jsx's MediaCard
+  // onMediaFile pattern), auto-fills manual.image_url on success.
+  const [mediaUploading, setMediaUploading] = useState(false);
+  const [mediaMsg, setMediaMsg] = useState('');
+  const manualMediaRef = useRef(null);
   // Step C — Manual Entry "Add to" target: 'all' = Current catalogue (no lookbook_id),
   // '__new__' = create a new designer lookbook (name from newLookbookName), else an existing lookbook _id.
   const [addTo, setAddTo] = useState('all');
@@ -110,6 +115,32 @@ export default function Catalogue() {
     setAddTo('all');
     setNewLookbookName('');
   };
+  // Manual Entry — drag-drop upload handler, mirrors Templates.jsx MediaCard's
+  // onMediaFile exactly (file-type check, try/catch/finally, uploading/msg
+  // state), but auto-fills manual.image_url on success instead of a
+  // separate mediaUrl state.
+  const onManualMediaFile = async (f) => {
+    if (!f) return;
+    const isAllowed = f.type.startsWith('video/') || f.type.startsWith('image/') || f.type === 'application/pdf';
+    if (!isAllowed) { setMediaMsg('Only video, image, or PDF files are supported.'); return; }
+    setMediaUploading(true);
+    setMediaMsg('Uploading…');
+    try {
+      const bytes = await f.arrayBuffer();
+      const res = await uploadTemplateMedia(bytes, f.name, f.type);
+      if (res && res.ok) {
+        setManual((m) => ({ ...m, image_url: res.url }));
+        setMediaMsg(`"${f.name}" uploaded.`);
+      } else {
+        setMediaMsg('Upload failed — please try again.');
+      }
+    } catch (err) {
+      setMediaMsg(`Upload failed: ${err?.message || 'please try again.'}`);
+    } finally {
+      setMediaUploading(false);
+    }
+  };
+
   const addIg = () => {
     if (!igImg) return;
     addCatalogueItem({ title: 'Instagram Style Post', price: 0, image_url: igImg, instagram_link: igUrl || '#', source: 'instagram' });
@@ -256,6 +287,17 @@ export default function Catalogue() {
               <div><label className="label">Source</label><input className="input" value="Manual" readOnly /></div>
             </div>
             <div><label className="label">Image URL</label><input className="input" value={manual.image_url} onChange={(e) => setManual({ ...manual, image_url: e.target.value })} /></div>
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); onManualMediaFile(e.dataTransfer.files?.[0]); }}
+              onClick={() => manualMediaRef.current?.click()}
+              className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
+            >
+              <input ref={manualMediaRef} type="file" accept="video/*,image/*,.pdf" className="hidden" onChange={(e) => onManualMediaFile(e.target.files?.[0])} />
+              <div className="text-2xl mb-2">📎</div>
+              <div className="text-sm">Drag & drop a video, image, or PDF</div>
+            </div>
+            {mediaMsg && <div className="text-xs text-gold mt-2">{mediaMsg}</div>}
             <div><label className="label">Instagram link (optional)</label><input className="input" value={manual.instagram_link} onChange={(e) => setManual({ ...manual, instagram_link: e.target.value })} /></div>
             <div>
               <label className="label">Add to</label>
