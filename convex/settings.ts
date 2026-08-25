@@ -59,6 +59,16 @@ export const SETTINGS_KEYS = {
   // (card image URLs) — confirmed no collision (grep shows only those two
   // existing string values in this file).
   WHATSAPP_TEMPLATES: "whatsapp_templates",
+  // Merchant-editable promo copy (Discount%, Coupon Code, Valid Days) shown
+  // in the Approve & Send modal for Anniversary/Birthday. DELIBERATELY a
+  // DIFFERENT key from WHATSAPP_TEMPLATES above, even though the names look
+  // similar side-by-side: WHATSAPP_TEMPLATES holds the Meta-approved
+  // template's {name, language} metadata (gates whether Cloud API can send
+  // at all); WHATSAPP_TEMPLATE_CONFIG holds free-text discount/coupon/
+  // validity fields the merchant can edit anytime, unrelated to template
+  // approval status. Same naming-collision-avoidance discipline as
+  // TEMPLATE_CARDS vs "templates" above — confirmed no collision via grep.
+  WHATSAPP_TEMPLATE_CONFIG: "whatsapp_template_config",
 } as const;
 
 /** Union type of the known settings group keys. */
@@ -312,6 +322,65 @@ function mergeWhatsAppTemplates(
   return {
     anniversary: stored?.anniversary ?? DEFAULT_WHATSAPP_TEMPLATES.anniversary,
     birthday: stored?.birthday ?? DEFAULT_WHATSAPP_TEMPLATES.birthday,
+  };
+}
+
+// ============================================================================
+// SECTION 3D — WhatsApp promo config (Discount / Coupon / Valid Days)
+// Design spec: docs/superpowers/specs/2026-08-24-whatsapp-template-config-approval-flow-design.md
+//
+// NOTE ON WHY THIS IS SEPARATE FROM SECTION 3C ABOVE: whatsAppTemplateConfigValidator
+// (3C) validates the Meta-approved template's {name, language} METADATA — it
+// gates whether a Cloud API send can happen at all. The validator below,
+// whatsAppTemplateConfigFieldsValidator, validates merchant-editable PROMO
+// TEXT (discount/coupon/validity) that the merchant can freely change anytime
+// on the Templates page, with zero relation to template-approval status. Two
+// different shapes, two different settings keys, two different purposes —
+// deliberately named distinctly (…ConfigValidator vs …ConfigFieldsValidator)
+// so they can't be confused when read side-by-side.
+// ============================================================================
+
+/** Validator for one moment type's promo-config fields (Discount%, Coupon Code, Valid Days). */
+export const whatsAppTemplateConfigFieldsValidator = v.object({
+  discountPercent: v.string(),
+  couponCode: v.string(),
+  validDays: v.string(),
+});
+
+/** Shape of one stored (or default) promo-config entry — plain editable text fields. */
+type WhatsAppTemplateConfigFields = {
+  discountPercent: string;
+  couponCode: string;
+  validDays: string;
+};
+
+/**
+ * DEFAULT WHATSAPP TEMPLATE CONFIG — all empty strings, not null. These are
+ * simple free-text fields (Discount%, Coupon Code, Valid Days); an empty
+ * string is itself a valid "merchant hasn't filled this in yet" state,
+ * unlike Section 3C's `null` (which means "no approved template exists").
+ */
+export const DEFAULT_WHATSAPP_TEMPLATE_CONFIG: Record<WhatsAppTemplateType, WhatsAppTemplateConfigFields> = {
+  anniversary: { discountPercent: "", couponCode: "", validDays: "" },
+  birthday: { discountPercent: "", couponCode: "", validDays: "" },
+};
+
+/**
+ * Merge the stored "whatsapp_template_config" value over the defaults — same
+ * missing-field-safe pattern as mergeTemplateCards/mergeWhatsAppTemplates
+ * above, so a partially written doc (or none at all) still resolves both
+ * moment types to a full, never-partially-undefined fields object.
+ */
+function mergeWhatsAppTemplateConfig(
+  stored: Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>> | undefined,
+): Record<WhatsAppTemplateType, WhatsAppTemplateConfigFields> {
+  return {
+    anniversary: stored?.anniversary
+      ? { ...DEFAULT_WHATSAPP_TEMPLATE_CONFIG.anniversary, ...stored.anniversary }
+      : DEFAULT_WHATSAPP_TEMPLATE_CONFIG.anniversary,
+    birthday: stored?.birthday
+      ? { ...DEFAULT_WHATSAPP_TEMPLATE_CONFIG.birthday, ...stored.birthday }
+      : DEFAULT_WHATSAPP_TEMPLATE_CONFIG.birthday,
   };
 }
 
@@ -591,6 +660,56 @@ export const clearWhatsAppTemplate = mutation({
       [type]: null, // override only the changed field, back to "not configured"
     };
     await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
+    return nextValue;
+  },
+});
+
+/**
+ * Get the current merchant-configured promo copy (Discount%, Coupon Code,
+ * Valid Days) for Anniversary/Birthday. Always returns the full merged
+ * shape — real stored data wins over DEFAULT_WHATSAPP_TEMPLATE_CONFIG, and
+ * a never-written doc simply returns the all-empty-string defaults (not an
+ * error state — matches the merchant not having filled the fields in yet).
+ */
+export const getWhatsAppTemplateConfig = query({
+  args: {},
+  handler: async (ctx) => {
+    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
+    const stored = doc?.value as
+      | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
+      | undefined;
+    return mergeWhatsAppTemplateConfig(stored);
+  },
+});
+
+/**
+ * Set ONE moment type's promo config (Discount%, Coupon Code, Valid Days),
+ * leaving the other moment type untouched.
+ *
+ * Same read-merge-write discipline as setWhatsAppTemplate/setTemplateCardUrl
+ * above — reads the current merged value first and spreads it before
+ * overriding only `type`, so this does NOT risk the whole-value-overwrite
+ * bug that an earlier design review in this codebase specifically caught
+ * and fixed for setTemplateCardUrl. A naive
+ * upsertSettings(ctx, KEY, { [type]: config }) would silently wipe the
+ * other moment type's stored promo config.
+ */
+export const setWhatsAppTemplateConfig = mutation({
+  args: {
+    type: whatsAppTemplateTypeValidator,
+    config: whatsAppTemplateConfigFieldsValidator,
+  },
+  handler: async (ctx, { type, config }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
+    const stored = existing?.value as
+      | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
+      | undefined;
+    const current = mergeWhatsAppTemplateConfig(stored); // spread the full current state first
+    const nextValue: Record<WhatsAppTemplateType, WhatsAppTemplateConfigFields> = {
+      ...current,
+      [type]: config, // override only the changed field
+    };
+    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG, nextValue);
     return nextValue;
   },
 });

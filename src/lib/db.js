@@ -415,6 +415,32 @@ export function getWhatsAppTemplates() {
 }
 
 /**
+ * Fetch the merchant-configured promo copy (Discount%, Coupon Code, Valid
+ * Days) for Anniversary/Birthday. Always resolves to the full merged shape
+ * — `{anniversary:{...}, birthday:{...}}`, all-empty-string is the normal
+ * "not set yet" state, not an error. Same query-with-catch-null pattern as
+ * getTemplateCardUrls/getWhatsAppTemplates above.
+ */
+export function getWhatsAppTemplateConfig() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.settings.getWhatsAppTemplateConfig).catch(() => null);
+}
+
+/**
+ * Save one moment type's promo config (Discount%, Coupon Code, Valid Days),
+ * leaving the other moment type untouched (read-merge-write on the Convex
+ * side). Same PROPAGATE-real-errors bridge pattern as setTemplateCardUrl/
+ * uploadTemplateMedia above — no try/catch-and-swallow, so Templates.jsx
+ * can show a real failure instead of a silently-ignored save.
+ */
+export function setWhatsAppTemplateConfig(type, config) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.settings.setWhatsAppTemplateConfig, { type, config });
+}
+
+/**
  * Send a pre-approved WhatsApp template message via the Cloud API
  * (convex/whatsapp.ts). Same PROPAGATE-real-errors bridge pattern as
  * uploadTemplateMedia/setTemplateCardUrl above — no try/catch-and-swallow

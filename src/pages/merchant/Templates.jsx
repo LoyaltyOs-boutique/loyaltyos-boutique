@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl, getWhatsAppTemplates, sendWhatsAppTemplateMessage, sendWhatsAppServiceMessage } from '../../lib/db.js';
+import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl, getWhatsAppTemplates, getWhatsAppTemplateConfig, setWhatsAppTemplateConfig, sendWhatsAppTemplateMessage, sendWhatsAppServiceMessage } from '../../lib/db.js';
 
 // Templates — Phase 1 (structure only). Design spec:
 // docs/superpowers/specs/2026-08-22-templates-section-phase1-design.md
@@ -109,13 +109,36 @@ function CustomerSelect({ customers, name, setName, phone, setPhone }) {
  * same-origin /templates/card/... path used for the wa.me send (unchanged
  * by Phase 3 — middleware.js resolves it live).
  */
-function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType, currentImageUrl, waTemplate }) {
+function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType, currentImageUrl, waTemplate, templateConfig }) {
   const [name, setName] = useState('');
   const [nickname, setNickname] = useState('');
   const [phone, setPhone] = useState('');
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
+
+  // Merchant-configured promo copy (Discount%, Coupon Code, Valid Days) —
+  // local controlled state synced from the parent-fetched templateConfig
+  // prop, saved when a field loses focus (not per keystroke — see design
+  // spec's locked "field save timing" decision: avoids a Convex
+  // read-merge-write mutation firing per character and avoids two
+  // overlapping writes racing and dropping a character).
+  const [discountPercent, setDiscountPercent] = useState(templateConfig?.discountPercent || '');
+  const [couponCode, setCouponCode] = useState(templateConfig?.couponCode || '');
+  const [validDays, setValidDays] = useState(templateConfig?.validDays || '');
+  useEffect(() => {
+    setDiscountPercent(templateConfig?.discountPercent || '');
+    setCouponCode(templateConfig?.couponCode || '');
+    setValidDays(templateConfig?.validDays || '');
+  }, [templateConfig]);
+
+  // Fires once per field-exit, sending the FULL three-field object every
+  // time (setWhatsAppTemplateConfig's config arg replaces the whole shape,
+  // not a partial patch) — reads current local state via the closure at
+  // field-exit time, so all three fields share one handler.
+  const saveTemplateConfig = () => {
+    setWhatsAppTemplateConfig(cardType, { discountPercent, couponCode, validDays }).catch(() => {});
+  };
 
   // Local optimistic copy of the active image — initialized from the
   // parent's fetched value, updated immediately after a successful replace.
@@ -214,6 +237,18 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
         <div>
           <label className="label">Message</label>
           <textarea className="input" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} />
+        </div>
+        <div>
+          <label className="label">Discount %</label>
+          <input className="input" value={discountPercent} onChange={(e) => setDiscountPercent(e.target.value)} onBlur={saveTemplateConfig} />
+        </div>
+        <div>
+          <label className="label">Coupon code</label>
+          <input className="input" value={couponCode} onChange={(e) => setCouponCode(e.target.value)} onBlur={saveTemplateConfig} />
+        </div>
+        <div>
+          <label className="label">Valid for (days)</label>
+          <input className="input" value={validDays} onChange={(e) => setValidDays(e.target.value)} onBlur={saveTemplateConfig} />
         </div>
         <div>
           <label className="label">Replace card</label>
@@ -327,6 +362,10 @@ export default function Templates() {
   const [customers, setCustomers] = useState([]);
   const [cardUrls, setCardUrls] = useState({ anniversary: '', birthday: '' });
   const [waTemplates, setWaTemplates] = useState({ anniversary: null, birthday: null });
+  const [templateConfig, setTemplateConfigState] = useState({
+    anniversary: { discountPercent: '', couponCode: '', validDays: '' },
+    birthday: { discountPercent: '', couponCode: '', validDays: '' },
+  });
 
   useEffect(() => {
     let mounted = true;
@@ -350,6 +389,15 @@ export default function Templates() {
     return () => { mounted = false; };
   }, []);
 
+  // Merchant-configured promo copy (Discount%, Coupon Code, Valid Days) for
+  // Anniversary/Birthday — fetched once on mount, same pattern as
+  // getTemplateCardUrls/getWhatsAppTemplates above.
+  useEffect(() => {
+    let mounted = true;
+    getWhatsAppTemplateConfig().then((cfg) => { if (mounted && cfg) setTemplateConfigState(cfg); });
+    return () => { mounted = false; };
+  }, []);
+
   return (
     <div className="space-y-10">
       <div>
@@ -367,6 +415,7 @@ export default function Templates() {
           cardType="anniversary"
           currentImageUrl={cardUrls.anniversary}
           waTemplate={waTemplates.anniversary}
+          templateConfig={templateConfig.anniversary}
         />
         <MomentCard
           eyebrow="Personal moment"
@@ -377,6 +426,7 @@ export default function Templates() {
           cardType="birthday"
           currentImageUrl={cardUrls.birthday}
           waTemplate={waTemplates.birthday}
+          templateConfig={templateConfig.birthday}
         />
         <MediaCard customers={customers} />
       </div>

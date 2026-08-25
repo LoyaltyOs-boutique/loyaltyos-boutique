@@ -4,6 +4,8 @@ import {
   getData, subscribe, customers, customerLedger, adjustPoints, addStaffNote,
   pendingGmbReviews, setReviewStatus, waMessage, waDigits,
   updateCustomerProfile, updateMeasurements,
+  getUpcomingBirthdays, getUpcomingAnniversaries,
+  getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
 import { Modal, TierBadge, Tag, Stars, Empty } from '../../components/ui.jsx';
@@ -29,6 +31,46 @@ export default function Customers() {
   const [editMeasurements, setEditMeasurements] = useState({});
   const navigate = useNavigate();
   const [copiedId, setCopiedId] = useState(null);
+
+  // "Birthdays tomorrow" / "Anniversaries tomorrow" tabs — the locally
+  // hydrated customers() array has no days_until field, so these two tabs
+  // fetch the real getUpcomingBirthdays/getUpcomingAnniversaries queries on
+  // mount (days:1) and filter to days_until === 1 below, same fetch-on-mount
+  // pattern as pendingGmbReviews's own hydration elsewhere in this codebase.
+  // Today's existing tabs (birthday/anniversary/all/reviews) keep reading
+  // from customers() exactly as before — untouched.
+  const [tomorrowBirthdays, setTomorrowBirthdays] = useState([]);
+  const [tomorrowAnniversaries, setTomorrowAnniversaries] = useState([]);
+  useEffect(() => {
+    let mounted = true;
+    getUpcomingBirthdays(1).then((rows) => { if (mounted) setTomorrowBirthdays(rows || []); });
+    getUpcomingAnniversaries(1).then((rows) => { if (mounted) setTomorrowAnniversaries(rows || []); });
+    return () => { mounted = false; };
+  }, []);
+
+  // Approval modal (Birthdays tomorrow / Anniversaries tomorrow "Approve &
+  // Send" flow) — the merchant-configured promo copy (discount/coupon/valid
+  // days) and the approved Cloud API template metadata (name/language) are
+  // both fetched once on mount, same fetch-on-mount idiom already used above
+  // and in Templates.jsx (getWhatsAppTemplateConfig/getWhatsAppTemplates are
+  // pre-existing bridges from a prior task on this branch, reused as-is).
+  const [templateConfig, setTemplateConfig] = useState({
+    anniversary: { discountPercent: '', couponCode: '', validDays: '' },
+    birthday: { discountPercent: '', couponCode: '', validDays: '' },
+  });
+  const [waTemplates, setWaTemplates] = useState({ anniversary: null, birthday: null });
+  useEffect(() => {
+    let mounted = true;
+    getWhatsAppTemplateConfig().then((cfg) => { if (mounted && cfg) setTemplateConfig(cfg); });
+    getWhatsAppTemplates().then((tpls) => { if (mounted && tpls) setWaTemplates(tpls); });
+    return () => { mounted = false; };
+  }, []);
+
+  // approveTarget: { customer, occasion } while the approval modal is open,
+  // null when closed — occasion is 'birthday' | 'anniversary', matching
+  // templateConfig/waTemplates' key shape directly.
+  const [approveTarget, setApproveTarget] = useState(null);
+
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
   const magicUrl = (c) => `${window.location.origin}${waToken(c).m}`;
   const copyLink = (c) => { if (navigator.clipboard) navigator.clipboard.writeText(magicUrl(c)); setCopiedId(c.id); setTimeout(() => setCopiedId(null), 1600); };
@@ -38,7 +80,23 @@ export default function Customers() {
   };
   const shareWa = (c) => `https://wa.me/${waToken(c).wa}?text=${encodeURIComponent(waMessage(c, waToken(c).m))}`;
 
+  // The Convex getUpcomingBirthdays/getUpcomingAnniversaries rows use `_id`
+  // and lack magic_token/custom_tags (see convex/customers.ts projection) —
+  // row rendering below (unchanged, out of scope for this task) expects the
+  // same shape customers() already produces (`id`, `magic_token`,
+  // `custom_tags`, …). Re-map each tomorrow-row onto its matching local
+  // hydrated customer record (already carrying those fields) so the
+  // existing row JSX keeps working untouched; a fetched row with no local
+  // match yet (hydration race) still renders using its own fields.
+  const withLocalShape = (row) => customers().find((u) => u.id === row._id) || { ...row, id: row._id };
+
   const list = useMemo(() => {
+    // "Tomorrow" tabs read from the separate Convex-fetched days_until state
+    // (not the local customers() array) — see the fetch-on-mount effect
+    // above. All other tabs are completely unchanged below.
+    if (filter === 'birthday_tomorrow') return tomorrowBirthdays.filter((c) => c.days_until === 1).map(withLocalShape);
+    if (filter === 'anniversary_tomorrow') return tomorrowAnniversaries.filter((c) => c.days_until === 1).map(withLocalShape);
+
     let l = customers();
     const query = q.trim().toLowerCase();
     if (filter === 'birthday') l = l.filter((c) => c.birthday === todayMD());
@@ -47,7 +105,7 @@ export default function Customers() {
     else if (query.startsWith('a:')) { const md = query.slice(2); l = l.filter((c) => c.anniversary === md); }
     else if (query) l = l.filter((c) => (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query));
     return l;
-  }, [db, q, filter]);
+  }, [db, q, filter, tomorrowBirthdays, tomorrowAnniversaries]);
 
   const pages = Math.max(1, Math.ceil(list.length / PAGE));
   const safePage = Math.min(page, pages - 1);
@@ -94,7 +152,7 @@ export default function Customers() {
       <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
         <input className="input sm:max-w-xs" placeholder="Search name, mobile, tag…" value={q} onChange={(e) => { setQ(e.target.value); setPage(0); }} />
         <div className="flex gap-2 text-[10px] tracking-wide2 uppercase">
-          {[['all', 'All clients'], ['birthday', 'Birthdays today'], ['anniversary', 'Anniversaries'], ['reviews', `Reviews · ${pending.length}`]].map(([k, label]) => (
+          {[['all', 'All clients'], ['birthday', 'Birthdays today'], ['anniversary', 'Anniversaries'], ['birthday_tomorrow', 'Birthdays tomorrow'], ['anniversary_tomorrow', 'Anniversaries tomorrow'], ['reviews', `Reviews · ${pending.length}`]].map(([k, label]) => (
             <button key={k} onClick={() => { setFilter(k); setPage(0); }} className={cls('px-3 py-2 border transition-colors', filter === k ? 'border-ink bg-ink text-white' : 'border-line text-steel hover:border-ink hover:text-ink')}>
               {label}
             </button>
@@ -123,7 +181,7 @@ export default function Customers() {
       <div className="card overflow-x-auto">
         <table className="tbl min-w-[680px]">
           <thead>
-            <tr><th>Client</th><th>Mobile</th><th>Points</th><th>Tier</th><th>Birthday</th><th>Anniversary</th><th>Magic link</th><th></th></tr>
+            <tr><th>Client</th><th>Mobile</th><th>Points</th><th>Tier</th><th>Birthday</th><th>Anniversary</th><th>Magic link</th>{(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && <th>WhatsApp wish</th>}<th></th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -148,6 +206,13 @@ export default function Customers() {
                     <a href={shareWa(c)} target="_blank" rel="noreferrer" title="Share on WhatsApp" onClick={(e) => e.stopPropagation()} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="WhatsApp"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
                   </div>
                 </td>
+                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (
+                  <td className="text-center whitespace-nowrap">
+                    <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion: filter === 'birthday_tomorrow' ? 'birthday' : 'anniversary' }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send">
+                      Approve &amp; Send
+                    </button>
+                  </td>
+                )}
                 <td className="text-right text-gold">→</td>
               </tr>
             ))}
@@ -305,6 +370,15 @@ export default function Customers() {
           {tab === 'points' && <PointsTool userId={active.id} />}
         </Modal>
       )}
+
+      {approveTarget && (
+        <ApprovalModal
+          target={approveTarget}
+          templateConfig={templateConfig}
+          waTemplates={waTemplates}
+          onClose={() => setApproveTarget(null)}
+        />
+      )}
     </div>
   );
 }
@@ -316,6 +390,95 @@ function Info({ label, value }) {
       <div className="label">{label}</div>
       <div className="text-sm">{value}</div>
     </div>
+  );
+}
+
+/**
+ * "Approve & Send" modal for the Birthdays tomorrow / Anniversaries tomorrow
+ * tabs. Mirrors Templates.jsx's MomentCard.send() guard/try/catch/fallback
+ * shape exactly: no template configured for this occasion type → skip
+ * straight to the wa.me fallback; template configured → try the Cloud API
+ * send, and on ANY failure fall back to the same wa.me link-open, never a
+ * silent dead end. The preview block shown here is for the merchant's own
+ * reference only — the real outgoing Cloud API bodyParams stay `[name]`
+ * only per the locked design decision, since discount/coupon/valid-days
+ * position in the real approved template text isn't finalized yet.
+ */
+function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
+  const { customer, occasion } = target;
+  const [sending, setSending] = useState(false);
+  const [sendMsg, setSendMsg] = useState('');
+  const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
+  const waTemplate = waTemplates[occasion];
+  const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
+  const occasionDate = parseMD(occasion === 'birthday' ? customer.birthday : customer.anniversary);
+
+  // Preview text — reference-only for the merchant, assembled from the
+  // customer's name plus the configured discount/coupon/valid-days for this
+  // occasion type. Anniversary has no partner-name field in the data model,
+  // so both {{1}} and {{2}} slots use the customer's own name — made
+  // explicit here rather than silently assumed (locked design decision).
+  const previewLines = [
+    `Happy ${occasionLabel.toLowerCase()}, ${customer.name}! With love, 85 Lansdowne.`,
+    occasion === 'anniversary' ? `(Both name slots {{1}} and {{2}} use "${customer.name}" — no separate partner name on file.)` : null,
+    cfg.discountPercent ? `Enjoy ${cfg.discountPercent}% off` + (cfg.couponCode ? ` with code ${cfg.couponCode}` : '') + (cfg.validDays ? `, valid for ${cfg.validDays} days.` : '.') : null,
+  ].filter(Boolean);
+
+  const previewText = previewLines.join('\n');
+
+  const openWaLinkFallback = () => {
+    window.open(`https://wa.me/${waDigits(customer.whatsapp || customer.mobile)}?text=${encodeURIComponent(previewText)}`, '_blank');
+  };
+
+  const approve = async () => {
+    // No template configured for this occasion type yet → skip the Cloud
+    // API attempt entirely, go straight to wa.me — same guard MomentCard.send()
+    // uses, not an error state.
+    if (!waTemplate) {
+      openWaLinkFallback();
+      setSendMsg('Sent via WhatsApp link');
+      onClose();
+      return;
+    }
+
+    // Template IS configured → try the Cloud API send first. bodyParams:
+    // [name] only, no card image URL — identical shape to MomentCard.send().
+    setSending(true);
+    setSendMsg('Sending…');
+    try {
+      await sendWhatsAppTemplateMessage(customer.mobile, waTemplate.name, waTemplate.language, undefined, [customer.name.trim() || '{name}']);
+      setSendMsg('Sent via WhatsApp');
+    } catch (err) {
+      // Any failure (Meta rejection, network error, etc.) → fall back to the
+      // same wa.me link-open, using the preview text shown above.
+      openWaLinkFallback();
+      setSendMsg('Sent via WhatsApp link');
+    } finally {
+      setSending(false);
+      onClose();
+    }
+  };
+
+  return (
+    <Modal open onClose={onClose} title={`Approve & Send — ${occasionLabel}`}>
+      <div className="space-y-4">
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Info label="Client" value={customer.name} />
+          <Info label="Occasion" value={occasionLabel} />
+          <Info label={occasionLabel} value={occasionDate} />
+          <Info label="Mobile" value={customer.mobile} />
+        </div>
+        <div>
+          <div className="label">Preview (merchant reference only)</div>
+          <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{previewText}</div>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={onClose} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Cancel</button>
+          <button onClick={approve} disabled={sending} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
+        </div>
+        {sendMsg && <div className="text-xs text-gold">{sendMsg}</div>}
+      </div>
+    </Modal>
   );
 }
 
