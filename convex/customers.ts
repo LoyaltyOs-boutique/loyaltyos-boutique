@@ -249,6 +249,8 @@ export const getUpcomingBirthdays = query({
       mobile: doc.mobile,
       tier: doc.tier ?? "silver",
       points: doc.points ?? 0,
+      // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
+      whatsapp_consent: doc.whatsapp_consent ?? false,
       days_until: daysUntil,
     }));
   },
@@ -266,6 +268,8 @@ export const getUpcomingAnniversaries = query({
       mobile: doc.mobile,
       tier: doc.tier ?? "silver",
       points: doc.points ?? 0,
+      // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
+      whatsapp_consent: doc.whatsapp_consent ?? false,
       days_until: daysUntil,
     }));
   },
@@ -325,8 +329,9 @@ export const createCustomer = mutation({
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
     custom_tags: v.optional(v.array(v.string())),
+    whatsapp_consent: v.optional(v.boolean()),
   },
-  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags }) => {
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent }) => {
     const digits = mobile.replace(/\D/g, '');
     if (digits.length !== 10) {
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };
@@ -341,11 +346,20 @@ export const createCustomer = mutation({
       .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
       .first();
     if (existing) {
+      // Repeat visit: only ever UPGRADE consent to true, never clear it.
+      // A resubmission without the box ticked must not silently downgrade a
+      // customer who consented on a prior visit — clearing consent is a
+      // separate, more sensitive action outside this flow's scope.
+      let record = existing;
+      if (whatsapp_consent === true && existing.whatsapp_consent !== true) {
+        await ctx.db.patch(existing._id, { whatsapp_consent: true });
+        record = { ...existing, whatsapp_consent: true };
+      }
       return {
         ok: true,
         isExisting: true,
-        existingId: existing._id,
-        customer: toMerchantCustomer(existing),
+        existingId: record._id,
+        customer: toMerchantCustomer(record),
       };
     }
 
@@ -358,6 +372,8 @@ export const createCustomer = mutation({
       tier: "silver",
       ...(birthday ? { birthday: birthday.trim() } : {}),
       ...(anniversary ? { anniversary: anniversary.trim() } : {}),
+      // Only set consent when explicitly opted in — never persist an explicit false.
+      ...(whatsapp_consent ? { whatsapp_consent: true } : {}),
       custom_tags: custom_tags ?? [],
     });
     const created = await ctx.db.get(id);
