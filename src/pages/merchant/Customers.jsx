@@ -431,6 +431,10 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
   };
 
   const approve = async () => {
+    // Consent gate — never send to a customer who hasn't given WhatsApp
+    // consent, even if the button is somehow triggered while disabled.
+    if (!customer.whatsapp_consent) return;
+
     // No template configured for this occasion type yet → skip the Cloud
     // API attempt entirely, go straight to wa.me — same guard MomentCard.send()
     // uses, not an error state.
@@ -474,8 +478,11 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
         </div>
         <div className="flex gap-2">
           <button onClick={onClose} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Cancel</button>
-          <button onClick={approve} disabled={sending} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
+          <button onClick={approve} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
         </div>
+        {!customer.whatsapp_consent && (
+          <div className="text-red-600 text-xs">This customer hasn't given WhatsApp consent yet — can't send.</div>
+        )}
         {sendMsg && <div className="text-xs text-gold">{sendMsg}</div>}
       </div>
     </Modal>
