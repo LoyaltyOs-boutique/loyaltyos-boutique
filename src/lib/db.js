@@ -1267,6 +1267,7 @@ export async function onboardCustomerRemote(f) {
       name: (f.name || 'New Client').trim(),
       ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
       ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
+      ...(f.whatsapp_consent ? { whatsapp_consent: true } : {}),
     });
     // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
     if (created && !created.ok) {

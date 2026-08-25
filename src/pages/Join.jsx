@@ -12,7 +12,7 @@ export default function Join() {
   // merchant sent, Lookbook redirects here with id/token preserved in the query.
   // The standard onboarding form still works; we prefill when we can.
   const fromLink = Boolean(params.get('id') || params.get('token'));
-  const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India' });
+  const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', whatsapp_consent: false });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
   const [mobileError, setMobileError] = useState('');
@@ -165,6 +165,18 @@ export default function Join() {
                 {COUNTRIES.map((c) => <option key={c}>{c}</option>)}
               </select>
             </div>
+          </div>
+          <div className="flex items-start gap-2">
+            <input
+              type="checkbox"
+              id="whatsapp_consent"
+              checked={f.whatsapp_consent || false}
+              onChange={(e) => setF({ ...f, whatsapp_consent: e.target.checked })}
+              className="mt-1"
+            />
+            <label htmlFor="whatsapp_consent" className="text-sm text-steel">
+              I agree to receive WhatsApp updates (birthday/anniversary wishes and offers) from 85 Lansdowne.
+            </label>
           </div>
           <button className="btn-ink w-full !py-3">Create my magic link ✨</button>
           <p className="text-center text-[10px] tracking-wide2 uppercase text-steel">Your details are private to the boutique</p>
