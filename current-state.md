@@ -26,6 +26,7 @@
 - Fix: Join.jsx onboarding reference (71099c3)
 - Improvement 3: Customer CRM edit + save (Basic info + Profiling tabs) (71f2721 + aacf0e1)
 - **Improvement 4: Public lookbook view + copy/WhatsApp share** (70d67ca)
+- WhatsApp consent checkbox (both onboarding flows) + Approve & Send consent gate — pushed on `feat/whatsapp-cloud-api` (3c8ac10/a48d4f6/7ab837b), NOT YET MERGED to main
 
 ## NEXT (ordered)
 1. Step 7 Checkout + Billing
