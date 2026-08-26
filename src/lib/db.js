@@ -323,6 +323,27 @@ export function getUpcomingAnniversaries(days) {
   return client.query(api.customers.getUpcomingAnniversaries, { days }).catch(() => []);
 }
 
+/**
+ * Record an admin decision (Approve & Send → "sent", Cancel → "cancelled")
+ * for one customer's birthday/anniversary occasion on a specific occasion_date
+ * ("M-D" string, e.g. "8-27") — see docs/superpowers/specs/2026-08-26-message-action-tracking-design.md.
+ * Same PROPAGATE-real-errors bridge pattern as sendWhatsAppTemplateMessage
+ * above (no try/catch-and-swallow) — Customers.jsx needs to see the real
+ * idempotency-rejection error (duplicate decision for the same tuple) to
+ * show an inline message instead of silently doing nothing.
+ */
+export function recordMessageAction(customer_id, occasion, occasion_date, action, channel) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.customers.recordMessageAction, {
+    customer_id: convexUserId(customer_id),
+    occasion,
+    occasion_date,
+    action,
+    ...(channel ? { channel } : {}),
+  });
+}
+
 /* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */
 // Contract parity: function names mirror convex/lookbooks.ts (Step 6) so the
 // frontend surface (Catalogue.jsx) stays identical. Initial render = localStorage

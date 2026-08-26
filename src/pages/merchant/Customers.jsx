@@ -6,6 +6,7 @@ import {
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
+  recordMessageAction,
   hydrateCustomers,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
@@ -82,6 +83,41 @@ export default function Customers() {
   // null when closed — occasion is 'birthday' | 'anniversary', matching
   // templateConfig/waTemplates' key shape directly.
   const [approveTarget, setApproveTarget] = useState(null);
+
+  // decidedActions: same-session "this row was just Approved&Sent/Cancelled"
+  // memory, keyed by `${customer.id}:${occasion}` -> 'sent' | 'cancelled'.
+  // The backend query already excludes decided rows on next fetch (see
+  // convex/customers.ts getUpcomingBirthdays/getUpcomingAnniversaries), but
+  // within THIS session the tomorrowBirthdays/tomorrowAnniversaries arrays
+  // aren't re-fetched after a click — so the row would keep showing the old
+  // buttons until a manual refresh. This local map lets the row swap its
+  // Approve & Send/Cancel buttons for a badge immediately, without removing
+  // the row from the list (per updated design decision — rows stay visible).
+  const [decidedActions, setDecidedActions] = useState({});
+  const decisionKey = (customerId, occasion) => `${customerId}:${occasion}`;
+  const markDecided = (customerId, occasion, action) => {
+    setDecidedActions((prev) => ({ ...prev, [decisionKey(customerId, occasion)]: action }));
+  };
+
+  // cancelErrors: same-session "Cancel just failed" inline message, keyed the
+  // same way as decidedActions — covers the double-click race where two
+  // recordMessageAction calls for the same tuple fire before local state
+  // updates (backend rejects the second with an idempotency error).
+  const [cancelErrors, setCancelErrors] = useState({});
+
+  const handleCancel = async (c, occasion) => {
+    const key = decisionKey(c.id, occasion);
+    const occasionDate = occasion === 'birthday' ? c.birthday : c.anniversary;
+    setCancelErrors((prev) => { const next = { ...prev }; delete next[key]; return next; });
+    try {
+      await recordMessageAction(c.id, occasion, occasionDate, 'cancelled');
+      markDecided(c.id, occasion, 'cancelled');
+    } catch (err) {
+      // Idempotency rejection (already decided) or offline — show inline,
+      // don't crash. If it was already decided, reflect that in the UI too.
+      setCancelErrors((prev) => ({ ...prev, [key]: err?.message || 'Could not cancel — try again.' }));
+    }
+  };
 
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
   const magicUrl = (c) => `${window.location.origin}${waToken(c).m}`;
@@ -216,13 +252,30 @@ export default function Customers() {
                     <a href={shareWa(c)} target="_blank" rel="noreferrer" title="Share on WhatsApp" onClick={(e) => e.stopPropagation()} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="WhatsApp"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
                   </div>
                 </td>
-                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (
-                  <td className="text-center whitespace-nowrap">
-                    <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion: filter === 'birthday_tomorrow' ? 'birthday' : 'anniversary' }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send">
-                      Approve &amp; Send
-                    </button>
-                  </td>
-                )}
+                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (() => {
+                  const occasion = filter === 'birthday_tomorrow' ? 'birthday' : 'anniversary';
+                  const decided = decidedActions[decisionKey(c.id, occasion)];
+                  const cancelError = cancelErrors[decisionKey(c.id, occasion)];
+                  return (
+                    <td className="text-center whitespace-nowrap">
+                      {decided ? (
+                        <span className="text-[10px] tracking-wide2 uppercase text-steel">
+                          {decided === 'sent' ? '✓ Sent' : '✗ Cancelled'}
+                        </span>
+                      ) : (
+                        <div className="inline-flex gap-1.5 items-center">
+                          <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send">
+                            Approve &amp; Send
+                          </button>
+                          <button onClick={(e) => { e.stopPropagation(); handleCancel(c, occasion); }} className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Cancel">
+                            Cancel
+                          </button>
+                        </div>
+                      )}
+                      {cancelError && <div className="text-red-600 text-[10px] mt-1">{cancelError}</div>}
+                    </td>
+                  );
+                })()}
                 <td className="text-right text-gold">→</td>
               </tr>
             ))}
@@ -387,6 +440,19 @@ export default function Customers() {
           templateConfig={templateConfig}
           waTemplates={waTemplates}
           onClose={() => setApproveTarget(null)}
+          onSent={(customerId, occasion, channel) => {
+            const occasionDate = occasion === 'birthday'
+              ? approveTarget.customer.birthday
+              : approveTarget.customer.anniversary;
+            recordMessageAction(customerId, occasion, occasionDate, 'sent', channel)
+              .then(() => markDecided(customerId, occasion, 'sent'))
+              .catch((err) => {
+                // Idempotency rejection (already decided) or offline — the
+                // send itself already happened/attempted; just surface the
+                // logging failure inline on the row rather than crashing.
+                setCancelErrors((prev) => ({ ...prev, [decisionKey(customerId, occasion)]: err?.message || 'Could not log this send — try refreshing.' }));
+              });
+          }}
         />
       )}
     </div>
@@ -414,7 +480,7 @@ function Info({ label, value }) {
  * only per the locked design decision, since discount/coupon/valid-days
  * position in the real approved template text isn't finalized yet.
  */
-function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
+function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent }) {
   const { customer, occasion } = target;
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
@@ -451,6 +517,7 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
     if (!waTemplate) {
       openWaLinkFallback();
       setSendMsg('Sent via WhatsApp link');
+      onSent?.(customer.id, occasion, 'wa_fallback');
       onClose();
       return;
     }
@@ -459,6 +526,7 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
     // [name] only, no card image URL — identical shape to MomentCard.send().
     setSending(true);
     setSendMsg('Sending…');
+    let channel = 'cloud_api';
     try {
       await sendWhatsAppTemplateMessage(customer.mobile, waTemplate.name, waTemplate.language, undefined, [customer.name.trim() || '{name}']);
       setSendMsg('Sent via WhatsApp');
@@ -467,8 +535,10 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose }) {
       // same wa.me link-open, using the preview text shown above.
       openWaLinkFallback();
       setSendMsg('Sent via WhatsApp link');
+      channel = 'wa_fallback';
     } finally {
       setSending(false);
+      onSent?.(customer.id, occasion, channel);
       onClose();
     }
   };

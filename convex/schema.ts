@@ -164,4 +164,29 @@ export default defineSchema({
   })
     .index("by_user", ["user_id"])
     .index("by_status", ["status"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
+   *
+   * message_actions — admin decision-log for birthday/anniversary WhatsApp
+   * reminders. Recording a "sent" or "cancelled" row here for a given
+   * (customer_id, occasion, occasion_date) hides that customer from the
+   * "Birthdays tomorrow" / "Anniversaries tomorrow" Delight Queue lists
+   * (see customers.ts getUpcomingBirthdays / getUpcomingAnniversaries).
+   *
+   * `occasion_date` is an "M-D" string (e.g. "8-27") — not a full date — so
+   * the row naturally stops matching once the year rolls over and the
+   * customer reappears in next year's queue. No cleanup/cron job needed.
+   */
+  message_actions: defineTable({
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(), // "M-D" e.g. "8-27" — matches parseMD's format in customers.ts
+    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    decided_at: v.number(), // epoch ms
+    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"
+  })
+    // Exclusion lookup used by getUpcomingBirthdays/getUpcomingAnniversaries —
+    // named after the exact field tuple, matching this file's by_<field(s)> convention.
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
 });

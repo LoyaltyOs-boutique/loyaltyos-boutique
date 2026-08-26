@@ -104,9 +104,36 @@ interface QueueHit {
 }
 
 /**
+ * message_actions exclusion check (docs/superpowers/specs/2026-08-26-message-action-tracking-design.md).
+ * Returns true when the admin has already recorded a "sent" or "cancelled"
+ * decision for this exact (customer_id, occasion, occasion_date) — i.e. this
+ * specific year's occurrence has already been handled and must not
+ * reappear in the Delight Queue tomorrow-tabs.
+ *
+ * Uses the by_customer_occasion_date index (no full-table scan).
+ */
+async function hasDecidedAction(
+  ctx: QueryCtx,
+  customerId: Id<"users">,
+  occasion: "birthday" | "anniversary",
+  occasionDate: string,
+): Promise<boolean> {
+  const existing = await ctx.db
+    .query("message_actions")
+    .withIndex("by_customer_occasion_date", (q) =>
+      q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+    )
+    .first();
+  return existing !== null;
+}
+
+/**
  * Delight Queue core (PRD Module 1 — Anniversary & Birthday Tracking):
  * customers whose `field` month/day falls within the next `days` days
  * (today inclusive, year-boundary aware). Returns hits sorted by urgency.
+ *
+ * Excludes any customer already decided (sent/cancelled) for that exact
+ * occasion_date via message_actions — see hasDecidedAction above.
  */
 async function findUpcoming(
   ctx: QueryCtx,
@@ -124,7 +151,9 @@ async function findUpcoming(
     const parsed = parseMD(raw);
     if (!parsed) continue;
     const key = `${parsed[0]}-${parsed[1]}`;
-    if (keys.has(key)) hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
+    if (!keys.has(key)) continue;
+    if (await hasDecidedAction(ctx, c._id, field, key)) continue; // already sent/cancelled this year
+    hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
   }
   hits.sort((a, b) => a.daysUntil - b.daysUntil);
   return hits;
@@ -274,6 +303,60 @@ export const getUpcomingAnniversaries = query({
       whatsapp_consent: doc.whatsapp_consent ?? false,
       days_until: daysUntil,
     }));
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
+ *
+ * recordMessageAction — admin decision-log write for the Delight Queue's
+ * tomorrow-tabs. Called by:
+ *   - Approve & Send button (existing) — after a successful/attempted send,
+ *     action:"sent" (+ channel: "cloud_api" | "wa_fallback")
+ *   - Cancel button (new, Customers.jsx follow-up) — action:"cancelled",
+ *     no send attempted
+ *
+ * IDEMPOTENCY: rejects with a clear error if a row already exists for the
+ * exact (customer_id, occasion, occasion_date) tuple — prevents duplicate
+ * rows from a double-click on Approve/Cancel or a duplicate call.
+ *
+ * Out of scope (per spec): no cron, no change to the Cloud-API-then-fallback
+ * send mechanism itself, no "cancel forever" — this only ever records ONE
+ * decision per occasion_date, and next year's differing M-D naturally resets it.
+ */
+export const recordMessageAction = mutation({
+  args: {
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(),
+    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))),
+  },
+  handler: async (ctx, { customer_id, occasion, occasion_date, action, channel }) => {
+    const doc = await getCustomerDoc(ctx, customer_id);
+    if (!doc) throw new Error("Customer not found.");
+
+    const trimmedDate = occasion_date.trim();
+    if (!parseMD(trimmedDate)) {
+      throw new Error(`occasion_date must be an "M-D" string (e.g. "8-27"), got "${occasion_date}".`);
+    }
+
+    // IDEMPOTENCY — same tuple already decided → reject, don't insert a duplicate.
+    if (await hasDecidedAction(ctx, customer_id, occasion, trimmedDate)) {
+      throw new Error(
+        `An action has already been recorded for this customer's ${occasion} on ${trimmedDate}.`,
+      );
+    }
+
+    const id = await ctx.db.insert("message_actions", {
+      customer_id,
+      occasion,
+      occasion_date: trimmedDate,
+      action,
+      decided_at: Date.now(),
+      ...(channel ? { channel } : {}),
+    });
+    return { ok: true, id };
   },
 });
 
