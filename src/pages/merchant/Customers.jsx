@@ -6,6 +6,7 @@ import {
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
+  hydrateCustomers,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
 import { Modal, TierBadge, Tag, Stars, Empty } from '../../components/ui.jsx';
@@ -47,6 +48,17 @@ export default function Customers() {
     getUpcomingAnniversaries(1).then((rows) => { if (mounted) setTomorrowAnniversaries(rows || []); });
     return () => { mounted = false; };
   }, []);
+
+  // Main customer list fresh-fetch on mount. customers() reads the shared
+  // module-scoped state singleton, which hydrateCustomers() populates just
+  // once at module load — so SPA navigation away from and back to this page
+  // (no hard refresh) would otherwise keep showing the last full-page-load
+  // snapshot (stale whatsapp_consent, points, tags, etc.). Re-running
+  // hydrateCustomers() on every mount re-queries Convex and merges fresh rows
+  // into state, calling emit() when anything changed, which useDb()'s
+  // subscribe() picks up to re-render. hydrateCustomers() self-guards via its
+  // crmHydrating flag, so rapid navigate-away-and-back never double-fetches.
+  useEffect(() => { hydrateCustomers(); }, []);
 
   // Approval modal (Birthdays tomorrow / Anniversaries tomorrow "Approve &
   // Send" flow) — the merchant-configured promo copy (discount/coupon/valid
