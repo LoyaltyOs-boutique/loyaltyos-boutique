@@ -57,6 +57,8 @@ function toMerchantCustomer(doc: UserDoc) {
     // PRD §3.2 — magic link fields for merchant eye/copy buttons + session persistence.
     magic_token: doc.magic_token ?? null,
     magic_token_created_at: doc.magic_token_created_at ?? null,
+    // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
+    whatsapp_consent: doc.whatsapp_consent ?? false,
     // CONFIDENTIAL — merchant-only: body-fit measurements + internal staff notes.
     measurements: doc.measurements ?? {},
     staff_notes: doc.staff_notes ?? [],

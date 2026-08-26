@@ -189,6 +189,7 @@ function toLocalCustomer(c) {
     birthday: c.birthday ?? null,
     anniversary: c.anniversary ?? null,
     custom_tags: c.custom_tags ?? [],
+    whatsapp_consent: c.whatsapp_consent,
     measurements: c.measurements ?? {},
     staff_notes: (c.staff_notes || []).map(noteToLocal),
     password_hash: null,
