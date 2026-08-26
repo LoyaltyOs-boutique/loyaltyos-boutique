@@ -38,8 +38,8 @@ export default function Customers() {
   // fetch the real getUpcomingBirthdays/getUpcomingAnniversaries queries on
   // mount (days:1) and filter to days_until === 1 below, same fetch-on-mount
   // pattern as pendingGmbReviews's own hydration elsewhere in this codebase.
-  // Today's existing tabs (birthday/anniversary/all/reviews) keep reading
-  // from customers() exactly as before — untouched.
+  // The remaining tabs (all/reviews) keep reading from customers() exactly
+  // as before — untouched.
   const [tomorrowBirthdays, setTomorrowBirthdays] = useState([]);
   const [tomorrowAnniversaries, setTomorrowAnniversaries] = useState([]);
   useEffect(() => {
@@ -111,8 +111,6 @@ export default function Customers() {
 
     let l = customers();
     const query = q.trim().toLowerCase();
-    if (filter === 'birthday') l = l.filter((c) => c.birthday === todayMD());
-    if (filter === 'anniversary') l = l.filter((c) => c.anniversary === todayMD());
     if (query.startsWith('b:')) { const md = query.slice(2); l = l.filter((c) => c.birthday === md); }
     else if (query.startsWith('a:')) { const md = query.slice(2); l = l.filter((c) => c.anniversary === md); }
     else if (query) l = l.filter((c) => (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query));
@@ -164,7 +162,7 @@ export default function Customers() {
       <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
         <input className="input sm:max-w-xs" placeholder="Search name, mobile, tag…" value={q} onChange={(e) => { setQ(e.target.value); setPage(0); }} />
         <div className="flex gap-2 text-[10px] tracking-wide2 uppercase">
-          {[['all', 'All clients'], ['birthday', 'Birthdays today'], ['anniversary', 'Anniversaries'], ['birthday_tomorrow', 'Birthdays tomorrow'], ['anniversary_tomorrow', 'Anniversaries tomorrow'], ['reviews', `Reviews · ${pending.length}`]].map(([k, label]) => (
+          {[['all', 'All clients'], ['birthday_tomorrow', 'Birthdays tomorrow'], ['anniversary_tomorrow', 'Anniversaries tomorrow'], ['reviews', `Reviews · ${pending.length}`]].map(([k, label]) => (
             <button key={k} onClick={() => { setFilter(k); setPage(0); }} className={cls('px-3 py-2 border transition-colors', filter === k ? 'border-ink bg-ink text-white' : 'border-line text-steel hover:border-ink hover:text-ink')}>
               {label}
             </button>
