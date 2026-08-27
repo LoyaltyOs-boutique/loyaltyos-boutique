@@ -89,7 +89,7 @@ export default function PointsLedger() {
                   {tier !== 'global' && <Toggle on={on} onChange={() => saveTierSettings(tier, { on: !on })} />}
                   <div className="relative">
                     <input
-                      className="input !w-24 text-right pr-7 disabled:opacity-40"
+                      className={unit === 'points per 100' ? 'input !w-32 text-right pr-16 disabled:opacity-40' : 'input !w-24 text-right pr-7 disabled:opacity-40'}
                       type="number"
                       value={cfg[key]}
                       disabled={tier !== 'global' && !on}
