@@ -90,16 +90,20 @@ export type TierKey = (typeof TIER_KEYS)[number];
  *
  * @field purchasePercent     — points earned per ₹100 of order value (e.g. 5 → 5 pts/₹100).
  * @field birthdayBonus       — flat bonus points awarded on a customer's birthday.
+ * @field anniversaryBonus    — flat bonus points awarded on a customer's anniversary.
  * @field gmbPoints           — bonus points per approved Google review.
  * @field productReviewPoints — bonus points per in-app product review.
+ * @field testimonialBonus    — bonus points per approved testimonial.
  * @field on                  — UI toggle; true → the tier's own rule set applies
  *                              (silver/gold/platinum only — global is always on).
  */
 export const tierRuleValidator = v.object({
   purchasePercent: v.optional(v.number()),
   birthdayBonus: v.optional(v.number()),
+  anniversaryBonus: v.optional(v.number()),
   gmbPoints: v.optional(v.number()),
   productReviewPoints: v.optional(v.number()),
+  testimonialBonus: v.optional(v.number()),
   on: v.optional(v.boolean()),
 });
 
@@ -109,8 +113,10 @@ export const loyaltyRulesValidator = v.object({
     global: v.object({
       purchasePercent: v.optional(v.number()),
       birthdayBonus: v.optional(v.number()),
+      anniversaryBonus: v.optional(v.number()),
       gmbPoints: v.optional(v.number()),
       productReviewPoints: v.optional(v.number()),
+      testimonialBonus: v.optional(v.number()),
     }),
     silver: tierRuleValidator,
     gold: tierRuleValidator,
@@ -128,17 +134,19 @@ export const DEFAULT_SETTINGS: {
     {
       purchasePercent: number;
       birthdayBonus: number;
+      anniversaryBonus: number;
       gmbPoints: number;
       productReviewPoints: number;
+      testimonialBonus: number;
       on?: boolean;
     }
   >;
 } = {
   tiers: {
-    global: { purchasePercent: 5, birthdayBonus: 200, gmbPoints: 500, productReviewPoints: 150 },
-    silver: { purchasePercent: 4, birthdayBonus: 150, gmbPoints: 400, productReviewPoints: 100, on: true },
-    gold: { purchasePercent: 5, birthdayBonus: 200, gmbPoints: 500, productReviewPoints: 150, on: true },
-    platinum: { purchasePercent: 7, birthdayBonus: 350, gmbPoints: 750, productReviewPoints: 250, on: true },
+    global: { purchasePercent: 5, birthdayBonus: 200, anniversaryBonus: 200, gmbPoints: 500, productReviewPoints: 150, testimonialBonus: 150 },
+    silver: { purchasePercent: 4, birthdayBonus: 150, anniversaryBonus: 150, gmbPoints: 400, productReviewPoints: 100, testimonialBonus: 100, on: true },
+    gold: { purchasePercent: 5, birthdayBonus: 200, anniversaryBonus: 200, gmbPoints: 500, productReviewPoints: 150, testimonialBonus: 150, on: true },
+    platinum: { purchasePercent: 7, birthdayBonus: 350, anniversaryBonus: 350, gmbPoints: 750, productReviewPoints: 250, testimonialBonus: 250, on: true },
   },
 };
 
@@ -162,7 +170,7 @@ function mergeLoyaltyRules(
     if (!override || typeof override !== "object") continue;
     const target = merged[key];
     // Numeric fields — copy only when a valid number is provided.
-    for (const numField of ["purchasePercent", "birthdayBonus", "gmbPoints", "productReviewPoints"] as const) {
+    for (const numField of ["purchasePercent", "birthdayBonus", "anniversaryBonus", "gmbPoints", "productReviewPoints", "testimonialBonus"] as const) {
       const val = (override as Record<string, unknown>)[numField];
       if (typeof val === "number") {
         (target as Record<string, unknown>)[numField] = val;
@@ -496,7 +504,7 @@ export const updateSettings = mutation({
       const tier = settings.tiers[key] as Record<string, unknown> | undefined;
       if (!tier) continue;
       const clean: Record<string, unknown> = {};
-      for (const numField of ["purchasePercent", "birthdayBonus", "gmbPoints", "productReviewPoints"] as const) {
+      for (const numField of ["purchasePercent", "birthdayBonus", "anniversaryBonus", "gmbPoints", "productReviewPoints", "testimonialBonus"] as const) {
         const val = tier[numField];
         if (typeof val === "number") clean[numField] = val;
       }
