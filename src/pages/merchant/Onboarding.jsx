@@ -146,7 +146,7 @@ export default function Onboarding() {
           <p className="text-sm text-steel mt-2">Add a client at the store (or send them the <Link to="/join" className="text-gold underline">client form</Link>) — we instantly mint their private magic link.</p>
           <button
             type="button"
-            onClick={() => window.open('https://wa.me/?text=' + encodeURIComponent("Your personal boutique lookbook is ready - open your secure link: https://loyaltyos-boutique-three.vercel.app/join - no password needed"), '_blank', 'noopener,noreferrer')}
+            onClick={() => window.open('https://wa.me/?text=' + encodeURIComponent(`Your personal boutique lookbook is ready - open your secure link: ${genUrl('/join')} - no password needed`), '_blank', 'noopener,noreferrer')}
             className="mt-2 inline-flex items-center gap-2 text-[11px] tracking-luxe uppercase text-gold underline hover:text-ink transition-colors cursor-pointer"
           >
             Share the self-onboarding link
