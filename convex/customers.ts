@@ -361,6 +361,64 @@ export const recordMessageAction = mutation({
 });
 
 /**
+ * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
+ *
+ * awardPoints — durable, real points-award mutation. Replaces (in a later,
+ * separate wiring task) the local-only src/lib/db.js adjustPoints function
+ * used by the Points Tool tab, which currently loses its changes on refresh
+ * because it never calls Convex.
+ *
+ * Atomically (single Convex mutation = one transaction):
+ *   1. Patches the customer's `points` field to Math.max(0, current + delta)
+ *      — never negative, matching the existing local adjustPoints's exact
+ *      Math.max(0, ...) safety clamp (src/lib/db.js).
+ *   2. Inserts one row into points_ledger recording the transaction, with
+ *      the resulting (post-clamp) balance.
+ * Returns the new balance.
+ *
+ * reason_type is NOT restricted here at the mutation level — "testimonial"
+ * and "purchase" remain technically callable, but per the design spec they
+ * are UI-reserved: only the automated reviews.ts (approveReview) and
+ * orders.ts (createOrder) flows are meant to ever send those values. Manual
+ * admin UIs (Points Tool, future "+ Points" button) only ever offer
+ * "normal"/"birthday"/"anniversary" — enforced at the frontend layer in a
+ * later task, not here.
+ */
+export const awardPoints = mutation({
+  args: {
+    customer_id: v.id("users"),
+    delta: v.number(),
+    reason_type: v.union(
+      v.literal("normal"),
+      v.literal("birthday"),
+      v.literal("anniversary"),
+      v.literal("testimonial"),
+      v.literal("purchase"),
+    ),
+    note: v.optional(v.string()),
+  },
+  handler: async (ctx, { customer_id, delta, reason_type, note }) => {
+    const doc = await getCustomerDoc(ctx, customer_id);
+    if (!doc) throw new Error("Customer not found.");
+
+    const resulting_balance = Math.max(0, (doc.points ?? 0) + delta);
+    await ctx.db.patch(customer_id, { points: resulting_balance });
+
+    await ctx.db.insert("points_ledger", {
+      customer_id,
+      delta,
+      reason_type,
+      ...(note?.trim() ? { note: note.trim() } : {}),
+      resulting_balance,
+      created_by: "admin",
+      created_at: Date.now(),
+    });
+
+    return resulting_balance;
+  },
+});
+
+/**
  * IMPROVEMENT 4 — WhatsApp number as UNIQUE key for customers.
  * Ma'am's rule: ONE WhatsApp number = ONE customer profile — prevent
  * duplicate accounts from the same number. Convex has no native unique

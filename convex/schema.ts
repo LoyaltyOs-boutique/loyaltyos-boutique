@@ -189,4 +189,41 @@ export default defineSchema({
     // Exclusion lookup used by getUpcomingBirthdays/getUpcomingAnniversaries —
     // named after the exact field tuple, matching this file's by_<field(s)> convention.
     .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
+   *
+   * points_ledger — durable, append-only audit trail for every points change
+   * (manual awards + future automated ones), replacing the local-only,
+   * refresh-losing array in src/lib/db.js's Points Tool tab. Each row is one
+   * transaction: written by convex/customers.ts's awardPoints mutation
+   * alongside the users.points patch (same mutation = atomic).
+   *
+   * reason_type:
+   *   "normal" | "birthday" | "anniversary" — selectable in manual admin UIs
+   *   "testimonial" — reserved for the automated review-approval flow
+   *                   (reviews.ts approveReview) only, not manual UIs
+   *   "purchase"    — reserved for the existing order-checkout flow
+   *                   (orders.ts createOrder) only, not manual UIs
+   * (Phase B1 does not enforce this split at the mutation level — see
+   * awardPoints's own comment — it is enforced by which callers exist.)
+   */
+  points_ledger: defineTable({
+    customer_id: v.id("users"),
+    delta: v.number(), // signed points change (positive = award, negative = deduction)
+    reason_type: v.union(
+      v.literal("normal"),
+      v.literal("birthday"),
+      v.literal("anniversary"),
+      v.literal("testimonial"),
+      v.literal("purchase"),
+    ),
+    note: v.optional(v.string()),
+    resulting_balance: v.number(), // customer's points AFTER this transaction (post-clamp)
+    created_by: v.union(v.literal("admin"), v.literal("system")),
+    created_at: v.number(), // epoch ms
+  })
+    // Per-customer history lookup (Activity Ledger tab, future task) — matches
+    // this file's by_<field> index-naming convention.
+    .index("by_customer", ["customer_id"]),
 });
