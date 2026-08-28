@@ -638,14 +638,15 @@ function PointsTool({ userId }) {
   const db = useDb();
   const [delta, setDelta] = useState('');
   const [reason, setReason] = useState('');
+  const [reasonType, setReasonType] = useState('normal');
   const [pointsError, setPointsError] = useState('');
   const user = db.users.find((u) => u.id === userId);
   const submit = (sign) => {
     const n = Number(delta);
     if (!n || !reason.trim()) return;
     setPointsError('');
-    awardPoints(userId, sign * n, 'normal', reason.trim())
-      .then(() => { setDelta(''); setReason(''); })
+    awardPoints(userId, sign * n, reasonType, reason.trim())
+      .then(() => { setDelta(''); setReason(''); setReasonType('normal'); })
       .catch((err) => {
         setPointsError(err?.message || 'Could not save this adjustment — try again.');
       });
@@ -660,6 +661,14 @@ function PointsTool({ userId }) {
       <div className="grid sm:grid-cols-2 gap-4 mb-4">
         <div><label className="label">Points {`(+add / −deduct)`}</label><input className="input" type="number" value={delta} onChange={(e) => setDelta(e.target.value)} placeholder="e.g. 100" /></div>
         <div><label className="label">Audit reason (mandatory)</label><input className="input" value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. walk-in goodwill credit" /></div>
+        <div>
+          <label className="label">Reason type</label>
+          <select className="input" value={reasonType} onChange={(e) => setReasonType(e.target.value)}>
+            <option value="normal">Normal</option>
+            <option value="birthday">Birthday</option>
+            <option value="anniversary">Anniversary</option>
+          </select>
+        </div>
       </div>
       <div className="flex gap-2">
         <button onClick={() => submit(1)} className="btn-ink flex-1" disabled={!delta || !reason.trim()}>Add points</button>
