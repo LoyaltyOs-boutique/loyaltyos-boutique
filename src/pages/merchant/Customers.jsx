@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
-  getData, subscribe, customers, customerLedger, adjustPoints, addStaffNote,
+  getData, subscribe, customers, customerLedger, addStaffNote,
   pendingGmbReviews, setReviewStatus, waMessage, waDigits,
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
-  recordMessageAction,
+  recordMessageAction, awardPoints,
   hydrateCustomers,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
@@ -83,6 +83,11 @@ export default function Customers() {
   // null when closed — occasion is 'birthday' | 'anniversary', matching
   // templateConfig/waTemplates' key shape directly.
   const [approveTarget, setApproveTarget] = useState(null);
+
+  // pointsTarget: the customer row object while the "Give points" modal is
+  // open (from the All-clients table's new + Points button), null when
+  // closed — same conditional-render-at-bottom pattern as approveTarget.
+  const [pointsTarget, setPointsTarget] = useState(null);
 
   // decidedActions: same-session "this row was just Approved&Sent/Cancelled"
   // memory, keyed by `${customer.id}:${occasion}` -> 'sent' | 'cancelled'.
@@ -250,6 +255,9 @@ export default function Customers() {
                       {copiedId === c.id ? '✓' : '🔗'}
                     </button>
                     <a href={shareWa(c)} target="_blank" rel="noreferrer" title="Share on WhatsApp" onClick={(e) => e.stopPropagation()} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="WhatsApp"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ verticalAlign: '-1px' }}><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg></a>
+                    <button onClick={(e) => { e.stopPropagation(); setPointsTarget(c); }} title="Give points" className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Give points">
+                      ✦
+                    </button>
                   </div>
                 </td>
                 {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (() => {
@@ -455,6 +463,12 @@ export default function Customers() {
           }}
         />
       )}
+
+      {pointsTarget && (
+        <Modal open onClose={() => setPointsTarget(null)} title={`Give points — ${pointsTarget.name}`}>
+          <PointsTool userId={pointsTarget.id} />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -624,12 +638,17 @@ function PointsTool({ userId }) {
   const db = useDb();
   const [delta, setDelta] = useState('');
   const [reason, setReason] = useState('');
+  const [pointsError, setPointsError] = useState('');
   const user = db.users.find((u) => u.id === userId);
   const submit = (sign) => {
     const n = Number(delta);
     if (!n || !reason.trim()) return;
-    adjustPoints(userId, sign * n, reason.trim());
-    setDelta(''); setReason('');
+    setPointsError('');
+    awardPoints(userId, sign * n, 'normal', reason.trim())
+      .then(() => { setDelta(''); setReason(''); })
+      .catch((err) => {
+        setPointsError(err?.message || 'Could not save this adjustment — try again.');
+      });
   };
   return (
     <div>
@@ -646,6 +665,7 @@ function PointsTool({ userId }) {
         <button onClick={() => submit(1)} className="btn-ink flex-1" disabled={!delta || !reason.trim()}>Add points</button>
         <button onClick={() => submit(-1)} className="btn-ghost flex-1" disabled={!delta || !reason.trim()}>Deduct points</button>
       </div>
+      {pointsError && <div className="text-red-600 text-[10px] mt-1">{pointsError}</div>}
       <p className="text-[10px] tracking-wide2 uppercase text-steel mt-4">Every adjustment is logged with its reason in the audit ledger.</p>
     </div>
   );

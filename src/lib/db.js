@@ -344,6 +344,38 @@ export function recordMessageAction(customer_id, occasion, occasion_date, action
   });
 }
 
+/**
+ * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
+ *
+ * Award (or deduct) points to a customer via the durable Convex awardPoints
+ * mutation (convex/customers.ts) — replaces the local-only adjustPoints
+ * function used by the Points Tool tab, which lost its changes on refresh
+ * because it never reached Convex. Same PROPAGATE-real-errors bridge pattern
+ * as recordMessageAction above (no try/catch-and-swallow) — PointsTool needs
+ * to see the real rejection (e.g. offline, customer not found) to show an
+ * inline message instead of silently doing nothing.
+ *
+ * awardPoints's Convex response is just the new numeric balance (not a full
+ * customer doc), so — unlike updateMeasurements/updateCustomTags/
+ * updateCustomerProfile above — refreshFromConvexSheet can't be used
+ * directly here. Instead, on success, re-pull the full customer list via
+ * hydrateCustomers() (same background-refresh mechanism used elsewhere) so
+ * the balance shown in the UI reflects the real, persisted Convex value.
+ */
+export function awardPoints(customer_id, delta, reason_type, note) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.customers.awardPoints, {
+    customer_id: convexUserId(customer_id),
+    delta,
+    reason_type,
+    ...(note ? { note } : {}),
+  }).then((resulting_balance) => {
+    hydrateCustomers();
+    return resulting_balance;
+  });
+}
+
 /* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */
 // Contract parity: function names mirror convex/lookbooks.ts (Step 6) so the
 // frontend surface (Catalogue.jsx) stays identical. Initial render = localStorage
