@@ -24,7 +24,7 @@ const csvToMD = (v) => {
 export default function Onboarding() {
   useDb(); // hydrate local customer cache so CSV preview can detect duplicates
   const convex = useConvex(); // shared client from <ConvexProvider> in main.jsx
-  const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '' });
+  const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -146,7 +146,7 @@ export default function Onboarding() {
           <p className="text-sm text-steel mt-2">Add a client at the store (or send them the <Link to="/join" className="text-gold underline">client form</Link>) — we instantly mint their private magic link.</p>
           <button
             type="button"
-            onClick={() => window.open('https://wa.me/?text=' + encodeURIComponent("Your personal boutique lookbook is ready - open your secure link: https://loyaltyos-boutique-three.vercel.app/join - no password needed"), '_blank', 'noopener,noreferrer')}
+            onClick={() => window.open('https://wa.me/?text=' + encodeURIComponent(`Your personal boutique lookbook is ready - open your secure link: ${genUrl('/join')} - no password needed`), '_blank', 'noopener,noreferrer')}
             className="mt-2 inline-flex items-center gap-2 text-[11px] tracking-luxe uppercase text-gold underline hover:text-ink transition-colors cursor-pointer"
           >
             Share the self-onboarding link
@@ -200,6 +200,18 @@ export default function Onboarding() {
               <label className="label">Staff note (optional)</label>
               <input className="input" value={f.note} onChange={set('note')} placeholder="e.g. prefers ivory & blushed tones" />
             </div>
+            <div className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                id="whatsapp_consent"
+                checked={f.whatsapp_consent || false}
+                onChange={(e) => setF({ ...f, whatsapp_consent: e.target.checked })}
+                className="mt-1"
+              />
+              <label htmlFor="whatsapp_consent" className="text-sm text-steel">
+                I agree to receive WhatsApp updates (birthday/anniversary wishes and offers) from 85 Lansdowne.
+              </label>
+            </div>
             <button className="btn-ink w-full" type="submit" disabled={creating}>
               {creating ? 'Minting secure link…' : 'Generate magic link'}
             </button>
@@ -231,7 +243,7 @@ export default function Onboarding() {
               <a href={genUrl(result.magicLink)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-2 !border-transparent !text-gold text-[10px]">
                 Preview their lookbook ↗
               </a>
-              <button onClick={() => { setResult(null); setF({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '' }); }} className="btn-ghost w-full mt-2 !py-2 text-[10px] border-white/10 text-white/70 hover:text-ink">
+              <button onClick={() => { setResult(null); setF({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false }); }} className="btn-ghost w-full mt-2 !py-2 text-[10px] border-white/10 text-white/70 hover:text-ink">
                 ＋ Onboard another client
               </button>
             </div>

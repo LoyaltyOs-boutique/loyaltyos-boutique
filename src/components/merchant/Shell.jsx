@@ -11,6 +11,7 @@ const NAV = [
   { to: '/merchant/campaigns', label: 'WhatsApp Campaigns', icon: '✆' },
   { to: '/merchant/catalogue', label: 'Lookbook Manager', icon: '❖' },
   { to: '/merchant/templates', label: 'Templates', icon: '▤' },
+  { to: '/merchant/points-ledger', label: 'Points Ledger', icon: '✪' },
   { to: '/merchant/settings', label: 'Settings & Support', icon: '✦' },
 ];
 

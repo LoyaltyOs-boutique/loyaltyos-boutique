@@ -1,6 +1,7 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
+import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 
 /**
  * LoyaltyOS Boutique — Orders + Points Backend (Step 7, PRD Module 7)
@@ -53,8 +54,18 @@ export const createOrder = mutation({
 
     if (final_total < 0) return { ok: false, error: "Discount exceeds total" };
 
-    // Earn Rate: ₹100 = 10,000 paise = 1pt, floored
-    const points_earned = Math.floor(subtotal_paise / 10000);
+    // Earn Rate: tier-specific purchasePercent points per ₹100 (10,000 paise),
+    // floored. Fetches the merchant's loyalty rules (falling back to defaults
+    // when unset) and resolves the customer's tier rule, defaulting to the
+    // `global` rule when the customer has no tier — mirrors reviews.ts's
+    // settings fetch and src/lib/db.js's `rules[user.tier] || rules.global`.
+    const settingsDoc = await ctx.db
+      .query("settings")
+      .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
+      .first();
+    const rules = settingsDoc?.value?.tiers || DEFAULT_SETTINGS.tiers;
+    const rule = rules[user.tier] || rules.global;
+    const points_earned = Math.floor((subtotal_paise * (rule.purchasePercent || 5)) / 10000);
 
     // 5. Update User Balance (Atomic)
     const new_balance = currentPoints - applied + points_earned;

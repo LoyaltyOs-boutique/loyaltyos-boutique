@@ -57,6 +57,8 @@ function toMerchantCustomer(doc: UserDoc) {
     // PRD §3.2 — magic link fields for merchant eye/copy buttons + session persistence.
     magic_token: doc.magic_token ?? null,
     magic_token_created_at: doc.magic_token_created_at ?? null,
+    // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
+    whatsapp_consent: doc.whatsapp_consent ?? false,
     // CONFIDENTIAL — merchant-only: body-fit measurements + internal staff notes.
     measurements: doc.measurements ?? {},
     staff_notes: doc.staff_notes ?? [],
@@ -102,9 +104,36 @@ interface QueueHit {
 }
 
 /**
+ * message_actions exclusion check (docs/superpowers/specs/2026-08-26-message-action-tracking-design.md).
+ * Returns true when the admin has already recorded a "sent" or "cancelled"
+ * decision for this exact (customer_id, occasion, occasion_date) — i.e. this
+ * specific year's occurrence has already been handled and must not
+ * reappear in the Delight Queue tomorrow-tabs.
+ *
+ * Uses the by_customer_occasion_date index (no full-table scan).
+ */
+async function hasDecidedAction(
+  ctx: QueryCtx,
+  customerId: Id<"users">,
+  occasion: "birthday" | "anniversary",
+  occasionDate: string,
+): Promise<boolean> {
+  const existing = await ctx.db
+    .query("message_actions")
+    .withIndex("by_customer_occasion_date", (q) =>
+      q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+    )
+    .first();
+  return existing !== null;
+}
+
+/**
  * Delight Queue core (PRD Module 1 — Anniversary & Birthday Tracking):
  * customers whose `field` month/day falls within the next `days` days
  * (today inclusive, year-boundary aware). Returns hits sorted by urgency.
+ *
+ * Excludes any customer already decided (sent/cancelled) for that exact
+ * occasion_date via message_actions — see hasDecidedAction above.
  */
 async function findUpcoming(
   ctx: QueryCtx,
@@ -122,7 +151,9 @@ async function findUpcoming(
     const parsed = parseMD(raw);
     if (!parsed) continue;
     const key = `${parsed[0]}-${parsed[1]}`;
-    if (keys.has(key)) hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
+    if (!keys.has(key)) continue;
+    if (await hasDecidedAction(ctx, c._id, field, key)) continue; // already sent/cancelled this year
+    hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
   }
   hits.sort((a, b) => a.daysUntil - b.daysUntil);
   return hits;
@@ -249,6 +280,8 @@ export const getUpcomingBirthdays = query({
       mobile: doc.mobile,
       tier: doc.tier ?? "silver",
       points: doc.points ?? 0,
+      // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
+      whatsapp_consent: doc.whatsapp_consent ?? false,
       days_until: daysUntil,
     }));
   },
@@ -266,8 +299,122 @@ export const getUpcomingAnniversaries = query({
       mobile: doc.mobile,
       tier: doc.tier ?? "silver",
       points: doc.points ?? 0,
+      // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
+      whatsapp_consent: doc.whatsapp_consent ?? false,
       days_until: daysUntil,
     }));
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
+ *
+ * recordMessageAction — admin decision-log write for the Delight Queue's
+ * tomorrow-tabs. Called by:
+ *   - Approve & Send button (existing) — after a successful/attempted send,
+ *     action:"sent" (+ channel: "cloud_api" | "wa_fallback")
+ *   - Cancel button (new, Customers.jsx follow-up) — action:"cancelled",
+ *     no send attempted
+ *
+ * IDEMPOTENCY: rejects with a clear error if a row already exists for the
+ * exact (customer_id, occasion, occasion_date) tuple — prevents duplicate
+ * rows from a double-click on Approve/Cancel or a duplicate call.
+ *
+ * Out of scope (per spec): no cron, no change to the Cloud-API-then-fallback
+ * send mechanism itself, no "cancel forever" — this only ever records ONE
+ * decision per occasion_date, and next year's differing M-D naturally resets it.
+ */
+export const recordMessageAction = mutation({
+  args: {
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(),
+    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))),
+  },
+  handler: async (ctx, { customer_id, occasion, occasion_date, action, channel }) => {
+    const doc = await getCustomerDoc(ctx, customer_id);
+    if (!doc) throw new Error("Customer not found.");
+
+    const trimmedDate = occasion_date.trim();
+    if (!parseMD(trimmedDate)) {
+      throw new Error(`occasion_date must be an "M-D" string (e.g. "8-27"), got "${occasion_date}".`);
+    }
+
+    // IDEMPOTENCY — same tuple already decided → reject, don't insert a duplicate.
+    if (await hasDecidedAction(ctx, customer_id, occasion, trimmedDate)) {
+      throw new Error(
+        `An action has already been recorded for this customer's ${occasion} on ${trimmedDate}.`,
+      );
+    }
+
+    const id = await ctx.db.insert("message_actions", {
+      customer_id,
+      occasion,
+      occasion_date: trimmedDate,
+      action,
+      decided_at: Date.now(),
+      ...(channel ? { channel } : {}),
+    });
+    return { ok: true, id };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
+ *
+ * awardPoints — durable, real points-award mutation. Replaces (in a later,
+ * separate wiring task) the local-only src/lib/db.js adjustPoints function
+ * used by the Points Tool tab, which currently loses its changes on refresh
+ * because it never calls Convex.
+ *
+ * Atomically (single Convex mutation = one transaction):
+ *   1. Patches the customer's `points` field to Math.max(0, current + delta)
+ *      — never negative, matching the existing local adjustPoints's exact
+ *      Math.max(0, ...) safety clamp (src/lib/db.js).
+ *   2. Inserts one row into points_ledger recording the transaction, with
+ *      the resulting (post-clamp) balance.
+ * Returns the new balance.
+ *
+ * reason_type is NOT restricted here at the mutation level — "testimonial"
+ * and "purchase" remain technically callable, but per the design spec they
+ * are UI-reserved: only the automated reviews.ts (approveReview) and
+ * orders.ts (createOrder) flows are meant to ever send those values. Manual
+ * admin UIs (Points Tool, future "+ Points" button) only ever offer
+ * "normal"/"birthday"/"anniversary" — enforced at the frontend layer in a
+ * later task, not here.
+ */
+export const awardPoints = mutation({
+  args: {
+    customer_id: v.id("users"),
+    delta: v.number(),
+    reason_type: v.union(
+      v.literal("normal"),
+      v.literal("birthday"),
+      v.literal("anniversary"),
+      v.literal("testimonial"),
+      v.literal("purchase"),
+    ),
+    note: v.optional(v.string()),
+  },
+  handler: async (ctx, { customer_id, delta, reason_type, note }) => {
+    const doc = await getCustomerDoc(ctx, customer_id);
+    if (!doc) throw new Error("Customer not found.");
+
+    const resulting_balance = Math.max(0, (doc.points ?? 0) + delta);
+    await ctx.db.patch(customer_id, { points: resulting_balance });
+
+    await ctx.db.insert("points_ledger", {
+      customer_id,
+      delta,
+      reason_type,
+      ...(note?.trim() ? { note: note.trim() } : {}),
+      resulting_balance,
+      created_by: "admin",
+      created_at: Date.now(),
+    });
+
+    return resulting_balance;
   },
 });
 
@@ -325,8 +472,9 @@ export const createCustomer = mutation({
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
     custom_tags: v.optional(v.array(v.string())),
+    whatsapp_consent: v.optional(v.boolean()),
   },
-  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags }) => {
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent }) => {
     const digits = mobile.replace(/\D/g, '');
     if (digits.length !== 10) {
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };
@@ -341,11 +489,20 @@ export const createCustomer = mutation({
       .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
       .first();
     if (existing) {
+      // Repeat visit: only ever UPGRADE consent to true, never clear it.
+      // A resubmission without the box ticked must not silently downgrade a
+      // customer who consented on a prior visit — clearing consent is a
+      // separate, more sensitive action outside this flow's scope.
+      let record = existing;
+      if (whatsapp_consent === true && existing.whatsapp_consent !== true) {
+        await ctx.db.patch(existing._id, { whatsapp_consent: true });
+        record = { ...existing, whatsapp_consent: true };
+      }
       return {
         ok: true,
         isExisting: true,
-        existingId: existing._id,
-        customer: toMerchantCustomer(existing),
+        existingId: record._id,
+        customer: toMerchantCustomer(record),
       };
     }
 
@@ -358,6 +515,8 @@ export const createCustomer = mutation({
       tier: "silver",
       ...(birthday ? { birthday: birthday.trim() } : {}),
       ...(anniversary ? { anniversary: anniversary.trim() } : {}),
+      // Only set consent when explicitly opted in — never persist an explicit false.
+      ...(whatsapp_consent ? { whatsapp_consent: true } : {}),
       custom_tags: custom_tags ?? [],
     });
     const created = await ctx.db.get(id);

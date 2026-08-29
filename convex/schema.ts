@@ -164,4 +164,66 @@ export default defineSchema({
   })
     .index("by_user", ["user_id"])
     .index("by_status", ["status"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
+   *
+   * message_actions — admin decision-log for birthday/anniversary WhatsApp
+   * reminders. Recording a "sent" or "cancelled" row here for a given
+   * (customer_id, occasion, occasion_date) hides that customer from the
+   * "Birthdays tomorrow" / "Anniversaries tomorrow" Delight Queue lists
+   * (see customers.ts getUpcomingBirthdays / getUpcomingAnniversaries).
+   *
+   * `occasion_date` is an "M-D" string (e.g. "8-27") — not a full date — so
+   * the row naturally stops matching once the year rolls over and the
+   * customer reappears in next year's queue. No cleanup/cron job needed.
+   */
+  message_actions: defineTable({
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(), // "M-D" e.g. "8-27" — matches parseMD's format in customers.ts
+    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    decided_at: v.number(), // epoch ms
+    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"
+  })
+    // Exclusion lookup used by getUpcomingBirthdays/getUpcomingAnniversaries —
+    // named after the exact field tuple, matching this file's by_<field(s)> convention.
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
+   *
+   * points_ledger — durable, append-only audit trail for every points change
+   * (manual awards + future automated ones), replacing the local-only,
+   * refresh-losing array in src/lib/db.js's Points Tool tab. Each row is one
+   * transaction: written by convex/customers.ts's awardPoints mutation
+   * alongside the users.points patch (same mutation = atomic).
+   *
+   * reason_type:
+   *   "normal" | "birthday" | "anniversary" — selectable in manual admin UIs
+   *   "testimonial" — reserved for the automated review-approval flow
+   *                   (reviews.ts approveReview) only, not manual UIs
+   *   "purchase"    — reserved for the existing order-checkout flow
+   *                   (orders.ts createOrder) only, not manual UIs
+   * (Phase B1 does not enforce this split at the mutation level — see
+   * awardPoints's own comment — it is enforced by which callers exist.)
+   */
+  points_ledger: defineTable({
+    customer_id: v.id("users"),
+    delta: v.number(), // signed points change (positive = award, negative = deduction)
+    reason_type: v.union(
+      v.literal("normal"),
+      v.literal("birthday"),
+      v.literal("anniversary"),
+      v.literal("testimonial"),
+      v.literal("purchase"),
+    ),
+    note: v.optional(v.string()),
+    resulting_balance: v.number(), // customer's points AFTER this transaction (post-clamp)
+    created_by: v.union(v.literal("admin"), v.literal("system")),
+    created_at: v.number(), // epoch ms
+  })
+    // Per-customer history lookup (Activity Ledger tab, future task) — matches
+    // this file's by_<field> index-naming convention.
+    .index("by_customer", ["customer_id"]),
 });

@@ -68,7 +68,7 @@ export const approveReview = mutation({
     // Calculate points
     let points = 0;
     if (review.type === "testimonial") {
-      points = 50000; // 50000 paise equivalent
+      points = globalRules.testimonialBonus;
     } else if (review.type === "gmb") {
       points = globalRules.gmbPoints;
     } else if (review.type === "product") {

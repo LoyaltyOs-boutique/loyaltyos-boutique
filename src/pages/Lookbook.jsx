@@ -88,11 +88,21 @@ export default function Lookbook() {
 
     // No params: check existing session
     const s = getCustomerSession();
-    if (s) { 
-      const u = validateLookbook(s.id, s.token); 
-      if (u) { 
-        setCustomer(u); 
-        return; 
+    if (s) {
+      const u = validateLookbook(s.id, s.token);
+      if (u) {
+        setCustomer(u);
+        // Background refresh: local cache may be stale (e.g. points credited via
+        // a review approval since this browser's last visit). Re-validate against
+        // Convex in the background and merge in the live data once resolved —
+        // mirrors the first-visit fallback pattern above (lines 76-85).
+        validateMagicToken(s.id, s.token, Date.now()).then((res) => {
+          if (res && res.user) {
+            const synced = syncMagicLinkCustomer(res.user, s.token, res.user.id);
+            if (synced) setCustomer(synced);
+          }
+        });
+        return;
       }
     }
 

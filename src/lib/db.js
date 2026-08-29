@@ -189,6 +189,7 @@ function toLocalCustomer(c) {
     birthday: c.birthday ?? null,
     anniversary: c.anniversary ?? null,
     custom_tags: c.custom_tags ?? [],
+    whatsapp_consent: c.whatsapp_consent,
     measurements: c.measurements ?? {},
     staff_notes: (c.staff_notes || []).map(noteToLocal),
     password_hash: null,
@@ -322,6 +323,59 @@ export function getUpcomingAnniversaries(days) {
   return client.query(api.customers.getUpcomingAnniversaries, { days }).catch(() => []);
 }
 
+/**
+ * Record an admin decision (Approve & Send → "sent", Cancel → "cancelled")
+ * for one customer's birthday/anniversary occasion on a specific occasion_date
+ * ("M-D" string, e.g. "8-27") — see docs/superpowers/specs/2026-08-26-message-action-tracking-design.md.
+ * Same PROPAGATE-real-errors bridge pattern as sendWhatsAppTemplateMessage
+ * above (no try/catch-and-swallow) — Customers.jsx needs to see the real
+ * idempotency-rejection error (duplicate decision for the same tuple) to
+ * show an inline message instead of silently doing nothing.
+ */
+export function recordMessageAction(customer_id, occasion, occasion_date, action, channel) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.customers.recordMessageAction, {
+    customer_id: convexUserId(customer_id),
+    occasion,
+    occasion_date,
+    action,
+    ...(channel ? { channel } : {}),
+  });
+}
+
+/**
+ * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
+ *
+ * Award (or deduct) points to a customer via the durable Convex awardPoints
+ * mutation (convex/customers.ts) — replaces the local-only adjustPoints
+ * function used by the Points Tool tab, which lost its changes on refresh
+ * because it never reached Convex. Same PROPAGATE-real-errors bridge pattern
+ * as recordMessageAction above (no try/catch-and-swallow) — PointsTool needs
+ * to see the real rejection (e.g. offline, customer not found) to show an
+ * inline message instead of silently doing nothing.
+ *
+ * awardPoints's Convex response is just the new numeric balance (not a full
+ * customer doc), so — unlike updateMeasurements/updateCustomTags/
+ * updateCustomerProfile above — refreshFromConvexSheet can't be used
+ * directly here. Instead, on success, re-pull the full customer list via
+ * hydrateCustomers() (same background-refresh mechanism used elsewhere) so
+ * the balance shown in the UI reflects the real, persisted Convex value.
+ */
+export function awardPoints(customer_id, delta, reason_type, note) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.customers.awardPoints, {
+    customer_id: convexUserId(customer_id),
+    delta,
+    reason_type,
+    ...(note ? { note } : {}),
+  }).then((resulting_balance) => {
+    hydrateCustomers();
+    return resulting_balance;
+  });
+}
+
 /* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */
 // Contract parity: function names mirror convex/lookbooks.ts (Step 6) so the
 // frontend surface (Catalogue.jsx) stays identical. Initial render = localStorage
@@ -399,6 +453,82 @@ export function setTemplateCardUrl(type, url) {
   const client = getConvex();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
   return client.mutation(api.settings.setTemplateCardUrl, { type, url });
+}
+
+/**
+ * Fetch the approved WhatsApp template metadata (name + language) for
+ * Anniversary/Birthday (WhatsApp Cloud API integration). Always resolves to
+ * a real object with both keys — `{ anniversary: null, birthday: null }` is
+ * the normal/expected "no template configured yet" state, not an error.
+ * Same query-with-catch-null pattern as getTemplateCardUrls above.
+ */
+export function getWhatsAppTemplates() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.settings.getWhatsAppTemplates).catch(() => null);
+}
+
+/**
+ * Fetch the merchant-configured promo copy (Discount%, Coupon Code, Valid
+ * Days) for Anniversary/Birthday. Always resolves to the full merged shape
+ * — `{anniversary:{...}, birthday:{...}}`, all-empty-string is the normal
+ * "not set yet" state, not an error. Same query-with-catch-null pattern as
+ * getTemplateCardUrls/getWhatsAppTemplates above.
+ */
+export function getWhatsAppTemplateConfig() {
+  const client = getConvex();
+  if (!client) return Promise.resolve(null);
+  return client.query(api.settings.getWhatsAppTemplateConfig).catch(() => null);
+}
+
+/**
+ * Save one moment type's promo config (Discount%, Coupon Code, Valid Days),
+ * leaving the other moment type untouched (read-merge-write on the Convex
+ * side). Same PROPAGATE-real-errors bridge pattern as setTemplateCardUrl/
+ * uploadTemplateMedia above — no try/catch-and-swallow, so Templates.jsx
+ * can show a real failure instead of a silently-ignored save.
+ */
+export function setWhatsAppTemplateConfig(type, config) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.mutation(api.settings.setWhatsAppTemplateConfig, { type, config });
+}
+
+/**
+ * Send a pre-approved WhatsApp template message via the Cloud API
+ * (convex/whatsapp.ts). Same PROPAGATE-real-errors bridge pattern as
+ * uploadTemplateMedia/setTemplateCardUrl above — no try/catch-and-swallow
+ * here. Templates.jsx decides what to do on failure (fall back to the
+ * existing wa.me link-open), this bridge just forwards the Convex action
+ * call and its real success/error shape.
+ */
+export function sendWhatsAppTemplateMessage(to, templateName, languageCode, imageUrl, bodyParams) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.whatsapp.sendWhatsAppTemplateMessage, {
+    to,
+    templateName,
+    languageCode,
+    ...(imageUrl ? { imageUrl } : {}),
+    ...(bodyParams ? { bodyParams } : {}),
+  });
+}
+
+/**
+ * Send a free-form WhatsApp service message (only valid inside an open 24h
+ * customer service window — convex/whatsapp.ts, Decision 1: no session
+ * tracking, the real Meta rejection IS the signal). Same PROPAGATE-real-
+ * errors bridge pattern as sendWhatsAppTemplateMessage above.
+ */
+export function sendWhatsAppServiceMessage(to, type, text, imageUrl) {
+  const client = getConvex();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  return client.action(api.whatsapp.sendWhatsAppServiceMessage, {
+    to,
+    type,
+    ...(text ? { text } : {}),
+    ...(imageUrl ? { imageUrl } : {}),
+  });
 }
 
 /**
@@ -1191,6 +1321,7 @@ export async function onboardCustomerRemote(f) {
       name: (f.name || 'New Client').trim(),
       ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
       ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
+      ...(f.whatsapp_consent ? { whatsapp_consent: true } : {}),
     });
     // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
     if (created && !created.ok) {

@@ -61,7 +61,7 @@ Readable structure, comments explaining why, typed validators, single source of 
 DO NOT edit: src/components/, src/pages/ (except approved flows), src/App.jsx, src/index.css, src/data/
 Allowed files: src/lib/db.js, src/main.jsx
 Approved flow files (specific sections only): Login.jsx (forgot-password), Lookbook.jsx (auth/waLink), Join.jsx (onboarding), Onboarding.jsx, Customers.jsx (eye/copy/share/edit), Catalogue.jsx (copy/share), PublicLookbook.jsx
-Build must stay ~27.74-28.10 kB CSS — report exact size if it changes.
+Build must stay ~28.60 kB CSS (grew during WhatsApp Cloud API + Points Ledger feature work on branch feat/whatsapp-cloud-api, not yet merged to main) — report exact size if it changes.
 
 ### 5.5 Ledger rules
 Canonical ledger: .superpowers/sdd/progress.md

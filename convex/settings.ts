@@ -53,6 +53,22 @@ export const SETTINGS_KEYS = {
   // images. Deliberately NOT named "templates" — that key already means
   // WhatsApp message-copy templates (PRD §8) and would silently collide.
   TEMPLATE_CARDS: "template_cards",
+  // WhatsApp Cloud API integration — approved template METADATA (name +
+  // language) registered in WhatsApp Manager for Anniversary/Birthday sends.
+  // Distinct from both "templates" (message-copy text) and "template_cards"
+  // (card image URLs) — confirmed no collision (grep shows only those two
+  // existing string values in this file).
+  WHATSAPP_TEMPLATES: "whatsapp_templates",
+  // Merchant-editable promo copy (Discount%, Coupon Code, Valid Days) shown
+  // in the Approve & Send modal for Anniversary/Birthday. DELIBERATELY a
+  // DIFFERENT key from WHATSAPP_TEMPLATES above, even though the names look
+  // similar side-by-side: WHATSAPP_TEMPLATES holds the Meta-approved
+  // template's {name, language} metadata (gates whether Cloud API can send
+  // at all); WHATSAPP_TEMPLATE_CONFIG holds free-text discount/coupon/
+  // validity fields the merchant can edit anytime, unrelated to template
+  // approval status. Same naming-collision-avoidance discipline as
+  // TEMPLATE_CARDS vs "templates" above — confirmed no collision via grep.
+  WHATSAPP_TEMPLATE_CONFIG: "whatsapp_template_config",
 } as const;
 
 /** Union type of the known settings group keys. */
@@ -74,16 +90,20 @@ export type TierKey = (typeof TIER_KEYS)[number];
  *
  * @field purchasePercent     — points earned per ₹100 of order value (e.g. 5 → 5 pts/₹100).
  * @field birthdayBonus       — flat bonus points awarded on a customer's birthday.
+ * @field anniversaryBonus    — flat bonus points awarded on a customer's anniversary.
  * @field gmbPoints           — bonus points per approved Google review.
  * @field productReviewPoints — bonus points per in-app product review.
+ * @field testimonialBonus    — bonus points per approved testimonial.
  * @field on                  — UI toggle; true → the tier's own rule set applies
  *                              (silver/gold/platinum only — global is always on).
  */
 export const tierRuleValidator = v.object({
   purchasePercent: v.optional(v.number()),
   birthdayBonus: v.optional(v.number()),
+  anniversaryBonus: v.optional(v.number()),
   gmbPoints: v.optional(v.number()),
   productReviewPoints: v.optional(v.number()),
+  testimonialBonus: v.optional(v.number()),
   on: v.optional(v.boolean()),
 });
 
@@ -93,8 +113,10 @@ export const loyaltyRulesValidator = v.object({
     global: v.object({
       purchasePercent: v.optional(v.number()),
       birthdayBonus: v.optional(v.number()),
+      anniversaryBonus: v.optional(v.number()),
       gmbPoints: v.optional(v.number()),
       productReviewPoints: v.optional(v.number()),
+      testimonialBonus: v.optional(v.number()),
     }),
     silver: tierRuleValidator,
     gold: tierRuleValidator,
@@ -112,17 +134,19 @@ export const DEFAULT_SETTINGS: {
     {
       purchasePercent: number;
       birthdayBonus: number;
+      anniversaryBonus: number;
       gmbPoints: number;
       productReviewPoints: number;
+      testimonialBonus: number;
       on?: boolean;
     }
   >;
 } = {
   tiers: {
-    global: { purchasePercent: 5, birthdayBonus: 200, gmbPoints: 500, productReviewPoints: 150 },
-    silver: { purchasePercent: 4, birthdayBonus: 150, gmbPoints: 400, productReviewPoints: 100, on: true },
-    gold: { purchasePercent: 5, birthdayBonus: 200, gmbPoints: 500, productReviewPoints: 150, on: true },
-    platinum: { purchasePercent: 7, birthdayBonus: 350, gmbPoints: 750, productReviewPoints: 250, on: true },
+    global: { purchasePercent: 5, birthdayBonus: 200, anniversaryBonus: 200, gmbPoints: 500, productReviewPoints: 150, testimonialBonus: 150 },
+    silver: { purchasePercent: 4, birthdayBonus: 150, anniversaryBonus: 150, gmbPoints: 400, productReviewPoints: 100, testimonialBonus: 100, on: true },
+    gold: { purchasePercent: 5, birthdayBonus: 200, anniversaryBonus: 200, gmbPoints: 500, productReviewPoints: 150, testimonialBonus: 150, on: true },
+    platinum: { purchasePercent: 7, birthdayBonus: 350, anniversaryBonus: 350, gmbPoints: 750, productReviewPoints: 250, testimonialBonus: 250, on: true },
   },
 };
 
@@ -146,7 +170,7 @@ function mergeLoyaltyRules(
     if (!override || typeof override !== "object") continue;
     const target = merged[key];
     // Numeric fields — copy only when a valid number is provided.
-    for (const numField of ["purchasePercent", "birthdayBonus", "gmbPoints", "productReviewPoints"] as const) {
+    for (const numField of ["purchasePercent", "birthdayBonus", "anniversaryBonus", "gmbPoints", "productReviewPoints", "testimonialBonus"] as const) {
       const val = (override as Record<string, unknown>)[numField];
       if (typeof val === "number") {
         (target as Record<string, unknown>)[numField] = val;
@@ -254,6 +278,117 @@ function mergeTemplateCards(
   return {
     anniversary: stored?.anniversary || DEFAULT_TEMPLATE_CARDS.anniversary,
     birthday: stored?.birthday || DEFAULT_TEMPLATE_CARDS.birthday,
+  };
+}
+
+// ============================================================================
+// SECTION 3C — WhatsApp Cloud API template metadata
+// Design spec: docs/superpowers/specs/2026-08-24-whatsapp-cloud-api-design.md
+// ============================================================================
+
+/** Moment type keys — the two approved-template slots (mirrors TEMPLATE_CARD_KEYS). */
+export const WHATSAPP_TEMPLATE_TYPE_KEYS = ["anniversary", "birthday"] as const;
+
+/** Union type of the WhatsApp template type keys. */
+export type WhatsAppTemplateType = (typeof WHATSAPP_TEMPLATE_TYPE_KEYS)[number];
+
+/** Validator for the moment-type argument. */
+export const whatsAppTemplateTypeValidator = v.union(
+  v.literal("anniversary"),
+  v.literal("birthday"),
+);
+
+/** A single approved template's metadata — name + language, as registered in WhatsApp Manager. */
+export const whatsAppTemplateConfigValidator = v.object({
+  name: v.string(),
+  language: v.string(),
+});
+
+/** Shape of one stored (or default/empty) template config — null until approved & configured. */
+type WhatsAppTemplateConfig = { name: string; language: string } | null;
+
+/**
+ * DEFAULT WHATSAPP TEMPLATES — empty until Ma'am/Saidul create & approve real
+ * templates in WhatsApp Manager (Decision 2, manual — not automated here).
+ * null is a real, expected state: the frontend treats it as "no template
+ * configured yet" and falls back to the wa.me link (Decision 3), not an error.
+ */
+export const DEFAULT_WHATSAPP_TEMPLATES: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
+  anniversary: null,
+  birthday: null,
+};
+
+/**
+ * Merge the stored "whatsapp_templates" value over the defaults — same
+ * missing-field-safe pattern as mergeTemplateCards above, so a partially
+ * written doc (or none at all) still resolves both fields, defaulting any
+ * missing/unset entry to null rather than crashing or omitting the field.
+ */
+function mergeWhatsAppTemplates(
+  stored: Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>> | undefined,
+): Record<WhatsAppTemplateType, WhatsAppTemplateConfig> {
+  return {
+    anniversary: stored?.anniversary ?? DEFAULT_WHATSAPP_TEMPLATES.anniversary,
+    birthday: stored?.birthday ?? DEFAULT_WHATSAPP_TEMPLATES.birthday,
+  };
+}
+
+// ============================================================================
+// SECTION 3D — WhatsApp promo config (Discount / Coupon / Valid Days)
+// Design spec: docs/superpowers/specs/2026-08-24-whatsapp-template-config-approval-flow-design.md
+//
+// NOTE ON WHY THIS IS SEPARATE FROM SECTION 3C ABOVE: whatsAppTemplateConfigValidator
+// (3C) validates the Meta-approved template's {name, language} METADATA — it
+// gates whether a Cloud API send can happen at all. The validator below,
+// whatsAppTemplateConfigFieldsValidator, validates merchant-editable PROMO
+// TEXT (discount/coupon/validity) that the merchant can freely change anytime
+// on the Templates page, with zero relation to template-approval status. Two
+// different shapes, two different settings keys, two different purposes —
+// deliberately named distinctly (…ConfigValidator vs …ConfigFieldsValidator)
+// so they can't be confused when read side-by-side.
+// ============================================================================
+
+/** Validator for one moment type's promo-config fields (Discount%, Coupon Code, Valid Days). */
+export const whatsAppTemplateConfigFieldsValidator = v.object({
+  discountPercent: v.string(),
+  couponCode: v.string(),
+  validDays: v.string(),
+});
+
+/** Shape of one stored (or default) promo-config entry — plain editable text fields. */
+type WhatsAppTemplateConfigFields = {
+  discountPercent: string;
+  couponCode: string;
+  validDays: string;
+};
+
+/**
+ * DEFAULT WHATSAPP TEMPLATE CONFIG — all empty strings, not null. These are
+ * simple free-text fields (Discount%, Coupon Code, Valid Days); an empty
+ * string is itself a valid "merchant hasn't filled this in yet" state,
+ * unlike Section 3C's `null` (which means "no approved template exists").
+ */
+export const DEFAULT_WHATSAPP_TEMPLATE_CONFIG: Record<WhatsAppTemplateType, WhatsAppTemplateConfigFields> = {
+  anniversary: { discountPercent: "", couponCode: "", validDays: "" },
+  birthday: { discountPercent: "", couponCode: "", validDays: "" },
+};
+
+/**
+ * Merge the stored "whatsapp_template_config" value over the defaults — same
+ * missing-field-safe pattern as mergeTemplateCards/mergeWhatsAppTemplates
+ * above, so a partially written doc (or none at all) still resolves both
+ * moment types to a full, never-partially-undefined fields object.
+ */
+function mergeWhatsAppTemplateConfig(
+  stored: Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>> | undefined,
+): Record<WhatsAppTemplateType, WhatsAppTemplateConfigFields> {
+  return {
+    anniversary: stored?.anniversary
+      ? { ...DEFAULT_WHATSAPP_TEMPLATE_CONFIG.anniversary, ...stored.anniversary }
+      : DEFAULT_WHATSAPP_TEMPLATE_CONFIG.anniversary,
+    birthday: stored?.birthday
+      ? { ...DEFAULT_WHATSAPP_TEMPLATE_CONFIG.birthday, ...stored.birthday }
+      : DEFAULT_WHATSAPP_TEMPLATE_CONFIG.birthday,
   };
 }
 
@@ -369,7 +504,7 @@ export const updateSettings = mutation({
       const tier = settings.tiers[key] as Record<string, unknown> | undefined;
       if (!tier) continue;
       const clean: Record<string, unknown> = {};
-      for (const numField of ["purchasePercent", "birthdayBonus", "gmbPoints", "productReviewPoints"] as const) {
+      for (const numField of ["purchasePercent", "birthdayBonus", "anniversaryBonus", "gmbPoints", "productReviewPoints", "testimonialBonus"] as const) {
         const val = tier[numField];
         if (typeof val === "number") clean[numField] = val;
       }
@@ -448,6 +583,141 @@ export const setTemplateCardUrl = mutation({
     const current = mergeTemplateCards(stored); // spread the full current state first
     const nextValue: Record<TemplateCardKey, string> = { ...current, [type]: url }; // override only the changed field
     await upsertSettings(ctx, SETTINGS_KEYS.TEMPLATE_CARDS, nextValue);
+    return nextValue;
+  },
+});
+
+/**
+ * Get the current approved WhatsApp template metadata (name + language) for
+ * Anniversary/Birthday, or `{ anniversary: null, birthday: null }` if the
+ * settings doc doesn't exist yet (expected state before templates are
+ * approved in WhatsApp Manager — not an error).
+ */
+export const getWhatsAppTemplates = query({
+  args: {},
+  handler: async (ctx) => {
+    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const stored = doc?.value as
+      | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
+      | undefined;
+    return mergeWhatsAppTemplates(stored);
+  },
+});
+
+/**
+ * Set ONE moment type's approved template config, leaving the other
+ * untouched.
+ *
+ * Same read-merge-write discipline as setTemplateCardUrl above — reads the
+ * current merged value first and spreads it before overriding only `type`,
+ * so this does NOT risk the whole-value-overwrite bug that an earlier
+ * design review in this codebase specifically caught and fixed for
+ * setTemplateCardUrl. A naive upsertSettings(ctx, KEY, { [type]: config })
+ * would silently wipe the other moment type's stored config.
+ */
+export const setWhatsAppTemplate = mutation({
+  args: {
+    type: whatsAppTemplateTypeValidator,
+    config: whatsAppTemplateConfigValidator,
+  },
+  handler: async (ctx, { type, config }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const stored = existing?.value as
+      | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
+      | undefined;
+    const current = mergeWhatsAppTemplates(stored); // spread the full current state first
+    const nextValue: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
+      ...current,
+      [type]: config, // override only the changed field
+    };
+    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
+    return nextValue;
+  },
+});
+
+/**
+ * Clear ONE moment type's approved template config back to `null`, leaving
+ * the other untouched.
+ *
+ * WHY THIS EXISTS: `setWhatsAppTemplate`'s `config` argument is validated by
+ * whatsAppTemplateConfigValidator, which requires non-optional `name`/
+ * `language` strings — it CANNOT accept `null`, so there was no way to undo
+ * a test/placeholder value and restore the true "not configured yet" state.
+ * This mutation fills that gap with a dedicated, narrowly-scoped clear
+ * operation instead of loosening setWhatsAppTemplate's validator.
+ *
+ * Same read-merge-write discipline as setWhatsAppTemplate/setTemplateCardUrl
+ * above — reads the current merged value first and spreads it before
+ * overriding only `type` to null, so this does NOT risk the whole-value-
+ * overwrite bug an earlier design review in this codebase caught for
+ * setTemplateCardUrl. A naive upsertSettings(ctx, KEY, { [type]: null })
+ * would silently wipe the other moment type's stored config.
+ */
+export const clearWhatsAppTemplate = mutation({
+  args: {
+    type: whatsAppTemplateTypeValidator,
+  },
+  handler: async (ctx, { type }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const stored = existing?.value as
+      | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
+      | undefined;
+    const current = mergeWhatsAppTemplates(stored); // spread the full current state first
+    const nextValue: Record<WhatsAppTemplateType, WhatsAppTemplateConfig> = {
+      ...current,
+      [type]: null, // override only the changed field, back to "not configured"
+    };
+    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
+    return nextValue;
+  },
+});
+
+/**
+ * Get the current merchant-configured promo copy (Discount%, Coupon Code,
+ * Valid Days) for Anniversary/Birthday. Always returns the full merged
+ * shape — real stored data wins over DEFAULT_WHATSAPP_TEMPLATE_CONFIG, and
+ * a never-written doc simply returns the all-empty-string defaults (not an
+ * error state — matches the merchant not having filled the fields in yet).
+ */
+export const getWhatsAppTemplateConfig = query({
+  args: {},
+  handler: async (ctx) => {
+    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
+    const stored = doc?.value as
+      | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
+      | undefined;
+    return mergeWhatsAppTemplateConfig(stored);
+  },
+});
+
+/**
+ * Set ONE moment type's promo config (Discount%, Coupon Code, Valid Days),
+ * leaving the other moment type untouched.
+ *
+ * Same read-merge-write discipline as setWhatsAppTemplate/setTemplateCardUrl
+ * above — reads the current merged value first and spreads it before
+ * overriding only `type`, so this does NOT risk the whole-value-overwrite
+ * bug that an earlier design review in this codebase specifically caught
+ * and fixed for setTemplateCardUrl. A naive
+ * upsertSettings(ctx, KEY, { [type]: config }) would silently wipe the
+ * other moment type's stored promo config.
+ */
+export const setWhatsAppTemplateConfig = mutation({
+  args: {
+    type: whatsAppTemplateTypeValidator,
+    config: whatsAppTemplateConfigFieldsValidator,
+  },
+  handler: async (ctx, { type, config }) => {
+    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
+    const stored = existing?.value as
+      | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
+      | undefined;
+    const current = mergeWhatsAppTemplateConfig(stored); // spread the full current state first
+    const nextValue: Record<WhatsAppTemplateType, WhatsAppTemplateConfigFields> = {
+      ...current,
+      [type]: config, // override only the changed field
+    };
+    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG, nextValue);
     return nextValue;
   },
 });
