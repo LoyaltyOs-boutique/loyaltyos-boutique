@@ -8,11 +8,13 @@ import { Toggle } from '../../components/ui.jsx';
 //
 // Section 1 "Point Rules" is REAL — it reuses the exact same
 // saveTierSettings()/getData() bridge as Settings.jsx (src/lib/db.js), just
-// exposing two additional per-tier fields (anniversaryBonus,
-// testimonialBonus) that convex/settings.ts already accepts. No new bridge
-// functions were needed: saveTierSettings(tierKey, patch) generically
+// exposing additional per-tier fields (anniversaryBonus, gmbPoints,
+// productReviewPoints) that convex/settings.ts already accepts. No new
+// bridge functions were needed: saveTierSettings(tierKey, patch) generically
 // spreads whatever keys are passed, and the full tier object is sent to
-// api.settings.updateSettings on every save.
+// api.settings.updateSettings on every save. testimonialBonus remains a
+// real settings field (read by convex/reviews.ts approveReview) — it's just
+// not editable from this page's UI.
 //
 // Section 2 "Give Points" is UI-ONLY (Phase A) — the Submit button is
 // disabled and wired to nothing. Real manual-award logic is Phase B.
@@ -28,7 +30,8 @@ const ROWS = [
   ['purchasePercent', 'Purchase points rule', 'points per 100', 'of order value'],
   ['birthdayBonus', 'Birthday bonus points', 'pts', 'on client birthday'],
   ['anniversaryBonus', 'Anniversary bonus points', 'pts', 'on client anniversary'],
-  ['testimonialBonus', 'Testimonial bonus points', 'pts', 'per approved testimonial'],
+  ['gmbPoints', 'GMB review points', 'pts', 'per Google review'],
+  ['productReviewPoints', 'Product review points', 'pts', 'per product review'],
 ];
 
 const REASON_TYPES = ['Normal', 'Birthday', 'Anniversary', 'Testimonial'];
