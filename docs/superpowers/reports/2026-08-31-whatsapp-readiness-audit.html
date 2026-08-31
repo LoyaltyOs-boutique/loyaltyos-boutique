@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WhatsApp Cloud API Readiness Audit — 2026-08-31</title>
+<style>
+  :root {
+    --gold: #C5A880;
+    --ink: #111111;
+    --steel: #6B6B6B;
+    --line: #E5E5E5;
+    --mist: #FAFAFA;
+    --paper: #FFFFFF;
+    --built: #1a7a3a;
+    --built-bg: #e8f5ea;
+    --partial: #9a6c00;
+    --partial-bg: #fff6e0;
+    --notbuilt: #b3261e;
+    --notbuilt-bg: #fdeceb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    background: var(--mist);
+    color: var(--ink);
+    margin: 0;
+    padding: 0 0 80px 0;
+    line-height: 1.55;
+  }
+  header {
+    background: var(--ink);
+    color: var(--paper);
+    padding: 28px 40px;
+    border-bottom: 4px solid var(--gold);
+  }
+  header h1 {
+    margin: 0 0 6px 0;
+    font-size: 22px;
+    letter-spacing: 0.02em;
+  }
+  header p {
+    margin: 0;
+    color: #cfcfcf;
+    font-size: 13px;
+  }
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 32px 40px;
+  }
+  section {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 24px 28px;
+    margin-bottom: 28px;
+  }
+  h2 {
+    font-size: 17px;
+    border-bottom: 2px solid var(--gold);
+    padding-bottom: 8px;
+    margin-top: 0;
+  }
+  h3 { font-size: 14px; margin-top: 24px; color: var(--ink); }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin-top: 12px;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 10px;
+    border: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th {
+    background: var(--ink);
+    color: var(--paper);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  tr:nth-child(even) td { background: var(--mist); }
+  .status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .built { color: var(--built); background: var(--built-bg); }
+  .partial { color: var(--partial); background: var(--partial-bg); }
+  .notbuilt { color: var(--notbuilt); background: var(--notbuilt-bg); }
+  code, pre {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 12.5px;
+  }
+  code {
+    background: #eee;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  pre {
+    background: #1c1c1c;
+    color: #d8d8d8;
+    padding: 14px 16px;
+    border-radius: 4px;
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  ol.steps li {
+    margin-bottom: 16px;
+    padding-left: 4px;
+  }
+  ol.steps .dep {
+    display: block;
+    font-size: 12px;
+    color: var(--steel);
+    margin-top: 3px;
+  }
+  .evidence {
+    font-size: 11.5px;
+    color: var(--steel);
+  }
+  .callout {
+    border-left: 4px solid var(--notbuilt);
+    background: var(--notbuilt-bg);
+    padding: 12px 16px;
+    margin: 14px 0;
+    font-size: 13px;
+  }
+  .callout.warn {
+    border-left-color: var(--partial);
+    background: var(--partial-bg);
+  }
+  .callout.ok {
+    border-left-color: var(--built);
+    background: var(--built-bg);
+  }
+  ul.tight li { margin-bottom: 6px; }
+  .small { font-size: 12px; color: var(--steel); }
+  footer {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 40px;
+    color: var(--steel);
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>WhatsApp Cloud API Readiness Audit</h1>
+  <p>LoyaltyOS Boutique — internal engineering report — generated 2026-08-31 by office-tester-agent (read-only audit, no source files edited, no new branch created)</p>
+</header>
+
+<main>
+
+<section>
+  <h2>0. Governance / scope note</h2>
+  <p>This audit was performed READ-ONLY per instruction. Every claim below is backed by either a real terminal command output (pasted verbatim) or a real <code>file:line</code> quote from the repository as it exists on <code>main</code> at commit <code>d013ffd</code> on 2026-08-31. No files were edited, no branch was created, nothing was committed.</p>
+  <p class="small">Read first: <code>/mnt/c/Users/ASUS/Downloads/loyaltyos-boutique/loyaltyos-boutique/CLAUDE.md</code> — confirmed governance rules 5.5 (ledger rules), 5.9 (diff-scoped verification), and the "tester verified" evidence requirement, all followed in this audit.</p>
+</section>
+
+<section>
+  <h2>1. Summary Table</h2>
+  <table>
+    <thead>
+      <tr><th style="width:20%">Component</th><th style="width:11%">Status</th><th>Evidence</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Cloud API send functions (<code>convex/whatsapp.ts</code>)</td>
+        <td><span class="status partial">Partial</span></td>
+        <td>Two real actions exist and POST to the real Graph API endpoint — <code>sendWhatsAppTemplateMessage</code> (<code>convex/whatsapp.ts:114-169</code>) and <code>sendWhatsAppServiceMessage</code> (<code>convex/whatsapp.ts:186-224</code>), both calling <code>postToGraphApi()</code> (<code>convex/whatsapp.ts:54-93</code>) against <code>https://graph.facebook.com/v23.0/{phoneNumberId}/messages</code>. Code is real and deployed to <code>pleasant-cobra-560</code>, but both required env vars are unset — see row below. Never yet executed a real send (no credentials exist).</td>
+      </tr>
+      <tr>
+        <td>WhatsApp Cloud API credentials</td>
+        <td><span class="status notbuilt">Not Built</span></td>
+        <td><code>npx convex env list</code> real output (see §3 below) shows only <code>BLOB_READ_WRITE_TOKEN</code> and <code>RESEND_API_KEY</code>. Neither <code>WHATSAPP_ACCESS_TOKEN</code> nor <code>WHATSAPP_PHONE_NUMBER_ID</code> exists in the deployment.</td>
+      </tr>
+      <tr>
+        <td>wa.me fallback link builder</td>
+        <td><span class="status built">Built</span></td>
+        <td><code>buildWaLink</code>/<code>toWaPhone</code> defined in <code>src/pages/merchant/Templates.jsx:26-34</code>, duplicated server-side in <code>convex/whatsapp.ts:38-41</code> (comment: "Exact same transform as Templates.jsx's toWaPhone"), and a third copy inline in <code>src/pages/merchant/Customers.jsx</code>'s <code>ApprovalModal</code> (<code>window.open(\`https://wa.me/${waDigits(...)}?text=...\`)</code> at line 520). This is the ONLY thing that has ever actually delivered a message today — confirmed by real user WhatsApp tests recorded in the ledger (commit <code>5ca8d06</code>, "confirmed by real user WhatsApp test").</td>
+      </tr>
+      <tr>
+        <td>Cloud-API-first / wa.me-fallback decision logic</td>
+        <td><span class="status built">Built</span></td>
+        <td><code>MomentCard.send()</code>, <code>src/pages/merchant/Templates.jsx:196-225</code>: if no template configured (<code>!waTemplate</code>, line 202) → straight to <code>openWaLinkFallback()</code>; else tries <code>sendWhatsAppTemplateMessage(...)</code> in a try/catch, and ANY thrown error falls back to <code>openWaLinkFallback()</code> (lines 217-221). Identical shape in <code>ApprovalModal.approve()</code>, <code>src/pages/merchant/Customers.jsx:523-558</code>. This logic is real and live on main, but since credentials are unset, the Cloud API branch always throws today (guard clause fires first) — so in practice 100% of sends currently go through wa.me.</td>
+      </tr>
+      <tr>
+        <td>Message body parameters actually sent to Meta</td>
+        <td><span class="status partial">Partial</span></td>
+        <td><code>[name.trim() || '{name}']</code> only — <code>Templates.jsx:215</code> and <code>Customers.jsx:545</code> both pass a single-element <code>bodyParams</code> array. Confirms memory-bank's claim is accurate: only <code>[name]</code> is transmitted. Discount%/Coupon/ValidDays are NOT sent — see next row.</td>
+      </tr>
+      <tr>
+        <td>Discount % / Coupon Code / Valid Days fields</td>
+        <td><span class="status partial">Partial (preview-only, confirmed by code trace)</span></td>
+        <td>Stored for real in Convex settings (<code>convex/settings.ts</code> <code>SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG</code>, real read-merge-write mutation) and rendered in a merchant-facing preview block — but NEVER included in the actual outgoing Cloud API call. Proof: <code>ApprovalModal</code>'s own header comment states it explicitly at <code>src/pages/merchant/Customers.jsx:493-495</code>: "the real outgoing Cloud API bodyParams stay <code>[name]</code> only per the locked design decision, since discount/coupon/valid-days position in the real approved template text isn't finalized yet." The <code>previewText</code> variable (lines 511-517) that includes discount/coupon/validDays is used ONLY for the on-screen preview div (line 571) and the wa.me fallback text (line 520) — never passed into <code>sendWhatsAppTemplateMessage(...)</code>'s <code>bodyParams</code> argument (line 545, which hardcodes <code>[customer.name.trim() || '{name}']</code>).</td>
+      </tr>
+      <tr>
+        <td>Template BUTTON components (Shop Online / Visit Store / Book Stylist / Opt-Out / Stop Promotions)</td>
+        <td><span class="status notbuilt">Not Built</span></td>
+        <td><code>grep -rn -i "quick.reply\|quick_reply\|\"buttons\"\|cta.button\|Shop Online\|Visit Store\|Book a Personal Stylist\|Stop Promotions" convex/ src/</code> → zero matches (empty output). <code>TemplateComponent</code> type in <code>convex/whatsapp.ts:44-46</code> only supports <code>header</code> (image) and <code>body</code> (text) components — no <code>buttons</code> variant exists in the type union at all.</td>
+      </tr>
+      <tr>
+        <td>Webhook / STOP-flag / opt-out infrastructure</td>
+        <td><span class="status notbuilt">Not Built</span></td>
+        <td><code>grep -rn -i "webhook\|opt.out\|optout\|stop_flag\|stop flag" convex/ src/</code> → zero matches. No <code>convex/http.ts</code> file exists in the repo at all.</td>
+      </tr>
+      <tr>
+        <td>Cron / scheduler for WhatsApp sends</td>
+        <td><span class="status notbuilt">Not Built</span></td>
+        <td>No <code>convex/crons.ts</code> file exists (<code>ls convex/crons.ts</code> → "No such file or directory"). Repo-wide grep for <code>ctx.scheduler\|runAfter\|cronJobs</code> only matches the generic Convex AI-guidelines doc (<code>convex/_generated/ai/guidelines.md</code>), not any real project code. The send flow is confirmed fully manual/admin-click-only — both send paths (<code>MomentCard.send()</code>, <code>ApprovalModal.approve()</code>) are only invoked from an <code>onClick</code> handler on a button (<code>Templates.jsx:268</code>, <code>Customers.jsx:575</code>).</td>
+      </tr>
+      <tr>
+        <td><code>whatsapp_consent</code> field shape</td>
+        <td><span class="status built">Built (but single boolean, not tri-state)</span></td>
+        <td>Confirmed single boolean, exactly as ledger implies is a known gap: <code>convex/schema.ts:50</code> — <code>whatsapp_consent: v.optional(v.boolean()), // Gate 1 — customer opted in to WhatsApp messages</code>. No <code>consent_occasion</code>/<code>consent_marketing</code>/<code>stop_flag</code> fields exist anywhere in schema.ts.</td>
+      </tr>
+      <tr>
+        <td>Consent checkbox — Onboarding.jsx (merchant-side)</td>
+        <td><span class="status built">Built</span></td>
+        <td><code>src/pages/merchant/Onboarding.jsx:204-213</code> — real <code>&lt;input type="checkbox" id="whatsapp_consent"&gt;</code> bound to <code>f.whatsapp_consent</code>, wired through to <code>createCustomer</code>.</td>
+      </tr>
+      <tr>
+        <td>Consent checkbox — Join.jsx (self-onboarding)</td>
+        <td><span class="status built">Built</span></td>
+        <td><code>src/pages/Join.jsx:170-179</code> — identical real checkbox pattern, same field name.</td>
+      </tr>
+      <tr>
+        <td>Approve & Send button consent gate</td>
+        <td><span class="status built">Built</span></td>
+        <td><code>src/pages/merchant/Customers.jsx:575</code> — <code>disabled={sending || !customer.whatsapp_consent}</code>; defensive re-check inside <code>approve()</code> itself at line 526 (<code>if (!customer.whatsapp_consent) return;</code>); red warning text shown at lines 577-579 when consent is false.</td>
+      </tr>
+      <tr>
+        <td>Message-action / duplicate-send tracking</td>
+        <td><span class="status built">Built (narrow scope)</span></td>
+        <td><code>message_actions</code> table, <code>convex/schema.ts:181-190</code>, records only "sent"/"cancelled" decisions per (customer, occasion, this-year's-date) for the two Delight-Queue "tomorrow" tabs — NOT a general message-idempotency log for all WhatsApp traffic (Templates.jsx's MomentCard/MediaCard sends are not recorded here at all).</td>
+      </tr>
+      <tr>
+        <td>Points Ledger backend (<code>points_ledger</code> table + <code>awardPoints</code>)</td>
+        <td><span class="status built">Built</span></td>
+        <td><code>convex/schema.ts:211-224</code>; wired to real UI in <code>Customers.jsx</code> PointsTool + PointsLedger.jsx. Unrelated to WhatsApp send-readiness but bundled in the same branch/merge — included here for completeness since it's part of what's now on <code>main</code>.</td>
+      </tr>
+      <tr>
+        <td>Branch merge status</td>
+        <td><span class="status built">Merged to main (contradicts most ledger entries — see §4)</span></td>
+        <td><code>git merge-base --is-ancestor feat/whatsapp-cloud-api main</code> → true. <code>main</code> tip is <code>d013ffd "Merge feat/whatsapp-cloud-api: WhatsApp Cloud API + Points Ledger + fixes"</code>. <code>convex/whatsapp.ts</code> exists on <code>main</code> today.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>2. Ordered list of remaining dependency steps — "Meta credentials arrive" → "a real customer receives a real WhatsApp message"</h2>
+  <ol class="steps">
+    <li><strong>Obtain Meta/WhatsApp Business Cloud API test-account (or production) credentials</strong> — a permanent System User access token and a business phone number ID from Meta Business Manager / WhatsApp Manager.
+      <span class="dep">Depends on: client (85 Lansdowne) completing Meta Business verification — outside engineering's control, this is the blocking external event the whole audit is triggered by.</span>
+    </li>
+    <li><strong>Set <code>WHATSAPP_ACCESS_TOKEN</code> and <code>WHATSAPP_PHONE_NUMBER_ID</code> in the Convex deployment environment</strong> via <code>npx convex env set</code> against <code>pleasant-cobra-560</code>.
+      <span class="dep">Depends on: step 1. Confirmed today these two vars are the ONLY thing <code>convex/whatsapp.ts</code>'s guard clauses check (<code>convex/whatsapp.ts:124-135</code>, <code>195-206</code>) — no other credential is referenced anywhere in the file.</span>
+    </li>
+    <li><strong>Create and get Meta-approved the real Anniversary and Birthday message templates in WhatsApp Manager</strong> (manual process in Meta's UI, not code — confirmed this was always the design decision, "manual template creation via WhatsApp Manager instead of a code-based create-template action", per the 2026-08-24 design spec referenced in the ledger).
+      <span class="dep">Depends on: step 1 (Business Manager access). No code path in this repo creates or submits templates — <code>sendWhatsAppTemplateMessage</code> only SENDS an already-approved template by name (<code>convex/whatsapp.ts:114-169</code>), it cannot create one.</span>
+    </li>
+    <li><strong>Store the approved template's exact name/language via <code>setWhatsAppTemplate</code></strong> so <code>getWhatsAppTemplates()</code> returns a non-null <code>waTemplate</code> for that moment type.
+      <span class="dep">Depends on: step 3. Confirmed this is the exact switch that flips <code>Templates.jsx</code>'s <code>MomentCard.send()</code> and <code>Customers.jsx</code>'s <code>ApprovalModal.approve()</code> from "skip straight to wa.me" (the <code>!waTemplate</code> branch, <code>Templates.jsx:202-205</code>) to "attempt the real Cloud API call".</span>
+    </li>
+    <li><strong>Decide and implement the real <code>bodyParams</code> shape for the approved template</strong> — today only <code>[name]</code> is sent (<code>Templates.jsx:215</code>, <code>Customers.jsx:545</code>); if the real approved template has more placeholders (e.g. discount%, coupon code — both of which are already collected and stored but never transmitted, see §1 row above), the send call's <code>bodyParams</code> array must be extended to match, or Meta will reject the send.
+      <span class="dep">Depends on: step 3 (need the real template's actual placeholder count/order before this can be coded correctly — explicitly flagged as unknown in the ledger: "discount/coupon/valid-days position in the real approved template text isn't finalized yet", <code>Customers.jsx:494-495</code>).</span>
+    </li>
+    <li><strong>If any template needs interactive buttons (Shop Online / Visit Store / Book a Personal Stylist / Opt-Out / Stop Promotions), design and implement a <code>TemplateComponent</code> button variant</strong> — today's type only supports <code>header</code>/<code>body</code> (<code>convex/whatsapp.ts:44-46</code>); no button-building code exists anywhere in the repo (confirmed via grep, zero matches).
+      <span class="dep">Depends on: a product decision on whether buttons are required for launch, plus step 3 (button behavior must match what's actually approved in the template).</span>
+    </li>
+    <li><strong>Build STOP-flag / webhook opt-out handling</strong> before any real marketing/promotional send at scale — no webhook route, no <code>convex/http.ts</code>, no STOP-keyword handling exists today (confirmed via grep, zero matches). This is a compliance requirement for WhatsApp Business Platform (Meta can suspend a number that doesn't honor opt-outs), not just a nice-to-have.
+      <span class="dep">Depends on: step 1 (need a real phone number ID for Meta to route inbound webhook events to), and a decision on hosting a Convex HTTP action or an external endpoint to receive Meta's webhook callbacks.</span>
+    </li>
+    <li><strong>Decide whether a scheduler/cron is needed</strong> for birthday/anniversary reminders, or whether the current fully-manual admin-click-only flow (confirmed: no cron/scheduler code exists anywhere for WhatsApp) stays as the permanent design.
+      <span class="dep">Depends on: explicit product decision — the ledger records this was previously a deliberate choice ("this stays fully live/reactive per the user's explicit requirement that nothing sends without the admin's manual click", commit <code>a894663</code>), not an oversight — but should be reconfirmed before declaring the WhatsApp feature "done," since a boutique with hundreds of customers may not want 100% manual sending forever.</span>
+    </li>
+    <li><strong>Run one real end-to-end send test</strong> — a real customer's real phone number, real template, real credentials, confirm delivery in the actual WhatsApp app (not just an HTTP 200 from Graph API).
+      <span class="dep">Depends on: steps 1-5 all complete. No such test has ever run — every ledger entry for the Cloud API path explicitly says "real credentials deliberately NOT set" / "no real send test yet". Only the wa.me fallback path has ever been confirmed delivering messages in production.</span>
+    </li>
+    <li><strong>Decide on a real message-idempotency / audit log for ALL WhatsApp sends</strong> (not just the two Delight-Queue "tomorrow" tabs, which the narrow <code>message_actions</code> table already covers) — Templates.jsx's MomentCard/MediaCard ad-hoc sends record nothing today, so there is no way to detect/prevent a merchant accidentally double-sending the same promo to the same customer from that screen.
+      <span class="dep">Depends on: none of the above technically — this can be built independently, but is lower priority than 1-9 since it's a data-hygiene/anti-duplicate concern, not a blocker to the first real send.</span>
+    </li>
+  </ol>
+</section>
+
+<section>
+  <h2>3. Exact list of env vars still missing</h2>
+  <p>Real command run: <code>npx convex env list</code></p>
+  <pre>BLOB_READ_WRITE_TOKEN=vercel_blob_rw_Kya9c... (redacted — real secret value, present and set)
+RESEND_API_KEY=re_CuZWh... (redacted — real secret value, present and set)</pre>
+  <p class="small">Secret values redacted in this report per GitHub push-protection policy — both vars are confirmed genuinely SET (non-empty) on <code>pleasant-cobra-560</code>, which is the only fact relevant to this audit.</p>
+  <p><strong>Missing (both are the only ones <code>convex/whatsapp.ts</code>'s code checks — confirmed by reading the full file, no other WhatsApp-related env var name appears anywhere in it):</strong></p>
+  <ul class="tight">
+    <li><code>WHATSAPP_ACCESS_TOKEN</code> — guarded at <code>convex/whatsapp.ts:124-129</code> and <code>195-200</code>; when unset, throws:
+      <pre>throw new Error(
+  "[sendWhatsAppTemplateMessage] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.",
+);</pre>
+      (and the equivalent <code>[sendWhatsAppServiceMessage]</code>-prefixed message in the other action).
+    </li>
+    <li><code>WHATSAPP_PHONE_NUMBER_ID</code> — guarded at <code>convex/whatsapp.ts:130-135</code> and <code>201-206</code>; identical throw pattern, e.g.:
+      <pre>throw new Error(
+  "[sendWhatsAppTemplateMessage] WHATSAPP_PHONE_NUMBER_ID is not set in the Convex deployment environment.",
+);</pre>
+    </li>
+  </ul>
+  <p class="small">Both errors are caught by the frontend's try/catch (<code>Templates.jsx:214-224</code>, <code>Customers.jsx:541-557</code>) and silently fall through to the wa.me link-open — the merchant never sees this raw error message, only "Sent via WhatsApp link" instead of "Sent via WhatsApp".</p>
+</section>
+
+<section>
+  <h2>4. Surprises / discrepancies vs. memory-bank/progress.md</h2>
+
+  <div class="callout">
+    <strong>Biggest discrepancy — the branch WAS merged to main.</strong> Every single memory-bank/progress.md and .superpowers/sdd/progress.md entry for the WhatsApp Cloud API work — from commit <code>c518f24</code> (2026-08-24) all the way through commit <code>7171663</code> (2026-08-29, the most recent one) — explicitly states <strong>"NOT YET MERGED to main"</strong>. That is now false. Real evidence:
+    <pre>$ git log --oneline -3 main
+d013ffd Merge feat/whatsapp-cloud-api: WhatsApp Cloud API + Points Ledger + fixes
+c07c493 Ledger: record Lookbook staleness fix (commit 7171663, NOT YET MERGED to main)
+7171663 Lookbook: background-refresh points on returning sessions
+
+$ git merge-base --is-ancestor feat/whatsapp-cloud-api main && echo "IS an ancestor (merged)"
+IS an ancestor (merged)
+
+$ git show main:convex/whatsapp.ts | head -3
+import { action } from "./_generated/server";
+import { v } from "convex/values";</pre>
+    The merge commit <code>d013ffd</code> ("Merge feat/whatsapp-cloud-api: WhatsApp Cloud API + Points Ledger + fixes") is on <code>main</code> right now, brought in 31 files including <code>convex/whatsapp.ts</code> (new, 224 lines), <code>convex/customers.ts</code>, <code>convex/orders.ts</code>, <code>convex/reviews.ts</code>, <code>convex/schema.ts</code>, <code>convex/settings.ts</code>, and the full Templates/Customers/PointsLedger frontend work. No ledger entry anywhere records this merge event — it appears to have happened without a corresponding "MERGED to main" ledger entry being written, which is exactly the "ledger drift" failure mode CLAUDE.md §12.9 warns about ("Missing entry = future sessions don't know the work exists"). Anyone reading only memory-bank/progress.md today would incorrectly believe none of this WhatsApp/Points-Ledger work is live on production.
+  </div>
+
+  <div class="callout warn">
+    <strong>Discount/Coupon/ValidDays fields — confirmed exactly as flagged, not a surprise, but worth restating plainly.</strong> memory-bank/progress.md's own language ("bodyParams sent to Meta on Approve are <code>[name]</code> only — discount/coupon/validDays stay preview-only until a real approved template's parameter structure is known") is accurate and was independently confirmed by tracing the real code path (<code>Customers.jsx:511-517</code> builds <code>previewText</code> for display only; <code>545</code> hardcodes <code>bodyParams</code> to <code>[customer.name...]</code>). No discrepancy here — flagging only because the audit task specifically asked to trace and confirm it, and it holds up.</p>
+  </div>
+
+  <div class="callout warn">
+    <strong>CLAUDE.md's own documented CSS budget is stale in the copy at the top of the repo root vs. the copy the ledger claims to have fixed.</strong> Ledger commit <code>6b3ba46</code> ("Docs: correct CLAUDE.md CSS bundle-size range to real 28.60 kB baseline") claims to have fixed CLAUDE.md's §5.4 range from "~27.74-28.10 kB" to "~28.60 kB", and the version of CLAUDE.md inside the repo (<code>/mnt/c/Users/ASUS/Downloads/loyaltyos-boutique/loyaltyos-boutique/CLAUDE.md</code>) does say ~28.60 kB, confirming that fix did land on main. However, a second copy of CLAUDE.md exists one directory up (<code>/mnt/c/Users/ASUS/Downloads/CLAUDE.md</code>, visible in this session's system context) that still states the old ~27.74-28.10 kB range — two copies of the same governance file have drifted out of sync with each other. Not a WhatsApp-specific finding, but relevant since this file is the project's single source of truth and an out-of-sync copy could mislead a future session.
+  </div>
+
+  <div class="callout ok">
+    <strong>No surprises found in the "no button/webhook/cron" claims</strong> — the ledger never explicitly claims these exist, and this audit's greps independently confirm they genuinely do not (zero matches for buttons, webhooks, STOP-flag, or any WhatsApp-related cron/scheduler anywhere in the codebase). The ledger's repeated "explicitly out of scope" / "deferred" language for these items is accurate and consistent with the real code.
+  </div>
+
+  <div class="callout ok">
+    <strong>whatsapp_consent single-boolean claim: confirmed accurate.</strong> No tri-state (<code>consent_occasion</code>/<code>consent_marketing</code>/<code>stop_flag</code>) fields exist in <code>convex/schema.ts</code> — only <code>whatsapp_consent: v.optional(v.boolean())</code> at line 50. Matches what the ledger has said since the 2026-08-25 consent-checkbox commit.
+  </div>
+</section>
+
+<section>
+  <h2>5. Full evidence appendix — convex/whatsapp.ts exports</h2>
+  <table>
+    <thead><tr><th style="width:26%">Export</th><th>Description</th><th>Env vars checked</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>sendWhatsAppTemplateMessage</code><br><span class="evidence">convex/whatsapp.ts:114-169</span></td>
+        <td>Convex <code>action</code>. Sends a pre-approved WhatsApp template message (for first-contact / marketing outreach). Args: <code>to, templateName, languageCode, imageUrl?, bodyParams?</code>. Normalizes phone via <code>toWaPhone</code>, builds an image-header + body-text components array, POSTs to Graph API via <code>postToGraphApi()</code>.</td>
+        <td><code>WHATSAPP_ACCESS_TOKEN</code>, <code>WHATSAPP_PHONE_NUMBER_ID</code></td>
+      </tr>
+      <tr>
+        <td><code>sendWhatsAppServiceMessage</code><br><span class="evidence">convex/whatsapp.ts:186-224</span></td>
+        <td>Convex <code>action</code>. Sends a free-form service message (text or image) — only valid inside an open 24-hour WhatsApp customer-service window. No session-window tracking implemented; a rejection from Meta (no open window) just surfaces as a normal try/catch failure to the caller.</td>
+        <td><code>WHATSAPP_ACCESS_TOKEN</code>, <code>WHATSAPP_PHONE_NUMBER_ID</code></td>
+      </tr>
+    </tbody>
+  </table>
+  <h3>Exact guard-clause code (both actions, identical shape)</h3>
+  <pre>const token = process.env.WHATSAPP_ACCESS_TOKEN;
+if (!token) {
+  throw new Error(
+    "[sendWhatsAppTemplateMessage] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.",
+  );
+}
+const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+if (!phoneNumberId) {
+  throw new Error(
+    "[sendWhatsAppTemplateMessage] WHATSAPP_PHONE_NUMBER_ID is not set in the Convex deployment environment.",
+  );
+}</pre>
+  <p class="small">(<code>sendWhatsAppServiceMessage</code>'s guard clauses at lines 195-206 are byte-identical except for the <code>[sendWhatsAppServiceMessage]</code> label prefix.)</p>
+
+  <h3>Required terminal evidence (verbatim, as requested)</h3>
+  <pre>$ npx convex env list
+BLOB_READ_WRITE_TOKEN=vercel_blob_rw_Kya9c... (redacted — real secret value, present and set)
+RESEND_API_KEY=re_CuZWh... (redacted — real secret value, present and set)
+
+$ git log --oneline --all -- convex/whatsapp.ts
+c518f24 Add WhatsApp Cloud API integration (Templates section) — credential-free build
+
+$ git branch -vv
+  feat/fix-join-onboard              71099c3 [origin/feat/fix-join-onboard] Fix: Join.jsx onboarding reference - self-onboarding magic link works
+  feat/fix-magiclink-session         e00ab17 [origin/feat/fix-magiclink-session] Ledger: magic link 180-day session fix recorded
+  feat/fix-onboarding-magiclink      26e6195 [origin/feat/fix-onboarding-magiclink] Fix: onboarding magic link opens client module directly - Convex validation - e2e T1-T5 PASS
+  feat/fix2-invalid-number           86d0d8b [origin/feat/fix2-invalid-number: ahead 1] chore: update progress ledgers for fix2-invalid-number audit
+  feat/gate1-gate2-schema-foundation 4b606ce [origin/feat/gate1-gate2-schema-foundation] Ledger: record Gate 2 PDF preview + getCatalogueItemById + OG middleware (commit 4334514, NOT yet merged to main)
+  feat/improve1-magic-link-eye       bdebff3 [origin/feat/improve1-magic-link-eye] Improvement 2: WhatsApp logo icon -> luxury share arrow icon (no branch change)
+  feat/improve3-customer-edit        00611e5 [origin/feat/improve3-customer-edit] Ledger: Improvement 3 complete (Profiling tab + custom_tags fix)
+  feat/improve3b-magiclink-to-form   faebdc2 [origin/feat/improve3b-magiclink-to-form] Ledger: Improvement 3b magic-link-to-form (dfa656e) - audit + e2e verified
+  feat/improve4-mobile-unique        e718030 [origin/feat/improve4-mobile-unique] Improvement 4: update progress ledgers (SDD + memory-bank)
+  feat/improve4-public-lookbook      70d67ca [origin/feat/improve4-public-lookbook] Improv 4: Public lookbook view + copy/WhatsApp share
+  feat/improve5-inquiry-message      dc28bc4 [origin/feat/improve5-inquiry-message] Improv 5: WhatsApp inquiry shows customer name not ID
+  feat/manual-entry-media-upload     5668fd1 [origin/feat/manual-entry-media-upload] Ledger: record Manual Entry drag-drop media upload (commit f2c13ad, NOT yet merged to main)
+  feat/step1-connect-convex          0899ac1 [origin/feat/step1-connect-convex] Step 1: Update progress ledgers - Convex Step 1 complete (cf2cdd4, f90f9d1)
+  feat/step2-convex-schema           7117805 [origin/feat/step2-convex-schema] Step 2: Update progress ledgers - Convex schema complete (53e0d79, 1255b70)
+  feat/step3-merchant-auth           7557746 [origin/feat/step3-merchant-auth] Step 3: update progress ledgers - Merchant Auth + Magic-Link secure complete
+  feat/step3b-wire-auth              f87c2b1 [origin/feat/step3b-wire-auth] Step 3.5: Wire frontend auth to Convex - merchantLogin now hits pleasant-cobra-560 - data lands on Convex - no UI edits
+  feat/step3c-resend-email           dbac121 [origin/feat/step3c-resend-email] Step 3.6: update progress ledgers - Resend real email added - fallback verified - real delivery pending Convex egress
+  feat/step3c-resend-fix             e23592c [origin/feat/step3c-resend-fix] Step 3.6b: update progress ledgers - mutation->action fix verified - real email pending domain DNS
+  feat/step3d-wire-forgot-email      03692b7 [origin/feat/step3d-wire-forgot-email] Step 3.7 cleanup: remove ezine/, ledgers updated
+  feat/step4-customer-crm            7733cb7 [origin/feat/step4-customer-crm] Step 4 ledgers: record Customer CRM backend in SDD + memory-bank progress
+  feat/step4b-wire-crm               6fb08f6 [origin/feat/step4b-wire-crm] Step 4.5 ledgers: CRM wiring recorded
+  feat/step5-settings                322536d [origin/feat/step5-settings] Step 5: update SDD + memory-bank progress ledgers
+  feat/step5b-wire-settings          a2b8380 [origin/feat/step5b-wire-settings] Step 5.5: mark tester verification complete in SDD + memory-bank ledgers (all 7 live tests pass on pleasant-cobra-560)
+  feat/step6-lookbook                ef49623 [origin/feat/step6-lookbook] Step 6.3: Update ledgers + spec
+  feat/step7-checkout                0dc8159 [origin/feat/step7-checkout] Step 7.2: Wire billing to Convex - checkout hits api.orders.* - no component edits
+  feat/step8-reviews                 3783906 [origin/feat/step8-reviews] Step 8.2: Ledger update for reviews frontend
+  feat/templates-section-phase1      94b37c1 [origin/feat/templates-section-phase1] Ledger: record card-replace 5MB size guard (commit dcc2f3c, NOT yet merged to main)
+  feat/whatsapp-cloud-api            c07c493 [origin/feat/whatsapp-cloud-api] Ledger: record Lookbook staleness fix (commit 7171663, NOT YET MERGED to main)
+* main                               d013ffd [origin/main] Merge feat/whatsapp-cloud-api: WhatsApp Cloud API + Points Ledger + fixes
+  r                                  ca3bc13 Docs: update progress ledgers - Step 3.6b + team handoff docs (STATUS_REPORT+TESTING_CHECKLIST) - no src/ edits</pre>
+</section>
+
+</main>
+
+<footer>
+  Generated by office-tester-agent · read-only audit · no source files edited · no branch created · report not committed to git.
+</footer>
+
+</body>
+</html>
