@@ -99,7 +99,23 @@ export function merchantLogin(email, password) {
             saveMerchantSession(u.id, res.token);
             const sIdx = state.users.findIndex((x) => x.id === u.id);
             if (sIdx >= 0) {
-              state.users[sIdx] = { ...state.users[sIdx], session_token: res.token, session_expiry: res.expiresAt };
+              // Merchant Session Lock bugfix (Task 1, step 9.5): stamp the REAL
+              // Convex `_id` (res.user.id — same string-projected field
+              // mergeConvexCustomer already keys off via cvx.id for customers)
+              // onto the local row as `convexId`. Without this, convexUserId()
+              // (used by merchantSessionArgs() for every locked call) has
+              // nothing to resolve and silently sends the literal local seed
+              // id ('owner') as `userId` to every merchant-only Convex function
+              // — which fails v.id("users") validation and gets swallowed by
+              // each bridge's .catch(), so the UI silently stays on stale
+              // localStorage/seed data forever. Mirrors mergeConvexCustomer's
+              // `convexId: cvx.id` precedent exactly.
+              state.users[sIdx] = {
+                ...state.users[sIdx],
+                convexId: res.user?.id || state.users[sIdx].convexId,
+                session_token: res.token,
+                session_expiry: res.expiresAt,
+              };
               persist();
             }
           }
