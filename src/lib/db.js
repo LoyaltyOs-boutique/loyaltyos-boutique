@@ -118,6 +118,26 @@ export function merchantLogin(email, password) {
               };
               persist();
             }
+            // Centralized hydration trigger (Task 1, step 9.8): this is the
+            // single moment a fresh login's real Convex session becomes
+            // available — BEFORE any particular page has had a chance to
+            // mount. Hydrate-on-page-mount was previously patched
+            // individually into Dashboard.jsx/Catalogue.jsx/Customers.jsx
+            // (224e328, aa7fe14), but the same gap kept resurfacing
+            // page-by-page (Templates.jsx, PointsLedger.jsx, Campaigns.jsx,
+            // Onboarding.jsx). Firing hydrateCustomers/hydrateCatalogue/
+            // hydrateReviews HERE instead closes the whole bug class at its
+            // source: every page — current and any future one — gets real
+            // data as soon as login actually succeeds, with no per-page
+            // useEffect required. Each hydrate function self-guards via its
+            // own `xHydrating` flag, so this is safe to call alongside any
+            // pre-existing per-page hydrate calls (no double-fetch races).
+            // hydrateSettings() is intentionally NOT called here — its
+            // underlying query is public and already unconditionally safe
+            // without a session.
+            hydrateCustomers();
+            hydrateCatalogue();
+            hydrateReviews();
           }
         })
         .catch(() => { /* offline — keep local demo flow */ });
