@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia, hydrateCatalogue } from '../../lib/db.js';
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty } from '../../components/ui.jsx';
@@ -13,6 +13,16 @@ const useDb = () => {
 export default function Catalogue() {
   const db = useDb();
   const items = allCatalogue();
+
+  // hydrateCatalogue() normally runs once at module load — but on a genuinely
+  // fresh browser session that one-shot module-load-only hydrate races ahead
+  // of a fresh login's async session being stored, silently finds no session,
+  // and no-ops, leaving this page stuck on hardcoded seed catalogue items
+  // until a hard reload. Re-running it on mount here re-queries Convex once
+  // the real session exists and merges fresh rows into state, calling emit()
+  // when anything changed, which useDb()'s subscribe() picks up to re-render.
+  useEffect(() => { hydrateCatalogue(); }, []);
+
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
   // Manual Entry — drag-drop media upload (mirrors Templates.jsx's MediaCard
   // onMediaFile pattern), auto-fills manual.image_url on success.

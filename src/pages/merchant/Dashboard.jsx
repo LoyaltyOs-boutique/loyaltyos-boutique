@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import {
   getData, subscribe, derivedMetrics, pendingGmbReviews, activityFeed,
   getMerchantSession, setReviewStatus,
+  hydrateCustomers, hydrateCatalogue, hydrateReviews,
 } from '../../lib/db.js';
 import { inr, greeting, first, fmtDate, fmtTime, cls } from '../../lib/util.js';
 import { Stat, Stars } from '../../components/ui.jsx';
@@ -27,6 +28,17 @@ export default function Dashboard() {
   const db = useDb();
   const navigate = useNavigate();
   const [me] = useState(() => getMerchantSession());
+
+  // hydrateCustomers()/hydrateCatalogue()/hydrateReviews() normally run once
+  // at module load — but on a genuinely fresh browser session that one-shot
+  // module-load-only hydrate races ahead of a fresh login's async session
+  // being stored, silently finds no session, and no-ops, leaving this page
+  // stuck on hardcoded seed customers/catalogue/reviews until a hard reload.
+  // Re-running them on mount here re-queries Convex once the real session
+  // exists and merges fresh rows into state, calling emit() when anything
+  // changed, which useDb()'s subscribe() picks up to re-render.
+  useEffect(() => { hydrateCustomers(); hydrateCatalogue(); hydrateReviews(); }, []);
+
   const m = derivedMetrics();
   const pending = pendingGmbReviews();
   const feed = activityFeed();
