@@ -2,6 +2,7 @@ import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/s
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
+import { requireMerchantSession } from "./auth";
 
 /**
  * LoyaltyOS Boutique — Orders + Points Backend (Step 7, PRD Module 7)
@@ -29,14 +30,21 @@ function getStartOfToday(): number {
 /** Create a new order, applying points and updating user balance atomically. */
 export const createOrder = mutation({
   args: {
-    user_id: v.id("users"),
+    // `customerId` is the customer this order is for. `userId` (below) is the
+    // authenticated merchant creating the order — kept distinct to avoid the
+    // ambiguous `user_id`/`userId` collision (matches customers.ts precedent).
+    customerId: v.id("users"),
     subtotal_paise: v.number(),
     payment_method: v.union(v.literal("online"), v.literal("offline")),
     points_applied: v.optional(v.number()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { user_id, subtotal_paise, payment_method, points_applied }) => {
+  handler: async (ctx, { customerId, subtotal_paise, payment_method, points_applied, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     // 1. Verify User
-    const user = await ctx.db.get(user_id);
+    const user = await ctx.db.get(customerId);
     if (!user) return { ok: false, error: "User not found" };
 
     // 2. Validate Inputs
@@ -69,11 +77,11 @@ export const createOrder = mutation({
 
     // 5. Update User Balance (Atomic)
     const new_balance = currentPoints - applied + points_earned;
-    await ctx.db.patch(user_id, { points: new_balance });
+    await ctx.db.patch(customerId, { points: new_balance });
 
     // 6. Insert Order
     const order_id = await ctx.db.insert("orders", {
-      user_id,
+      user_id: customerId,
       subtotal: subtotal_paise,
       points_applied: applied,
       discount_value,
@@ -95,19 +103,24 @@ export const createOrder = mutation({
 
 /** Get all orders sorted by created_at desc. */
 export const getOrders = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     return await ctx.db.query("orders").order("desc").collect();
   },
 });
 
 /** Get orders for a specific user. */
 export const getOrdersByUser = query({
-  args: { user_id: v.id("users") },
-  handler: async (ctx, { user_id }) => {
+  // `customerId` is the customer whose orders are fetched. `userId` is the
+  // authenticated merchant — kept distinct to avoid the ambiguous
+  // `user_id`/`userId` collision (matches customers.ts precedent).
+  args: { customerId: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { customerId, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     return await ctx.db
       .query("orders")
-      .withIndex("by_user", (q) => q.eq("user_id", user_id))
+      .withIndex("by_user", (q) => q.eq("user_id", customerId))
       .order("desc")
       .collect();
   },
@@ -125,16 +138,18 @@ async function getTodayOrdersInternal(ctx: QueryCtx) {
 
 /** Get orders created today. */
 export const getTodayOrders = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     return await getTodayOrdersInternal(ctx);
   },
 });
 
 /** Get aggregate summary for today. */
 export const getTodaySummary = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const orders = await getTodayOrdersInternal(ctx);
     const summary = orders.reduce(
       (
