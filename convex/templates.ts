@@ -1,6 +1,8 @@
-import { action } from "./_generated/server";
+import { action, internalQuery } from "./_generated/server";
 import { v } from "convex/values";
 import { put } from "@vercel/blob";
+import { internal } from "./_generated/api";
+import { requireMerchantSession } from "./auth";
 
 /**
  * Templates section — Video/Image/PDF Send (Phase 1, structure only)
@@ -15,12 +17,35 @@ import { put } from "@vercel/blob";
  */
 
 /**
+ * Merchant Session Lock (2026-09-01) — internal helper for
+ * generateTemplateMediaUploadUrl. Actions have no ctx.db, so
+ * requireMerchantSession (which needs ctx.db.get) cannot be called directly
+ * from an action — it is wrapped in this internalQuery and invoked via
+ * ctx.runQuery, mirroring convex/lookbooks.ts's checkMerchantSession
+ * (built for the identical reason: generatePdfUploadUrl is also an action).
+ * Throws (via requireMerchantSession) rather than returning a boolean, so
+ * the action's runQuery call rejects and generateTemplateMediaUploadUrl
+ * never proceeds to the Blob upload for an unauthenticated/expired caller.
+ */
+export const checkMerchantSession = internalQuery({
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    return null;
+  },
+});
+
+/**
  * Gate: Templates Phase 1 — Upload arbitrary media (video/image/PDF) to
  * Vercel Blob. Reads BLOB_READ_WRITE_TOKEN from the Convex deployment's env
  * vars, same pattern as lookbooks.ts's generatePdfUploadUrl / auth.ts's
  * sendResetEmail().
+ * MERCHANT-ONLY (Merchant Session Lock, 2026-09-01) — session is verified via
+ * checkMerchantSession (see above) before any Blob upload.
  *
  * Args:
+ *  - userId, token : merchant session credentials, verified before any
+ *                     Blob upload happens.
  *  - file        : raw file bytes (v.bytes() -> ArrayBuffer at the Convex
  *                  boundary).
  *  - filename    : original filename, used to build the Blob pathname.
@@ -29,13 +54,20 @@ import { put } from "@vercel/blob";
  */
 export const generateTemplateMediaUploadUrl = action({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     file: v.bytes(),
     filename: v.string(),
     contentType: v.string(),
   },
-  handler: async (ctx, { file, filename, contentType }) => {
-    const token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!token) {
+  handler: async (ctx, { userId, token, file, filename, contentType }) => {
+    await ctx.runQuery(internal.templates.checkMerchantSession, { userId, token });
+
+    // Renamed from `token` to `blobToken` — the merchant session arg above
+    // already owns the name `token` in this scope (same collision + same
+    // fix as generatePdfUploadUrl's BLOB_READ_WRITE_TOKEN var in lookbooks.ts).
+    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
+    if (!blobToken) {
       throw new Error(
         "[generateTemplateMediaUploadUrl] BLOB_READ_WRITE_TOKEN is not set in the Convex deployment environment.",
       );
@@ -45,7 +77,7 @@ export const generateTemplateMediaUploadUrl = action({
     try {
       const blob = await put(filename, file, {
         access: "public",
-        token,
+        token: blobToken,
         contentType,
         addRandomSuffix: true, // avoid overwriting an existing file with the same filename
       });
