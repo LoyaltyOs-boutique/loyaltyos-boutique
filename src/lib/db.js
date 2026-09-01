@@ -132,11 +132,18 @@ export function validateLookbook(id, token) {
 export function customerById(id) { return state.users.find((x) => x.id === id); }
 
 /* ---------- Auth → Convex bridges (PRD §3.1/§3.2) ---------- */
-/** Issue/rotate a customer's magic link on Convex (PRD §3.2). Async — UI not yet wired. */
+/**
+ * Issue/rotate a customer's magic link on Convex (PRD §3.2). Async — UI not yet wired.
+ * Merchant Session Lock (Task 1, Step 9): switched from the deprecated
+ * api.auth.generateMagicToken alias to api.auth.generateMagicTokenSelf — the
+ * PUBLIC variant with byte-identical behavior (see convex/auth.ts's
+ * deprecation comment on generateMagicToken). No session args needed here;
+ * this bridge's own signature/callers are unaffected.
+ */
 export function generateMagicToken(mobile, baseUrl) {
   const client = getConvex();
   if (!client) return Promise.resolve(null);
-  return client.mutation(api.auth.generateMagicToken, { mobile, baseUrl }).catch(() => null);
+  return client.mutation(api.auth.generateMagicTokenSelf, { mobile, baseUrl }).catch(() => null);
 }
 /** Validate a customer magic link against Convex (180-day expiry, PRD §3.2). Async. */
 export function validateMagicToken(id, token, now) {
@@ -242,9 +249,10 @@ function mergeConvexCustomer(cvx, silent = false) {
 export function hydrateCustomers() {
   if (crmHydrating) return;
   const client = getConvex();
-  if (!client) return;
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
   crmHydrating = true;
-  client.query(api.customers.getCustomers)
+  client.query(api.customers.getCustomers, session)
     .then((rows) => {
       crmHydrating = false;
       if (!Array.isArray(rows)) return;
@@ -261,18 +269,20 @@ function refreshFromConvexSheet(doc) {
   return doc;
 }
 
-/** Full customer list from Convex (async). Falls back to [] when offline/error. */
+/** Full customer list from Convex (async). Falls back to [] when offline/error/no session. */
 export function getCustomers() {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.customers.getCustomers).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.customers.getCustomers, session).catch(() => []);
 }
 
-/** Full customer profile by Convex id (async). Falls back to null when offline/error. */
+/** Full customer profile by Convex id (async). Falls back to null when offline/error/no session. */
 export function getCustomerById(id) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.query(api.customers.getCustomerById, { id }).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.query(api.customers.getCustomerById, { id, ...session }).catch(() => null);
 }
 
 // Resolve the Convex `Id<"users">` for a UI-facing userId → keeps mutations valid
@@ -282,29 +292,70 @@ const convexUserId = (userId) => {
   return (u && u.convexId) || userId;
 };
 
-/** Patch a customer's body-fit measurements on Convex (async). */
+/**
+ * Merchant Session Lock (Task 1, Step 9) — resolve the merchant's Convex
+ * userId + session token for every now-locked backend call.
+ *
+ * getMerchantSession() (see bottom of this file) returns { id, token } where
+ * `id` is the LOCAL user id used by the synchronous UI guards — NOT
+ * necessarily the real Convex `_id` the backend's v.id("users") validator
+ * expects. Reuses the existing convexUserId() mapper (same one
+ * updateMeasurements/updateCustomTags/etc. already use) so a hydrated
+ * merchant row's convexId is sent, falling back to passthrough when the
+ * session id already IS the Convex id (matches convexUserId's own contract).
+ *
+ * Returns null when there is no session (never logged in, or the local
+ * session cache was cleared) — every call site below must check for this
+ * and fail the SAME WAY that file's existing offline/error convention does
+ * (Promise.resolve([]) / Promise.resolve(null) / Promise.reject(...)), so a
+ * logged-out caller looks identical to an offline one and never throws an
+ * unhandled error into a component.
+ */
+function merchantSessionArgs() {
+  const session = getMerchantSession();
+  if (!session || !session.token) return null;
+  return { userId: convexUserId(session.id), token: session.token };
+}
+
+/**
+ * Patch a customer's body-fit measurements on Convex (async).
+ * Merchant Session Lock (Task 1, Step 9): convex/customers.ts's updateMeasurements
+ * now reserves the arg name `userId` for the authenticated MERCHANT (session),
+ * so the customer being patched must be sent as `customerId` instead — the
+ * function signature/local param name here is UNCHANGED for callers.
+ */
 export function updateMeasurements(userId, measurements) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.customers.updateMeasurements, { userId: convexUserId(userId), measurements })
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.customers.updateMeasurements, { customerId: convexUserId(userId), measurements, ...session })
     .then((updated) => (updated ? refreshFromConvexSheet(updated) : updated))
     .catch(() => null);
 }
 
-/** Replace a customer's custom tags on Convex (async). */
+/**
+ * Replace a customer's custom tags on Convex (async).
+ * Same customerId rename as updateMeasurements above — `userId` in the
+ * Convex args is now the merchant session's id, not the target customer's.
+ */
 export function updateCustomTags(userId, tags) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.customers.updateCustomTags, { userId: convexUserId(userId), tags })
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.customers.updateCustomTags, { customerId: convexUserId(userId), tags, ...session })
     .then((updated) => (updated ? refreshFromConvexSheet(updated) : updated))
     .catch(() => null);
 }
 
-/** Update customer profile on Convex (async). */
+/**
+ * Update customer profile on Convex (async).
+ * Same customerId rename as updateMeasurements/updateCustomTags above.
+ */
 export function updateCustomerProfile(userId, patch) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.customers.updateCustomerProfile, { userId: convexUserId(userId), ...patch })
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.customers.updateCustomerProfile, { customerId: convexUserId(userId), ...patch, ...session })
     .then((updated) => (updated ? refreshFromConvexSheet(updated) : updated))
     .catch(() => null);
 }
@@ -312,15 +363,17 @@ export function updateCustomerProfile(userId, patch) {
 /** Delight Queue — customers with a birthday within the next `days` days (async). */
 export function getUpcomingBirthdays(days) {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.customers.getUpcomingBirthdays, { days }).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.customers.getUpcomingBirthdays, { days, ...session }).catch(() => []);
 }
 
 /** Delight Queue — customers with an anniversary within the next `days` days (async). */
 export function getUpcomingAnniversaries(days) {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.customers.getUpcomingAnniversaries, { days }).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.customers.getUpcomingAnniversaries, { days, ...session }).catch(() => []);
 }
 
 /**
@@ -330,17 +383,23 @@ export function getUpcomingAnniversaries(days) {
  * Same PROPAGATE-real-errors bridge pattern as sendWhatsAppTemplateMessage
  * above (no try/catch-and-swallow) — Customers.jsx needs to see the real
  * idempotency-rejection error (duplicate decision for the same tuple) to
- * show an inline message instead of silently doing nothing.
+ * show an inline message instead of silently doing nothing. Merchant Session
+ * Lock (Task 1, Step 9): no `userId`/`customer_id` collision on this function
+ * (Convex arg is `customer_id`, not `customerId`/`userId`), so no rename needed
+ * — only the session args are added.
  */
 export function recordMessageAction(customer_id, occasion, occasion_date, action, channel) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
   return client.mutation(api.customers.recordMessageAction, {
     customer_id: convexUserId(customer_id),
     occasion,
     occasion_date,
     action,
     ...(channel ? { channel } : {}),
+    ...session,
   });
 }
 
@@ -364,12 +423,15 @@ export function recordMessageAction(customer_id, occasion, occasion_date, action
  */
 export function awardPoints(customer_id, delta, reason_type, note) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
   return client.mutation(api.customers.awardPoints, {
     customer_id: convexUserId(customer_id),
     delta,
     reason_type,
     ...(note ? { note } : {}),
+    ...session,
   }).then((resulting_balance) => {
     hydrateCustomers();
     return resulting_balance;
@@ -383,25 +445,32 @@ export function awardPoints(customer_id, delta, reason_type, note) {
 
 export function allCatalogue() { return [...state.catalogueItems]; }
 
-/** Full lookbook list from Convex (async). */
+/** Full lookbook list from Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function getLookbooks() {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.lookbooks.getLookbooks).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.lookbooks.getLookbooks, session).catch(() => []);
 }
 
-/** Full lookbook + items from Convex (async). */
+/**
+ * Full lookbook + items from Convex (async). PUBLIC — convex/lookbooks.ts's
+ * getLookbookById takes no session args (used by public lookbook pages/PDF
+ * preview too), so this bridge is left UNCHANGED per the Merchant Session
+ * Lock design (only genuinely merchant-only functions get session args).
+ */
 export function getLookbookById(id) {
   const client = getConvex();
   if (!client) return Promise.resolve(null);
   return client.query(api.lookbooks.getLookbookById, { id }).catch(() => null);
 }
 
-/** Lookbook list for the Catalogue selector dropdown (async). Returns [{_id, name, kind}]. */
+/** Lookbook list for the Catalogue selector dropdown (async). Returns [{_id, name, kind}]. MERCHANT-ONLY. */
 export function getLookbooksForSelector() {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.lookbooks.getLookbooksForSelector).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.lookbooks.getLookbooksForSelector, session).catch(() => []);
 }
 
 /**
@@ -411,11 +480,15 @@ export function getLookbooksForSelector() {
  * always resolves ok:true), this bridge PROPAGATES real errors so the Catalogue.jsx
  * upload card can show the failure to the merchant instead of silently swallowing it
  * (see CLAUDE.md §12 lesson 4 — fallback only on network failure, not validation errors).
+ * MERCHANT-ONLY (Merchant Session Lock) — a missing session rejects the same
+ * way an offline client does (PROPAGATE-real-errors convention for this bridge).
  */
 export function uploadPdfLookbook(file, filename, lookbookName) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
-  return client.action(api.lookbooks.generatePdfUploadUrl, { file, filename, lookbookName });
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.action(api.lookbooks.generatePdfUploadUrl, { file, filename, lookbookName, ...session });
 }
 
 /**
@@ -424,18 +497,24 @@ export function uploadPdfLookbook(file, filename, lookbookName) {
  * errors bridge pattern as uploadPdfLookbook above — no silent fallback, no
  * DB row to persist to (Phase 1 has no template-media table; the caller only
  * needs the returned Blob URL to build the wa.me message text).
+ * MERCHANT-ONLY (Merchant Session Lock) — same missing-session-rejects
+ * convention as uploadPdfLookbook above.
  */
 export function uploadTemplateMedia(file, filename, contentType) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
-  return client.action(api.templates.generateTemplateMediaUploadUrl, { file, filename, contentType });
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.action(api.templates.generateTemplateMediaUploadUrl, { file, filename, contentType, ...session });
 }
 
 /**
  * Current active Anniversary/Birthday card image URLs (Templates Phase 3).
  * Always resolves to real URLs (backend falls back to defaults) — falls
  * back to [] here only on network/offline failure, same as
- * getLookbooksForSelector above.
+ * getLookbooksForSelector above. PUBLIC — convex/settings.ts's
+ * getTemplateCardUrls takes no session args (middleware.js OG-preview fail-
+ * open path also depends on it), so this bridge is left UNCHANGED.
  */
 export function getTemplateCardUrls() {
   const client = getConvex();
@@ -447,12 +526,15 @@ export function getTemplateCardUrls() {
  * Replace one card type's active image URL (Templates Phase 3). Same
  * PROPAGATE-real-errors pattern as uploadTemplateMedia/uploadPdfLookbook —
  * no silent fallback, so the merchant sees a real failure instead of a
- * silently-ignored replace.
+ * silently-ignored replace. MERCHANT-ONLY (Merchant Session Lock) — same
+ * missing-session-rejects convention as uploadPdfLookbook/uploadTemplateMedia.
  */
 export function setTemplateCardUrl(type, url) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
-  return client.mutation(api.settings.setTemplateCardUrl, { type, url });
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.mutation(api.settings.setTemplateCardUrl, { type, url, ...session });
 }
 
 /**
@@ -464,8 +546,9 @@ export function setTemplateCardUrl(type, url) {
  */
 export function getWhatsAppTemplates() {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.query(api.settings.getWhatsAppTemplates).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.query(api.settings.getWhatsAppTemplates, session).catch(() => null);
 }
 
 /**
@@ -473,12 +556,13 @@ export function getWhatsAppTemplates() {
  * Days) for Anniversary/Birthday. Always resolves to the full merged shape
  * — `{anniversary:{...}, birthday:{...}}`, all-empty-string is the normal
  * "not set yet" state, not an error. Same query-with-catch-null pattern as
- * getTemplateCardUrls/getWhatsAppTemplates above.
+ * getTemplateCardUrls/getWhatsAppTemplates above. MERCHANT-ONLY.
  */
 export function getWhatsAppTemplateConfig() {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.query(api.settings.getWhatsAppTemplateConfig).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.query(api.settings.getWhatsAppTemplateConfig, session).catch(() => null);
 }
 
 /**
@@ -486,12 +570,15 @@ export function getWhatsAppTemplateConfig() {
  * leaving the other moment type untouched (read-merge-write on the Convex
  * side). Same PROPAGATE-real-errors bridge pattern as setTemplateCardUrl/
  * uploadTemplateMedia above — no try/catch-and-swallow, so Templates.jsx
- * can show a real failure instead of a silently-ignored save.
+ * can show a real failure instead of a silently-ignored save. MERCHANT-ONLY
+ * (Merchant Session Lock) — same missing-session-rejects convention.
  */
 export function setWhatsAppTemplateConfig(type, config) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
-  return client.mutation(api.settings.setWhatsAppTemplateConfig, { type, config });
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.mutation(api.settings.setWhatsAppTemplateConfig, { type, config, ...session });
 }
 
 /**
@@ -500,17 +587,21 @@ export function setWhatsAppTemplateConfig(type, config) {
  * uploadTemplateMedia/setTemplateCardUrl above — no try/catch-and-swallow
  * here. Templates.jsx decides what to do on failure (fall back to the
  * existing wa.me link-open), this bridge just forwards the Convex action
- * call and its real success/error shape.
+ * call and its real success/error shape. MERCHANT-ONLY (Merchant Session
+ * Lock) — same missing-session-rejects convention as setTemplateCardUrl.
  */
 export function sendWhatsAppTemplateMessage(to, templateName, languageCode, imageUrl, bodyParams) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
   return client.action(api.whatsapp.sendWhatsAppTemplateMessage, {
     to,
     templateName,
     languageCode,
     ...(imageUrl ? { imageUrl } : {}),
     ...(bodyParams ? { bodyParams } : {}),
+    ...session,
   });
 }
 
@@ -518,60 +609,69 @@ export function sendWhatsAppTemplateMessage(to, templateName, languageCode, imag
  * Send a free-form WhatsApp service message (only valid inside an open 24h
  * customer service window — convex/whatsapp.ts, Decision 1: no session
  * tracking, the real Meta rejection IS the signal). Same PROPAGATE-real-
- * errors bridge pattern as sendWhatsAppTemplateMessage above.
+ * errors bridge pattern as sendWhatsAppTemplateMessage above. MERCHANT-ONLY
+ * (Merchant Session Lock) — same missing-session-rejects convention.
  */
 export function sendWhatsAppServiceMessage(to, type, text, imageUrl) {
   const client = getConvex();
+  const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
   return client.action(api.whatsapp.sendWhatsAppServiceMessage, {
     to,
     type,
     ...(text ? { text } : {}),
     ...(imageUrl ? { imageUrl } : {}),
+    ...session,
   });
 }
 
 /**
- * Fetch a single catalogue piece by its Convex id (async).
- * No backend query exists for a lone item, so we walk the lookbooks client-side
- * (allowed: db.js is the data-layer bridge) and return the first matching piece,
- * shaped like a catalogue item (price kept in paise, as PublicLookbook expects).
+ * Fetch a single catalogue piece by its Convex id (async). PUBLIC — called
+ * from PublicPiece.jsx with NO merchant logged in, so this must never
+ * require a session.
+ *
+ * Merchant Session Lock (Task 1, Step 9) fix: this bridge PREVIOUSLY walked
+ * every lookbook client-side via api.lookbooks.getLookbooks +
+ * getLookbookById(id) (the "no backend query exists for a lone item"
+ * comment above was true at the time it was written) — but getLookbooks is
+ * now MERCHANT-ONLY (requires userId/token), so that walk would always
+ * resolve null for an anonymous public visitor once Steps 1-8 deployed.
+ * convex/lookbooks.ts's getCatalogueItemById (added alongside the lock,
+ * explicitly documented as "the server-side counterpart to this client
+ * helper") is a genuinely PUBLIC, O(1) query — switch to it directly instead
+ * of the now-broken multi-lookbook scan. lookup_id/lookbook_title are no
+ * longer attached (the O(1) query has no reason to also fetch the parent
+ * lookbook); PublicPiece.jsx does not read those fields today.
  */
 export function getCatalogueItemById(pieceId) {
   const client = getConvex();
   if (!client) return Promise.resolve(null);
-  return client.query(api.lookbooks.getLookbooks)
-    .then(async (lookbooks) => {
-      if (!Array.isArray(lookbooks)) return null;
-      for (const lb of lookbooks) {
-        const detail = await client.query(api.lookbooks.getLookbookById, { id: lb._id });
-        const match = detail?.items?.find((i) => i._id === pieceId);
-        if (match) return { ...match, lookbook_id: lb._id, lookbook_title: lb.title };
-      }
-      return null;
-    })
-    .catch(() => null);
+  return client.query(api.lookbooks.getCatalogueItemById, { id: pieceId }).catch(() => null);
 }
 
-/** Create lookbook on Convex (async). */
+/** Create lookbook on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function createLookbook(args) {
   const client = getConvex();
-  if (!client) return Promise.resolve({ ok: false });
-  return client.mutation(api.lookbooks.createLookbook, args).catch(() => ({ ok: false }));
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.mutation(api.lookbooks.createLookbook, { ...args, ...session }).catch(() => ({ ok: false }));
 }
 
-/** Patch lookbook on Convex (async). */
+/** Patch lookbook on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function updateLookbook(id, patch) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.lookbooks.updateLookbook, { id, ...patch }).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.lookbooks.updateLookbook, { id, ...patch, ...session }).catch(() => null);
 }
 
-/** Delete lookbook + items on Convex (async). */
+/** Delete lookbook + items on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function deleteLookbook(id) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.lookbooks.deleteLookbook, { id }).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.lookbooks.deleteLookbook, { id, ...session }).catch(() => null);
 }
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
@@ -592,12 +692,17 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
   pushEvent('owner', 'catalogue', `New lookbook item added · ${title} (₹${item.price})`);
   emit();
 
-  // 2. Convex write-through (PAISE integer)
+  // 2. Convex write-through (PAISE integer). MERCHANT-ONLY (Merchant Session
+  // Lock) — both the lookbook lookup and the insert now require the
+  // merchant's session; skip the write-through entirely (keep the local
+  // optimistic item) when no merchant is logged in, same as every other
+  // "no session → stay on local/offline state" bridge in this file.
   const client = getConvex();
-  if (client) {
+  const addSession = merchantSessionArgs();
+  if (client && addSession) {
     // If no lookbook_id provided, we try to find one or ignore (PRD says item must have lookbook)
     // For the demo / standalone catalogue, we expect the caller to provide it or the first lookbook.
-    client.query(api.lookbooks.getLookbooks).then((lbs) => {
+    client.query(api.lookbooks.getLookbooks, addSession).then((lbs) => {
       const lbId = lookbook_id || (lbs && lbs[0] ? lbs[0]._id : null);
       if (lbId) {
         client.mutation(api.lookbooks.addCatalogueItem, {
@@ -605,7 +710,8 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
           title,
           price: Math.round((Number(price) || 0) * 100),
           image_url: image_url || '',
-          instagram_link: instagram_link || undefined
+          instagram_link: instagram_link || undefined,
+          ...addSession,
         }).then((cvxId) => {
           // Stamp the real ID so subsequent deletes/updates target Convex
           const idx = state.catalogueItems.findIndex((i) => i.id === item.id);
@@ -621,16 +727,17 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
   return item;
 }
 
-/** Patch catalogue item on Convex (async). */
+/** Patch catalogue item on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function updateCatalogueItem(id, patch) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
   const p = { ...patch };
   if (p.price !== undefined) p.price = Math.round(Number(p.price) * 100);
-  return client.mutation(api.lookbooks.updateCatalogueItem, { id, ...p }).catch(() => null);
+  return client.mutation(api.lookbooks.updateCatalogueItem, { id, ...p, ...session }).catch(() => null);
 }
 
-/** Delete item with optimistic update + Convex write-through (Step 6.2). */
+/** Delete item with optimistic update + Convex write-through (Step 6.2). MERCHANT-ONLY. */
 export function removeCatalogueItem(id) {
   const item = state.catalogueItems.find((i) => i.id === id);
   const convexId = item ? (item.convexId || (String(id).startsWith('it_') ? null : id)) : null;
@@ -639,25 +746,28 @@ export function removeCatalogueItem(id) {
   state.catalogueItems = state.catalogueItems.filter((i) => i.id !== id);
   emit();
 
-  // 2. Convex delete
+  // 2. Convex delete. Merchant Session Lock (Task 1, Step 9): skip silently
+  // (same as the pre-existing "offline" catch) when no merchant is logged in.
   if (convexId) {
     const client = getConvex();
-    if (client) {
-      client.mutation(api.lookbooks.deleteCatalogueItem, { id: convexId })
+    const session = merchantSessionArgs();
+    if (client && session) {
+      client.mutation(api.lookbooks.deleteCatalogueItem, { id: convexId, ...session })
         .catch(() => { /* offline */ });
     }
   }
 }
 
-/** Background hydrate catalogue items from all lookbooks (Step 6.2). */
+/** Background hydrate catalogue items from all lookbooks (Step 6.2). MERCHANT-ONLY. */
 let catalogueHydrating = false;
 export function hydrateCatalogue() {
   if (catalogueHydrating) return;
   const client = getConvex();
-  if (!client) return;
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
   catalogueHydrating = true;
 
-  client.query(api.lookbooks.getLookbooks)
+  client.query(api.lookbooks.getLookbooks, session)
     .then(async (lookbooks) => {
       if (!Array.isArray(lookbooks)) { catalogueHydrating = false; return; }
       const allItems = [];
@@ -714,9 +824,13 @@ export function addStaffNote(userId, text, by) {
   emit();
   const client = getConvex();
   const convexId = user.convexId || (user._isConvex ? user.id : null);
-  if (client && convexId) {
+  // Merchant Session Lock (Task 1, Step 9): convex/customers.ts's addStaffNote
+  // now reserves `userId` for the authenticated MERCHANT session — the target
+  // customer must be sent as `customerId` (was incorrectly `userId: convexId`).
+  const session = merchantSessionArgs();
+  if (client && convexId && session) {
     try {
-      client.mutation(api.customers.addStaffNote, { userId: convexId, text, author: by || 'Owner' })
+      client.mutation(api.customers.addStaffNote, { customerId: convexId, text, author: by || 'Owner', ...session })
         .then((updated) => { if (updated) refreshFromConvexSheet(updated); })
         .catch(() => { /* offline — local note stays */ });
     } catch { /* same */ }
@@ -746,39 +860,51 @@ export function checkout({ userId, items, pointsApplied, paymentMethod }) {
   pushEvent(userId, 'purchase', `${user.name} placed an order · ${items[0]?.title || 'lookbook'} ${paymentMethod === 'online' ? 'paid online' : 'reserved in store'} ₹${finalTotal.toLocaleString('en-IN')}`);
   emit();
 
-  // Convex write-through
+  // Convex write-through. Merchant Session Lock (Task 1, Step 9): convex/
+  // orders.ts's createOrder now reserves `userId` for the authenticated
+  // MERCHANT session, so the customer this order is FOR must be sent as
+  // `customerId` (not `user_id` as this call incorrectly sent before —
+  // createOrder's target-customer arg was already named `customerId`, this
+  // call site was passing the wrong key even pre-lock; fixed here alongside
+  // adding the required session args).
   const client = getConvex();
-  if (client) {
+  const checkoutSession = merchantSessionArgs();
+  if (client && checkoutSession) {
     client.mutation(api.orders.createOrder, {
-      user_id: convexUserId(userId),
+      customerId: convexUserId(userId),
       subtotal_paise: Math.round(subtotal * 100),
       payment_method: paymentMethod === 'online' ? 'online' : 'offline',
-      points_applied: pointsApplied
+      points_applied: pointsApplied,
+      ...checkoutSession,
     }).catch((err) => console.error('[checkout] Convex mutation failed:', err));
   }
 
   return order;
 }
 
-/** Get all orders (async). */
+/** Get all orders (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function getOrders() {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.orders.getOrders).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.orders.getOrders, session).catch(() => []);
 }
 
-/** Get orders for today (async). */
+/** Get orders for today (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function getTodayOrders() {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.orders.getTodayOrders).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.orders.getTodayOrders, session).catch(() => []);
 }
 
-/** Get today's summary (async). */
+/** Get today's summary (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function getTodaySummary() {
   const client = getConvex();
-  if (!client) return Promise.resolve({ order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 });
-  return client.query(api.orders.getTodaySummary).catch(() => ({ order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 }));
+  const session = merchantSessionArgs();
+  const empty = { order_count: 0, revenue_paise: 0, points_issued: 0, points_redeemed: 0 };
+  if (!client || !session) return Promise.resolve(empty);
+  return client.query(api.orders.getTodaySummary, session).catch(() => empty);
 }
 /* ---------- Reviews → Convex bridge (Step 8.2) ---------- */
 // Contract parity: function names mirror convex/reviews.ts (Step 8.1) so the
@@ -854,9 +980,10 @@ let reviewsHydrating = false;
 export function hydrateReviews() {
   if (reviewsHydrating) return;
   const client = getConvex();
-  if (!client) return;
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
   reviewsHydrating = true;
-  client.query(api.reviews.getPendingReviews)
+  client.query(api.reviews.getPendingReviews, session)
     .then((rows) => {
       reviewsHydrating = false;
       if (!Array.isArray(rows)) return;
@@ -873,32 +1000,36 @@ function refreshFromConvexReview(doc) {
   return doc;
 }
 
-/** Full pending reviews from Convex (async). Falls back to [] when offline/error. */
+/** Full pending reviews from Convex (async). Falls back to [] when offline/error/no session. */
 export function getPendingReviews() {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.reviews.getPendingReviews).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.reviews.getPendingReviews, session).catch(() => []);
 }
 
-/** Full reviews with optional status filter from Convex (async). */
+/** Full reviews with optional status filter from Convex (async). MERCHANT-ONLY. */
 export function getReviews({ status }) {
   const client = getConvex();
-  if (!client) return Promise.resolve([]);
-  return client.query(api.reviews.getReviews, { status }).catch(() => []);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.reviews.getReviews, { status, ...session }).catch(() => []);
 }
 
-/** Approve review on Convex (async). Returns { ok, points_awarded }. */
+/** Approve review on Convex (async). Returns { ok, points_awarded }. MERCHANT-ONLY. */
 export function approveReview(id) {
   const client = getConvex();
-  if (!client) return Promise.resolve({ ok: false });
-  return client.mutation(api.reviews.approveReview, { id }).catch(() => ({ ok: false }));
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.mutation(api.reviews.approveReview, { id, ...session }).catch(() => ({ ok: false }));
 }
 
-/** Decline review on Convex (async). Returns { ok }. */
+/** Decline review on Convex (async). Returns { ok }. MERCHANT-ONLY. */
 export function declineReview(id) {
   const client = getConvex();
-  if (!client) return Promise.resolve({ ok: false });
-  return client.mutation(api.reviews.declineReview, { id }).catch(() => ({ ok: false }));
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.mutation(api.reviews.declineReview, { id, ...session }).catch(() => ({ ok: false }));
 }
 
 /** Create review on Convex (async). Returns Convex review doc. */
@@ -1002,13 +1133,17 @@ export function setReviewStatus(id, status) {
   emit();
 
   // 2. Convex write-through (only for pending → approved/declined transitions)
+  // Merchant Session Lock (Task 1, Step 9): approveReview/declineReview are
+  // MERCHANT-ONLY — skip the write-through (local status stays, same as the
+  // existing offline convention) when no merchant session is available.
   if (prevStatus === 'pending' && (status === 'approved' || status === 'declined' || status === 'resolved')) {
     const client = getConvex();
     const convexId = r.convexId || (r._isConvex ? r.id : null);
-    if (client && convexId) {
+    const session = merchantSessionArgs();
+    if (client && convexId && session) {
       const cvxStatus = localToConvexStatus(status);
       if (cvxStatus === 'approved') {
-        client.mutation(api.reviews.approveReview, { id: convexId })
+        client.mutation(api.reviews.approveReview, { id: convexId, ...session })
           .then((res) => {
             if (res && res.ok) {
               // Points already awarded locally; Convex also updated user points.
@@ -1019,7 +1154,7 @@ export function setReviewStatus(id, status) {
           .catch(() => { /* offline — local status stays */ });
       } else {
         // declined or resolved → Convex 'declined'
-        client.mutation(api.reviews.declineReview, { id: convexId })
+        client.mutation(api.reviews.declineReview, { id: convexId, ...session })
           .then(() => {
             refreshFromConvexReview({ ...r, _id: convexId, status: 'declined' });
           })
@@ -1097,10 +1232,14 @@ export function saveTierSettings(tierKey, patch) {
   state.settings.tiers[tierKey] = { ...state.settings.tiers[tierKey], ...patch };
   emit();
   const client = getConvex();
-  if (client) {
+  // Merchant Session Lock (Task 1, Step 9): updateSettings is MERCHANT-ONLY —
+  // skip the write-through (local tier settings stay in effect, same as the
+  // existing offline convention) when no merchant session is available.
+  const session = merchantSessionArgs();
+  if (client && session) {
     try {
       client
-        .mutation(api.settings.updateSettings, { settings: loyaltyRulesPayload() })
+        .mutation(api.settings.updateSettings, { settings: loyaltyRulesPayload(), ...session })
         .then((merged) => refreshSettingsFromConvex(merged))
         .catch(() => { /* offline — local tier settings stay in effect */ });
     } catch { /* same */ }
@@ -1114,6 +1253,11 @@ export function saveTierSettings(tierKey, patch) {
  * query resolves. If Convex has never had loyalty_rules written
  * (updated_at.loyalty_rules === null), the local seed is written through to
  * Convex so the backend becomes the source of truth with identical values.
+ *
+ * getSettings itself is PUBLIC (no session args — untouched below); only the
+ * conditional "seed Convex when empty" follow-up call is a write
+ * (updateSettings) and is MERCHANT-ONLY, so it needs a session and is
+ * skipped (keep seed, same as offline) when no merchant is logged in.
  */
 let settingsHydrating = false;
 export function hydrateSettings() {
@@ -1128,7 +1272,9 @@ export function hydrateSettings() {
       // First successful hydrate → if Convex was empty, seed it with local values
       // so the settings page stays pixel-identical while Convex becomes the truth.
       if (merged.updated_at && merged.updated_at.loyalty_rules === null) {
-        client.mutation(api.settings.updateSettings, { settings: loyaltyRulesPayload() })
+        const session = merchantSessionArgs();
+        if (!session) return; // no merchant logged in — keep seed, try again next hydrate
+        client.mutation(api.settings.updateSettings, { settings: loyaltyRulesPayload(), ...session })
           .then((seeded) => { if (seeded) refreshSettingsFromConvex(seeded); })
           .catch(() => { /* offline — keep seed */ });
         return;
@@ -1138,25 +1284,27 @@ export function hydrateSettings() {
     .catch(() => { settingsHydrating = false; /* offline — stay on localStorage seed */ });
 }
 
-/** Full effective settings from Convex (async). Falls back to null when offline/error. */
+/** Full effective settings from Convex (async). Falls back to null when offline/error. PUBLIC — untouched. */
 export function getSettings() {
   const client = getConvex();
   if (!client) return Promise.resolve(null);
   return client.query(api.settings.getSettings).catch(() => null);
 }
 
-/** Update a global WhatsApp message template on Convex (async, PRD §8). */
+/** Update a global WhatsApp message template on Convex (async, PRD §8). MERCHANT-ONLY. */
 export function updateTemplate(templateKey, text) {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.settings.updateTemplate, { templateKey, text }).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.settings.updateTemplate, { templateKey, text, ...session }).catch(() => null);
 }
 
-/** Restore defaults on Convex (async) — deletes all settings docs, defaults fallback. */
+/** Restore defaults on Convex (async) — deletes all settings docs, defaults fallback. MERCHANT-ONLY. */
 export function resetSettings() {
   const client = getConvex();
-  if (!client) return Promise.resolve(null);
-  return client.mutation(api.settings.resetSettings).catch(() => null);
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve(null);
+  return client.mutation(api.settings.resetSettings, session).catch(() => null);
 }
 
 /* ---------- Derived ---------- */
@@ -1334,7 +1482,11 @@ export async function onboardCustomerRemote(f) {
     const cvxId = created && (created.id || created.existingId);
 
     // Rotate/issue the 256-bit magic token on Convex (180-day validity).
-    const linkRes = await client.mutation(api.auth.generateMagicToken, {
+    // Merchant Session Lock (Task 1, Step 9): switched from the deprecated
+    // api.auth.generateMagicToken alias to api.auth.generateMagicTokenSelf —
+    // the PUBLIC variant with byte-identical behavior (see convex/auth.ts's
+    // deprecation comment on generateMagicToken).
+    const linkRes = await client.mutation(api.auth.generateMagicTokenSelf, {
       mobile,
       ...(typeof location !== 'undefined' ? { baseUrl: location.origin } : {}),
     });
