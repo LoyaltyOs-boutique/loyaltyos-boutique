@@ -1,6 +1,7 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
+import { requireMerchantSession } from "./auth";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -161,8 +162,9 @@ async function findUpcoming(
 
 /** All customers — merchant CRM list view (all fields, no auth secrets). */
 export const getCustomers = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const customers = await ctx.db
       .query("users")
       .filter((q) => q.eq(q.field("role"), "customer"))
@@ -175,8 +177,9 @@ export const getCustomers = query({
 
 /** Full customer profile by _id — measurements + staff_notes (merchant-only). */
 export const getCustomerById = query({
-  args: { id: v.id("users") },
-  handler: async (ctx, { id }) => {
+  args: { id: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { id, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const doc = await getCustomerDoc(ctx, id);
     return doc ? toMerchantCustomer(doc) : null;
   },
@@ -189,7 +192,7 @@ export const getCustomerById = query({
  */
 export const updateMeasurements = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     measurements: v.object({
       bust: v.optional(v.number()),
       waist: v.optional(v.number()),
@@ -197,12 +200,15 @@ export const updateMeasurements = mutation({
       height: v.optional(v.string()),
       blouse_size: v.optional(v.string()),
     }),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, measurements }) => {
-    const doc = await getCustomerDoc(ctx, userId);
+  handler: async (ctx, { customerId, measurements, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const merged = { ...(doc.measurements ?? {}), ...measurements };
-    await ctx.db.patch(userId, { measurements: merged });
+    await ctx.db.patch(customerId, { measurements: merged });
     return toMerchantCustomer({ ...doc, measurements: merged });
   },
 });
@@ -213,18 +219,21 @@ export const updateMeasurements = mutation({
  */
 export const addStaffNote = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     text: v.string(),
     author: v.optional(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, text, author }) => {
+  handler: async (ctx, { customerId, text, author, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Staff note text is required.");
-    const doc = await getCustomerDoc(ctx, userId);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const note = { text: trimmed, date: Date.now(), author: author?.trim() || "Owner" };
     const staff_notes = [...(doc.staff_notes ?? []), note];
-    await ctx.db.patch(userId, { staff_notes });
+    await ctx.db.patch(customerId, { staff_notes });
     return toMerchantCustomer({ ...doc, staff_notes });
   },
 });
@@ -232,14 +241,17 @@ export const addStaffNote = mutation({
 /** Replace a customer's custom tags (e.g. ["Hot Lead", "Saree Enthusiast"]). */
 export const updateCustomTags = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     tags: v.array(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, tags }) => {
-    const doc = await getCustomerDoc(ctx, userId);
+  handler: async (ctx, { customerId, tags, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const custom_tags = tags.map((t) => t.trim()).filter(Boolean);
-    await ctx.db.patch(userId, { custom_tags });
+    await ctx.db.patch(customerId, { custom_tags });
     return toMerchantCustomer({ ...doc, custom_tags });
   },
 });
@@ -247,15 +259,18 @@ export const updateCustomTags = mutation({
 /** Update customer profile (name, birthday, anniversary, tier). */
 export const updateCustomerProfile = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     name: v.optional(v.string()),
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
     tier: v.optional(v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum"))),
     custom_tags: v.optional(v.array(v.string())),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, ...patch }) => {
-    const doc = await getCustomerDoc(ctx, userId);
+  handler: async (ctx, { customerId, userId, token, ...patch }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const update: any = {};
     if (patch.name !== undefined) update.name = patch.name.trim();
@@ -263,15 +278,16 @@ export const updateCustomerProfile = mutation({
     if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
     if (patch.tier !== undefined) update.tier = patch.tier;
     if (patch.custom_tags !== undefined) update.custom_tags = patch.custom_tags.map((t: string) => t.trim()).filter(Boolean);
-    await ctx.db.patch(userId, update);
+    await ctx.db.patch(customerId, update);
     return toMerchantCustomer({ ...doc, ...update });
   },
 });
 
 /** Delight Queue — customers with a birthday within the next `days` days. */
 export const getUpcomingBirthdays = query({
-  args: { days: v.optional(v.number()) },
-  handler: async (ctx, { days }) => {
+  args: { days: v.optional(v.number()), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { days, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const hits = await findUpcoming(ctx, days ?? 7, "birthday");
     return hits.map(({ doc, daysUntil }) => ({
       _id: doc._id,
@@ -289,8 +305,9 @@ export const getUpcomingBirthdays = query({
 
 /** Delight Queue — customers with an anniversary within the next `days` days. */
 export const getUpcomingAnniversaries = query({
-  args: { days: v.optional(v.number()) },
-  handler: async (ctx, { days }) => {
+  args: { days: v.optional(v.number()), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { days, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const hits = await findUpcoming(ctx, days ?? 7, "anniversary");
     return hits.map(({ doc, daysUntil }) => ({
       _id: doc._id,
@@ -331,8 +348,11 @@ export const recordMessageAction = mutation({
     occasion_date: v.string(),
     action: v.union(v.literal("sent"), v.literal("cancelled")),
     channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { customer_id, occasion, occasion_date, action, channel }) => {
+  handler: async (ctx, { customer_id, occasion, occasion_date, action, channel, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const doc = await getCustomerDoc(ctx, customer_id);
     if (!doc) throw new Error("Customer not found.");
 
@@ -396,8 +416,11 @@ export const awardPoints = mutation({
       v.literal("purchase"),
     ),
     note: v.optional(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { customer_id, delta, reason_type, note }) => {
+  handler: async (ctx, { customer_id, delta, reason_type, note, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const doc = await getCustomerDoc(ctx, customer_id);
     if (!doc) throw new Error("Customer not found.");
 
@@ -441,8 +464,9 @@ function normalizeMobile(mobile: string): string {
  * Returns the merchant view of the customer, or null when not found.
  */
 export const findCustomerByMobile = query({
-  args: { mobile: v.string() },
-  handler: async (ctx, { mobile }) => {
+  args: { mobile: v.string(), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { mobile, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const normalized = normalizeMobile(mobile);
     if (!normalized) return null;
     const doc = await ctx.db
@@ -551,8 +575,11 @@ export const bulkCreateCustomers = mutation({
         country: v.optional(v.string()),
       }),
     ),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { rows }) => {
+  handler: async (ctx, { rows, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const created: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
     const skipped: Array<{ name: string; whatsapp: string; reason: string }> = [];
     const seenInFile = new Set<string>();
