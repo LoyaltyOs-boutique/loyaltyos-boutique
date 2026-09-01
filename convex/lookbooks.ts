@@ -1,8 +1,9 @@
-import { action, internalMutation, mutation, query, type QueryCtx } from "./_generated/server";
+import { action, internalMutation, internalQuery, mutation, query, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { put } from "@vercel/blob";
 import { internal } from "./_generated/api";
+import { requireMerchantSession } from "./auth";
 
 /**
  * LoyaltyOS Boutique — Lookbook Catalogue backend (Step 6.1)
@@ -35,10 +36,11 @@ async function getItemCount(ctx: QueryCtx, lookbookId: Id<"lookbooks">): Promise
 
 // --- PUBLIC API ---
 
-/** Get all lookbooks with item_count, sorted by created_at desc. */
+/** Get all lookbooks with item_count, sorted by created_at desc. MERCHANT-ONLY. */
 export const getLookbooks = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const lookbooks = await ctx.db.query("lookbooks").order("desc").collect();
     return await Promise.all(
       lookbooks.map(async (lb) => ({
@@ -60,10 +62,13 @@ export const getLookbooks = query({
  * selector shape is `{_id, name, kind}` — so we relabel title -> name here.
  * The implicit "Current catalogue" pseudo-option is UI-only and NOT included
  * in this list (it isn't a real lookbooks row).
+ *
+ * MERCHANT-ONLY (Merchant Session Lock, 2026-09-01).
  */
 export const getLookbooksForSelector = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const lookbooks = await ctx.db.query("lookbooks").collect();
     return lookbooks.map((lb) => ({
       _id: lb._id,
@@ -103,13 +108,15 @@ export const getCatalogueItemById = query({
 });
 
 /**
- * Create lookbook.
+ * Create lookbook. MERCHANT-ONLY.
  * `kind` is optional (Gate 2 Step C): pass "designer" to tag a manually-created
  * designer-lookbook so it shows in the Step A selector's designer list; omit for
  * legacy/catalogue rows (missing kind is treated as catalogue grouping).
  */
 export const createLookbook = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     title: v.string(),
     designer: v.string(),
     source: LOOKBOOK_SOURCES,
@@ -117,7 +124,8 @@ export const createLookbook = mutation({
       v.union(v.literal("catalogue"), v.literal("designer"), v.literal("pdf")),
     ),
   },
-  handler: async (ctx, args) => {
+  handler: async (ctx, { userId, token, ...args }) => {
+    await requireMerchantSession(ctx, userId, token);
     const id = await ctx.db.insert("lookbooks", {
       ...args,
       created_at: Date.now(),
@@ -126,23 +134,27 @@ export const createLookbook = mutation({
   },
 });
 
-/** Patch lookbook. */
+/** Patch lookbook. MERCHANT-ONLY. */
 export const updateLookbook = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     id: v.id("lookbooks"),
     title: v.optional(v.string()),
     designer: v.optional(v.string()),
     source: v.optional(LOOKBOOK_SOURCES),
   },
-  handler: async (ctx, { id, ...patch }) => {
+  handler: async (ctx, { userId, token, id, ...patch }) => {
+    await requireMerchantSession(ctx, userId, token);
     await ctx.db.patch(id, patch);
   },
 });
 
-/** Delete lookbook + items (cleanup). */
+/** Delete lookbook + items (cleanup). MERCHANT-ONLY. */
 export const deleteLookbook = mutation({
-  args: { id: v.id("lookbooks") },
-  handler: async (ctx, { id }) => {
+  args: { userId: v.id("users"), token: v.string(), id: v.id("lookbooks") },
+  handler: async (ctx, { userId, token, id }) => {
+    await requireMerchantSession(ctx, userId, token);
     // Delete all items first
     const items = await ctx.db
       .query("catalogue_items")
@@ -155,38 +167,45 @@ export const deleteLookbook = mutation({
   },
 });
 
-/** Add catalogue item. Price in paise (Integer). */
+/** Add catalogue item. Price in paise (Integer). MERCHANT-ONLY. */
 export const addCatalogueItem = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     lookbook_id: v.id("lookbooks"),
     title: v.string(),
     price: v.number(), // PAISE integer
     image_url: v.string(),
     instagram_link: v.optional(v.string()),
   },
-  handler: async (ctx, args) => {
+  handler: async (ctx, { userId, token, ...args }) => {
+    await requireMerchantSession(ctx, userId, token);
     return await ctx.db.insert("catalogue_items", args);
   },
 });
 
-/** Patch catalogue item. */
+/** Patch catalogue item. MERCHANT-ONLY. */
 export const updateCatalogueItem = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     id: v.id("catalogue_items"),
     title: v.optional(v.string()),
     price: v.optional(v.number()),
     image_url: v.optional(v.string()),
     instagram_link: v.optional(v.string()),
   },
-  handler: async (ctx, { id, ...patch }) => {
+  handler: async (ctx, { userId, token, id, ...patch }) => {
+    await requireMerchantSession(ctx, userId, token);
     await ctx.db.patch(id, patch);
   },
 });
 
-/** Delete item. */
+/** Delete item. MERCHANT-ONLY. */
 export const deleteCatalogueItem = mutation({
-  args: { id: v.id("catalogue_items") },
-  handler: async (ctx, { id }) => {
+  args: { userId: v.id("users"), token: v.string(), id: v.id("catalogue_items") },
+  handler: async (ctx, { userId, token, id }) => {
+    await requireMerchantSession(ctx, userId, token);
     await ctx.db.delete(id);
   },
 });
@@ -228,12 +247,36 @@ export const createPdfLookbook = internalMutation({
 });
 
 /**
+ * Merchant Session Lock (2026-09-01) — internal helper for generatePdfUploadUrl.
+ * Actions have no ctx.db, so requireMerchantSession (which needs ctx.db.get)
+ * cannot be called directly from an action — it is wrapped in this
+ * internalQuery and invoked via ctx.runQuery, mirroring the existing
+ * action -> internalMutation delegation pattern already used below
+ * (createPdfLookbook) for the same reason (actions lack direct DB access).
+ * Throws (via requireMerchantSession) rather than returning a boolean, so
+ * the action's runQuery call rejects and generatePdfUploadUrl never proceeds
+ * to the Blob upload for an unauthenticated/expired caller.
+ */
+export const checkMerchantSession = internalQuery({
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    return null;
+  },
+});
+
+/**
  * Gate 2 (Step B) — Upload a PDF lookbook to Vercel Blob and record it.
+ * MERCHANT-ONLY (Merchant Session Lock, 2026-09-01) — session is verified via
+ * checkMerchantSession (see above) before any Blob upload or DB write.
+ *
  * Actions (not mutations) can perform external fetches; Convex mutations
  * cannot. Reads BLOB_READ_WRITE_TOKEN from the Convex deployment's env vars,
  * same pattern as auth.ts's sendResetEmail() reading RESEND_API_KEY.
  *
  * Args:
+ *  - userId, token : merchant session credentials, verified before any
+ *                     Blob upload or DB write happens.
  *  - file      : raw file bytes (v.bytes() -> ArrayBuffer at the Convex
  *                boundary — see convex/_generated/ai/guidelines.md's binary
  *                data table; this project has no Next.js API route to do the
@@ -243,13 +286,17 @@ export const createPdfLookbook = internalMutation({
  */
 export const generatePdfUploadUrl = action({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     file: v.bytes(),
     filename: v.string(),
     lookbookName: v.string(),
   },
-  handler: async (ctx, { file, filename, lookbookName }) => {
-    const token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!token) {
+  handler: async (ctx, { userId, token, file, filename, lookbookName }) => {
+    await ctx.runQuery(internal.lookbooks.checkMerchantSession, { userId, token });
+
+    const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
+    if (!blobToken) {
       throw new Error(
         "[generatePdfUploadUrl] BLOB_READ_WRITE_TOKEN is not set in the Convex deployment environment.",
       );
@@ -259,7 +306,7 @@ export const generatePdfUploadUrl = action({
     try {
       const blob = await put(filename, file, {
         access: "public",
-        token,
+        token: blobToken,
         contentType: "application/pdf",
         addRandomSuffix: true, // avoid overwriting an existing PDF with the same filename
       });
