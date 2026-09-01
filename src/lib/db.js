@@ -474,6 +474,44 @@ export function awardPoints(customer_id, delta, reason_type, note) {
   });
 }
 
+/**
+ * Task 1, Step 9.9 — bulk CSV customer import bridge.
+ *
+ * Onboarding.jsx's CSV bulk-import previously called
+ * `convex.mutation(api.customers.bulkCreateCustomers, ...)` DIRECTLY via
+ * useConvex(), bypassing this file entirely. That call site was never wired
+ * with Merchant Session Lock args, so every real attempt threw
+ * ArgumentValidationError once Step 2 locked bulkCreateCustomers behind
+ * requireMerchantSession(userId, token) — silently swallowed by a bare
+ * `finally` with no `catch` in the component, leaving the merchant with no
+ * error message and a reset button.
+ *
+ * Fix: route the call through this bridge, following the SAME
+ * propagate-real-errors contract as awardPoints above (no swallowing
+ * .catch) — bulkCreateCustomers returns a plain
+ * { created, skipped, createdCount, skippedCount } object (no `ok` field,
+ * confirmed from convex/customers.ts), so there is no success/failure flag
+ * to branch on here; a thrown rejection (offline / not logged in / a real
+ * Convex error) is the only failure signal, and the caller's try/catch
+ * shows it to the merchant.
+ *
+ * On success, calls hydrateCustomers() (same background-refresh mechanism
+ * used elsewhere) so the local customers() cache — used by the CSV preview's
+ * duplicate-mobile detection for the NEXT import in the same session —
+ * includes the customers just created.
+ */
+export function bulkCreateCustomers(rows) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.mutation(api.customers.bulkCreateCustomers, { rows, ...session })
+    .then((res) => {
+      hydrateCustomers();
+      return res;
+    });
+}
+
 /* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */
 // Contract parity: function names mirror convex/lookbooks.ts (Step 6) so the
 // frontend surface (Catalogue.jsx) stays identical. Initial render = localStorage

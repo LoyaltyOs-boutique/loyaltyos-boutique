@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { useConvex } from 'convex/react';
-import { onboardCustomerRemote, waMessage, waDigits, getData, subscribe, customers } from '../../lib/db.js';
+import { onboardCustomerRemote, waMessage, waDigits, getData, subscribe, customers, bulkCreateCustomers } from '../../lib/db.js';
 import { COUNTRIES, BRAND } from '../../data/seed.js';
 
 const useDb = () => {
@@ -23,7 +22,6 @@ const csvToMD = (v) => {
 
 export default function Onboarding() {
   useDb(); // hydrate local customer cache so CSV preview can detect duplicates
-  const convex = useConvex(); // shared client from <ConvexProvider> in main.jsx
   const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
@@ -35,6 +33,7 @@ export default function Onboarding() {
   const [csvPreview, setCsvPreview] = useState(null); // {rows, toCreate, toSkip}
   const [bulkResult, setBulkResult] = useState(null); // {createdCount, skippedCount, skipped}
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkError, setBulkError] = useState(''); // Task 1, Step 9.9 — surfaces a real bridge rejection instead of a silent reset
   const csvRef = useRef(null);
 
   const onBulkCsv = (file) => {
@@ -56,15 +55,24 @@ export default function Onboarding() {
       const toCreate = rows.filter((row) => !row.invalid && !row.isDup).length;
       setCsvPreview({ rows, toCreate, toSkip: rows.length - toCreate });
       setBulkResult(null);
+      setBulkError('');
     };
     r.readAsText(file);
   };
 
+  // Task 1, Step 9.9 fix: this used to call convex.mutation(api.customers.bulkCreateCustomers, ...)
+  // directly via useConvex(), bypassing db.js — so it never sent the merchant
+  // session args that customers.ts's requireMerchantSession lock now requires,
+  // and the resulting ArgumentValidationError was swallowed by a bare
+  // try/finally with no catch. Now routed through the bulkCreateCustomers()
+  // bridge (src/lib/db.js), which attaches the session and re-hydrates the
+  // local customer cache on success; a real failure (offline/session/server
+  // error) is caught here and shown inline instead of silently resetting.
   const confirmBulkImport = async () => {
     if (!csvPreview) return;
     setBulkBusy(true);
+    setBulkError('');
     try {
-      const { api } = await import('../../../convex/_generated/api.js');
       const payload = csvPreview.rows
         .filter((row) => !row.invalid)
         .map((row) => ({
@@ -75,9 +83,11 @@ export default function Onboarding() {
           ...(row.city ? { city: row.city } : {}),
           ...(row.country ? { country: row.country } : {}),
         }));
-      const res = await convex.mutation(api.customers.bulkCreateCustomers, { rows: payload });
+      const res = await bulkCreateCustomers(payload);
       setBulkResult(res);
       setCsvPreview(null);
+    } catch (err) {
+      setBulkError(err?.message || 'Import failed — please try again.');
     } finally {
       setBulkBusy(false);
     }
@@ -295,6 +305,7 @@ export default function Onboarding() {
               </button>
               <button onClick={() => setCsvPreview(null)} className="btn-ghost flex-1" disabled={bulkBusy}>Cancel</button>
             </div>
+            {bulkError && <div className="text-red-600 text-xs mt-2">{bulkError}</div>}
           </div>
         )}
 
