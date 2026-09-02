@@ -610,7 +610,12 @@ function StaffNotes({ userId }) {
   );
 }
 
-function Ledger({ userId, db }) {
+// Exported (Dashboard "Recent activity" redesign) so Dashboard.jsx can reuse
+// this EXACT component — same hydratePointsHistory()/customerLedger() data
+// source and rendering — inside its own per-customer activity modal, instead
+// of duplicating this logic. Behavior/props/rendering are UNCHANGED for this
+// file's own existing "Activity ledger" tab usage below.
+export function Ledger({ userId, db }) {
   // Activity Ledger fix (2026-09-02): manual Points Tool awards/deductions
   // are written straight to Convex's points_ledger table (awardPoints), which
   // had no read path back into the UI. Pull this customer's real points

@@ -1487,6 +1487,32 @@ export function resetSettings() {
 export function customers() { return state.users.filter((u) => u.role === 'customer'); }
 export function pendingGmbReviews() { return state.reviews.filter((r) => r.platform === 'gmb' && r.status === 'pending'); }
 export function activityFeed() { return state.events.slice(0, 40); }
+
+/**
+ * Dashboard "Recent activity" redesign — one row per customer instead of
+ * one row per event. Derives purely from state.events (the same source
+ * activityFeed() already reads — a local, already-hydrated array, so no new
+ * Convex round-trip is needed): group events by userId, keep only each
+ * customer's single MOST RECENT event as that row's preview, then sort the
+ * resulting per-customer rows by that timestamp descending — so whichever
+ * customer did something most recently overall sits at the top, regardless
+ * of how many other events they have piled up underneath.
+ *
+ * The 'owner'/'system' pseudo-events (pushEvent('owner', ...) for catalogue
+ * adds / campaign dispatches) are kept as their own row — they are not tied
+ * to a real customer id, so they group under the literal 'owner' key exactly
+ * like any other id would; db.users has no 'owner' role='customer' row so
+ * Dashboard's name lookup already falls back to "Boutique" for these, same
+ * as the old flat feed did.
+ */
+export function recentActivityByCustomer() {
+  const latestByUser = new Map(); // userId -> most recent event for that user
+  for (const e of state.events) {
+    const prev = latestByUser.get(e.userId);
+    if (!prev || (e.ts || '') > (prev.ts || '')) latestByUser.set(e.userId, e);
+  }
+  return [...latestByUser.values()].sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+}
 export function customerLedger(userId) {
   const ledger = state.pointsLedger.filter((l) => l.userId === userId).map((l) => ({ ...l, kind: 'points' }));
   const orders = state.orders.filter((o) => o.userId === userId).map((o) => ({ ...o, kind: 'order' }));
