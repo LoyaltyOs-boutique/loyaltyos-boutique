@@ -84,14 +84,36 @@ function parseMD(s: string | null | undefined): [number, number] | null {
   return [month, day];
 }
 
-/** Build the set of "M-D" keys for the next `days` days (inclusive of today), with day offset. */
+/**
+ * IST fix (2026-09-02): 85 Lansdowne operates in India Standard Time
+ * (UTC+5:30), but Convex server functions always run in UTC (the V8 isolate
+ * has zero local offset — Date's getMonth()/getDate() read back UTC's
+ * calendar day, never IST's). Any time between 00:00 and 05:30 IST, IST's
+ * calendar date is already one day ahead of UTC's. A client onboarded with
+ * birthday/anniversary = "tomorrow" per the merchant's IST-timezone date
+ * picker (see mdFromDate in src/lib/db.js) would be stored correctly as that
+ * IST calendar date, but the OLD code below computed "today"/"tomorrow"
+ * from raw server UTC — so during that ~5.5-hour daily window the stored
+ * date was actually 2 days away by UTC reckoning, not 1, and silently
+ * dropped out of the days_until===1 "tomorrow" tabs (Customers.jsx).
+ * Fix: shift the UTC instant by the fixed +5:30 IST offset before reading
+ * the calendar Y/M/D, so "today" here always matches the boutique's actual
+ * local calendar day. IST has no daylight-saving, so this fixed offset is
+ * always correct (no DST edge cases to handle).
+ */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/** Build the set of "M-D" keys for the next `days` days (inclusive of today, IST calendar), with day offset. */
 function upcomingWindow(days: number, now = new Date()) {
   const keys = new Set<string>();
   const offset = new Map<string, number>();
+  // Shift the UTC instant into IST before reading Y/M/D, so "today" reflects
+  // the boutique's real local calendar day (see IST fix note above).
+  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
   for (let i = 0; i <= days; i++) {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
-    const m = d.getMonth() + 1;
-    const day = d.getDate();
+    const d = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + i));
+    const m = d.getUTCMonth() + 1;
+    const day = d.getUTCDate();
     const key = `${m}-${day}`;
     keys.add(key);
     if (!offset.has(key)) offset.set(key, i);
