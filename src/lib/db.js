@@ -1216,16 +1216,19 @@ export function submitGmbReview(userId, stars, review_text) {
   const rule = state.settings.tiers[user.tier] || state.settings.tiers.global;
   const bonus = rule.gmbPoints;
 
-  // 1. Optimistic local create
-  // points_awarded mirrors the matching state.pointsLedger "Google Review
-  // bonus" row pushed below, so the Ledger tab's review row shows the real
-  // "+N" immediately (see toLocalReview's comment for why this field exists).
-  const review = { id: uid('r'), userId, catalogueItemId: null, platform: 'gmb', stars, review_text, status: 'pending', points_awarded: bonus, createdAt: now() };
+  // 1. Optimistic local create — PENDING ONLY.
+  // Security fix (2026-09-02, Medium #2): a review must NOT credit real
+  // points or read as approved until a merchant genuinely approves it via
+  // the Reviews queue (convex/reviews.ts approveReview, merchant-session
+  // gated). points_awarded stays 0 here — matching Convex's own createReview
+  // truth (status 'pending', points_awarded 0) — so nothing is pre-stamped
+  // with the bonus amount pending customers haven't actually earned yet. The
+  // Activity Ledger's "+N" display only ever reads points_awarded once it is
+  // a real positive value stamped by approveReview, so hiding it here (via 0)
+  // is consistent with that filter, not a regression of it.
+  const review = { id: uid('r'), userId, catalogueItemId: null, platform: 'gmb', stars, review_text, status: 'pending', points_awarded: 0, createdAt: now() };
   state.reviews.unshift(review);
-  user.points += bonus;
-  state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: bonus, reason: 'Google Review bonus', createdAt: now() });
   pushEvent(userId, 'review', `${user.name} posted a Google review (${stars}★) — awaiting approval`);
-  pushEvent(userId, 'points', `${user.name} earned ${bonus} pts · Google Review bonus`);
   emit();
 
   // 2. Convex write-through
@@ -1259,15 +1262,12 @@ export function submitProductReview(userId, catalogueItemId, stars, review_text)
   const rule = state.settings.tiers[user.tier] || state.settings.tiers.global;
   const bonus = rule.productReviewPoints;
 
-  // 1. Optimistic local create
-  // points_awarded mirrors the matching state.pointsLedger "Product review"
-  // row pushed below (same reasoning as submitGmbReview above).
-  const review = { id: uid('r'), userId, catalogueItemId, platform: 'in-app', stars, review_text, status: 'approved', points_awarded: bonus, createdAt: now() };
+  // 1. Optimistic local create — PENDING ONLY (same fix + reasoning as
+  // submitGmbReview above: no pre-credited points, no fake approved status
+  // until a merchant genuinely approves via the Reviews queue).
+  const review = { id: uid('r'), userId, catalogueItemId, platform: 'in-app', stars, review_text, status: 'pending', points_awarded: 0, createdAt: now() };
   state.reviews.unshift(review);
-  user.points += bonus;
-  state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: bonus, reason: `Product review · ${item.title}`, createdAt: now() });
-  pushEvent(userId, 'review', `${user.name} reviewed ${item.title} (${stars}★)`);
-  pushEvent(userId, 'points', `${user.name} earned ${bonus} pts · Product review`);
+  pushEvent(userId, 'review', `${user.name} reviewed ${item.title} (${stars}★) — awaiting approval`);
   emit();
 
   // 2. Convex write-through
@@ -1318,8 +1318,12 @@ export function setReviewStatus(id, status) {
         client.mutation(api.reviews.approveReview, { id: convexId, ...session })
           .then((res) => {
             if (res && res.ok) {
-              // Points already awarded locally; Convex also updated user points.
-              // Refresh review from Convex to get authoritative points_awarded.
+              // Security fix (2026-09-02): points are credited for the FIRST
+              // time right here, by Convex's approveReview — nothing was
+              // pre-awarded locally at submission anymore. Refresh the review
+              // row with the authoritative points_awarded value from Convex;
+              // the customer's own state.users[...].points balance updates
+              // separately when their lookbook next syncs (toLocalCustomer).
               refreshFromConvexReview({ ...r, _id: convexId, status: 'approved', points_awarded: res.points_awarded });
             }
           })
