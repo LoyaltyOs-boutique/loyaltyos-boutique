@@ -1400,7 +1400,20 @@ export function activityFeed() { return state.events.slice(0, 40); }
 export function customerLedger(userId) {
   const ledger = state.pointsLedger.filter((l) => l.userId === userId).map((l) => ({ ...l, kind: 'points' }));
   const orders = state.orders.filter((o) => o.userId === userId).map((o) => ({ ...o, kind: 'order' }));
-  const reviews = state.reviews.filter((r) => r.userId === userId).map((r) => ({ ...r, kind: 'review' }));
+  // Activity Ledger fix (2026-09-02): only show reviews that have actually
+  // been approved. A freshly submitted review sits at points_awarded: 0
+  // until the merchant approves it (convex/reviews.ts createReview sets 0,
+  // approveReview sets the real tier-bonus value — see toLocalReview's
+  // comment in this file). Including a still-pending review here produced a
+  // useless "+0" placeholder row with no real information; the merchant
+  // already sees pending reviews in the separate Reviews approval queue
+  // (pendingGmbReviews(), rendered in Customers.jsx's "reviews" filter tab),
+  // so hiding them from this tab loses nothing — it just removes noise.
+  // Approved reviews (points_awarded > 0) are unaffected and still show
+  // their real "+N" value via the existing render logic in Customers.jsx.
+  const reviews = state.reviews
+    .filter((r) => r.userId === userId && (r.points_awarded ?? 0) > 0)
+    .map((r) => ({ ...r, kind: 'review' }));
   return [...orders, ...reviews, ...ledger].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 }
 export function derivedMetrics() {
