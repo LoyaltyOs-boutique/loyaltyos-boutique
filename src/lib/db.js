@@ -1126,6 +1126,21 @@ function mergeConvexReview(cvx, silent = false) {
   const idx = state.reviews.findIndex((r) => r.convexId === cvx._id);
   if (idx >= 0) {
     const prev = state.reviews[idx];
+    // Anti-regression guard (2026-09-02, Activity Ledger bugfix): hydrateReviews()
+    // only ever fetches PENDING rows (api.reviews.getPendingReviews, by_status
+    // index). If that fetch is still in flight (or a stale re-render calls this
+    // merge) at the same time a merchant approves/declines the SAME review, the
+    // pending-only snapshot must never be allowed to downgrade a row that local
+    // state already knows is approved/declined back to "pending" — Convex's own
+    // DB is already correct (approveReview/declineReview are atomic mutations),
+    // this is purely about not letting a stale local merge race stomp a newer
+    // local optimistic update. A review's status only ever moves pending ->
+    // approved/declined, never backwards, so skipping a pending-status incoming
+    // update when local is already resolved is always safe/correct.
+    if (prev.status !== 'pending' && cvx.status === 'pending') {
+      if (!silent) emit();
+      return true;
+    }
     // Keep local id for UI features; take authoritative fields + convexId from backend.
     state.reviews[idx] = {
       ...prev,
@@ -1143,6 +1158,21 @@ function mergeConvexReview(cvx, silent = false) {
 // Background hydrate (Step 8.2): pull reviews from Convex and merge into local state.
 // Components keep their synchronous contract — initial render = localStorage seed,
 // then emit() swaps in live Convex data.
+//
+// Bugfix (2026-09-02, Activity Ledger missing approved reviews on a genuinely
+// fresh session — e.g. new device / cleared localStorage): this used to call
+// ONLY api.reviews.getPendingReviews (by_status == "pending" index), so an
+// already-approved review with a real points_awarded value never made it into
+// state.reviews unless it happened to be approved earlier IN THIS SAME browser
+// session (where the optimistic setReviewStatus() update already put it
+// there). Fetching approved rows too — via the existing, already
+// requireMerchantSession-gated api.reviews.getReviews query (convex/reviews.ts,
+// unmodified call-site, just passing status:"approved" like the getReviews()
+// bridge function a few lines below already supports) — closes that gap with
+// no new Convex function needed. mergeConvexReview's anti-regression guard
+// (added alongside this fix) means merging these two fetches' results in
+// either sequence is always safe: an approved row is never downgraded back to
+// pending by a stale pending-only snapshot.
 let reviewsHydrating = false;
 export function hydrateReviews() {
   if (reviewsHydrating) return;
@@ -1150,21 +1180,18 @@ export function hydrateReviews() {
   const session = merchantSessionArgs();
   if (!client || !session) return;
   reviewsHydrating = true;
-  client.query(api.reviews.getPendingReviews, session)
-    .then((rows) => {
+  Promise.all([
+    client.query(api.reviews.getPendingReviews, session).catch(() => []),
+    client.query(api.reviews.getReviews, { status: 'approved', ...session }).catch(() => []),
+  ])
+    .then(([pending, approved]) => {
       reviewsHydrating = false;
-      if (!Array.isArray(rows)) return;
+      const rows = [...(Array.isArray(pending) ? pending : []), ...(Array.isArray(approved) ? approved : [])];
       let changed = false;
       for (const r of rows) changed = mergeConvexReview(r, true) || changed;
       if (changed) emit();
     })
     .catch(() => { reviewsHydrating = false; /* offline — stay on localStorage seed */ });
-}
-
-// Re-hydrate when a review mutation succeeds so the list reflects the backend immediately.
-function refreshFromConvexReview(doc) {
-  mergeConvexReview(doc);
-  return doc;
 }
 
 /** Full pending reviews from Convex (async). Falls back to [] when offline/error/no session. */
@@ -1318,21 +1345,44 @@ export function setReviewStatus(id, status) {
         client.mutation(api.reviews.approveReview, { id: convexId, ...session })
           .then((res) => {
             if (res && res.ok) {
-              // Security fix (2026-09-02): points are credited for the FIRST
-              // time right here, by Convex's approveReview — nothing was
-              // pre-awarded locally at submission anymore. Refresh the review
-              // row with the authoritative points_awarded value from Convex;
-              // the customer's own state.users[...].points balance updates
-              // separately when their lookbook next syncs (toLocalCustomer).
-              refreshFromConvexReview({ ...r, _id: convexId, status: 'approved', points_awarded: res.points_awarded });
+              // Bugfix (2026-09-02, Activity Ledger / Recent Activity not
+              // showing approved reviews): approveReview's mutation result is
+              // ONLY { ok, points_awarded } — it does NOT return the full
+              // Convex review doc (no user_id/type/text/rating/created_at).
+              // The previous code spread the LOCAL row (`r`) plus a couple of
+              // fields and routed it through refreshFromConvexReview() ->
+              // mergeConvexReview() -> toLocalReview(), which reads Convex's
+              // snake_case field names (cvx.created_at etc). Those fields were
+              // never present on that fabricated object, so
+              // `new Date(cvx.created_at).toISOString()` threw
+              // "RangeError: Invalid time value" — silently swallowed by the
+              // trailing .catch() below, meaning points_awarded was NEVER
+              // corrected past its submission-time 0. Since customerLedger()
+              // only shows reviews with points_awarded > 0 (by design, see
+              // that function's comment), the review never appeared in the
+              // Activity Ledger even though status had already flipped to
+              // "approved" locally.
+              //
+              // Fix: patch the REAL local row directly with the two fields
+              // Convex actually confirmed (status + the authoritative
+              // points_awarded) — `r` is a live reference into state.reviews
+              // (found via state.reviews.find at the top of this function),
+              // so no re-lookup or fake-doc reconstruction is needed.
+              r.status = 'approved';
+              r.points_awarded = res.points_awarded;
+              emit();
             }
           })
           .catch(() => { /* offline — local status stays */ });
       } else {
-        // declined or resolved → Convex 'declined'
+        // declined or resolved → Convex 'declined'. No points involved, so no
+        // points_awarded correction is needed here — just confirm status
+        // (already set optimistically above; re-affirming is a harmless no-op
+        // and keeps this branch parallel/readable with the approve branch).
         client.mutation(api.reviews.declineReview, { id: convexId, ...session })
           .then(() => {
-            refreshFromConvexReview({ ...r, _id: convexId, status: 'declined' });
+            r.status = 'declined';
+            emit();
           })
           .catch(() => { /* offline — local status stays */ });
       }
