@@ -442,6 +442,54 @@ export const awardPoints = mutation({
 });
 
 /**
+ * Activity Ledger fix (2026-09-02) — getPointsHistory.
+ *
+ * Bug: manual points_ledger transactions written by awardPoints (above) had
+ * NO read path back out of Convex at all — the "future task" flagged in this
+ * table's schema.ts comment. The frontend's customerLedger() (src/lib/db.js)
+ * only ever read a local-only state.pointsLedger array, which awardPoints
+ * never touches, so every manual award/deduction was invisible in the
+ * customer's Activity Ledger tab even though the write itself succeeded.
+ *
+ * Fix: a new merchant-only query reading points_ledger by customer, via the
+ * existing by_customer index (schema.ts), newest-first. Confidential
+ * financial data — locked with requireMerchantSession(userId, token), the
+ * SAME pattern as every other merchant-only query in this file (see
+ * getCustomers above) — this is a brand-new guard call-site on a brand-new
+ * function, not a modification of any existing one.
+ */
+export const getPointsHistory = query({
+  args: { customer_id: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { customer_id, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const rows = await ctx.db
+      .query("points_ledger")
+      .withIndex("by_customer", (q) => q.eq("customer_id", customer_id))
+      .order("desc")
+      .collect();
+    return rows.map((r) => ({
+      id: String(r._id),
+      userId: String(r.customer_id),
+      action: r.delta < 0 ? "redeemed" : r.reason_type === "adjustment" ? "adjustment" : "earned",
+      points: Math.abs(r.delta),
+      reason: r.note?.trim() ? r.note.trim() : reasonTypeLabel(r.reason_type),
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  },
+});
+
+/** Human-readable fallback detail text for a points_ledger row with no merchant-typed note. */
+function reasonTypeLabel(reason_type: string): string {
+  switch (reason_type) {
+    case "birthday": return "Birthday bonus";
+    case "anniversary": return "Anniversary bonus";
+    case "testimonial": return "Review bonus";
+    case "purchase": return "Purchase bonus";
+    default: return "Manual adjustment";
+  }
+}
+
+/**
  * IMPROVEMENT 4 — WhatsApp number as UNIQUE key for customers.
  * Ma'am's rule: ONE WhatsApp number = ONE customer profile — prevent
  * duplicate accounts from the same number. Convex has no native unique

@@ -7,7 +7,7 @@ import {
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
   recordMessageAction, awardPoints,
-  hydrateCustomers, hydrateReviews,
+  hydrateCustomers, hydrateReviews, hydratePointsHistory,
   clearMerchantSession,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
@@ -611,6 +611,14 @@ function StaffNotes({ userId }) {
 }
 
 function Ledger({ userId, db }) {
+  // Activity Ledger fix (2026-09-02): manual Points Tool awards/deductions
+  // are written straight to Convex's points_ledger table (awardPoints), which
+  // had no read path back into the UI. Pull this customer's real points
+  // history in the background when the tab opens — same hydrate-on-mount
+  // idea used elsewhere in this file (hydrateCustomers/hydrateReviews) —
+  // customerLedger() below then reads the merged rows synchronously like it
+  // always has, so no other render logic here changes.
+  useEffect(() => { hydratePointsHistory(userId); }, [userId]);
   const entries = customerLedger(userId);
   const icon = { order: '🛍', review: '★', earned: '✦', redeemed: '▼', adjustment: '⚙' };
   return (

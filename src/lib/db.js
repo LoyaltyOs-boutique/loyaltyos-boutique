@@ -470,8 +470,67 @@ export function awardPoints(customer_id, delta, reason_type, note) {
     ...session,
   }).then((resulting_balance) => {
     hydrateCustomers();
+    // Activity Ledger fix (2026-09-02): a manual award/deduction writes a
+    // real row to Convex's points_ledger table, but customerLedger() only
+    // reads the local state.pointsLedger array — re-pull this customer's
+    // history immediately so the Ledger tab shows the new row without
+    // needing a manual refresh (same background-refresh idea as
+    // hydrateCustomers() above, scoped to just this one customer).
+    hydratePointsHistory(customer_id);
     return resulting_balance;
   });
+}
+
+/**
+ * Activity Ledger fix (2026-09-02) — getPointsHistory bridge + hydrate.
+ *
+ * Root cause: convex/customers.ts's awardPoints mutation writes every manual
+ * points transaction to a durable points_ledger table, but NO query ever
+ * read that table back out — customerLedger() (below) only ever saw
+ * state.pointsLedger, a local array that awardPoints never touches (it's
+ * populated only by optimistic local flows like the review-bonus push in
+ * submitGmbReview/submitProductReview and the old local-only adjustPoints).
+ * So manual awards were durable in the database but never appeared in the UI.
+ *
+ * Fix: convex/customers.ts now exposes getPointsHistory (merchant-only,
+ * requireMerchantSession-gated, same pattern as every other locked query in
+ * that file). This bridge fetches it and MERGES the rows into
+ * state.pointsLedger (idempotent — matched by id, so re-hydrating never
+ * duplicates a row), the same array customerLedger() already reads for its
+ * 'points' kind rows — so the existing render logic in Customers.jsx's
+ * Ledger component needs zero changes.
+ *
+ * Called per-customer (not globally like hydrateReviews) because points
+ * history is scoped to whichever customer's Ledger tab is open — see the
+ * Ledger component's useEffect in Customers.jsx.
+ */
+const pointsHistoryHydrating = new Set(); // customer ids currently in flight — avoid duplicate concurrent fetches
+export function hydratePointsHistory(userId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session || !userId) return;
+  if (pointsHistoryHydrating.has(userId)) return;
+  pointsHistoryHydrating.add(userId);
+  client.query(api.customers.getPointsHistory, { customer_id: convexUserId(userId), ...session })
+    .then((rows) => {
+      pointsHistoryHydrating.delete(userId);
+      if (!Array.isArray(rows)) return;
+      let changed = false;
+      for (const r of rows) {
+        const idx = state.pointsLedger.findIndex((l) => l.id === r.id);
+        if (idx >= 0) {
+          if (JSON.stringify(state.pointsLedger[idx]) !== JSON.stringify(r)) {
+            state.pointsLedger[idx] = r;
+            changed = true;
+          }
+        } else {
+          state.pointsLedger.push(r);
+          changed = true;
+        }
+      }
+      if (changed) emit();
+    })
+    .catch(() => { pointsHistoryHydrating.delete(userId); /* offline — stay on whatever local rows exist */ });
 }
 
 /**
