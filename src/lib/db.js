@@ -1585,6 +1585,23 @@ export async function onboardCustomerRemote(f) {
       location: { city: f.city || '', country: f.country || 'India' },
     });
     if (!synced) return createLocalCustomer(f);
+
+    // BUG FIX: the onboarding form's "Staff note (optional)" field (f.note)
+    // used to be silently dropped here — createCustomer's Convex args have no
+    // note field, so it never reached the database, and the CRM's Staff Notes
+    // tab showed "No private notes yet" even when a note was typed at
+    // onboarding time. Reuse the EXISTING, already-working addStaffNote
+    // bridge (same one the CRM's own "Add Note" button calls) as a SECOND
+    // call right after customer creation succeeds — this keeps createCustomer
+    // (a public, unguarded function reachable from /join) untouched, and
+    // writes the note in the exact same { text, date/ts, author } shape the
+    // Staff Notes tab already renders. Only fires when a note was actually
+    // typed; a brand-new customer (only-just synced) always has an empty
+    // local staff_notes array, so no merge/duplicate-check is needed here.
+    if (f.note && f.note.trim()) {
+      addStaffNote(synced.id, f.note.trim(), 'Onboarding');
+    }
+
     return {
       user: synced,
       magicLink: `/lookbook?id=${linkRes.user.id}&token=${linkRes.token}`,
