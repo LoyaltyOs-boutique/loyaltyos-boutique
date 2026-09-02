@@ -819,6 +819,7 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
     instagram_link: instagram_link || '',
     source: source || 'manual',
     likes: 0,
+    likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
     lookbook_id
   };
   state.catalogueItems.unshift(item);
@@ -917,6 +918,7 @@ export function hydrateCatalogue() {
             instagram_link: i.instagram_link || '',
             source: lb.source || 'manual',
             likes: 0,
+            likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
             lookbook_id: lb._id
           })));
         }
@@ -931,12 +933,37 @@ export function hydrateCatalogue() {
 }
 
 /* ---------- Customer actions ---------- */
+// Like/unlike TOGGLE (bug fix — 2026-09-02): previously this was a bare
+// counter increment with no per-customer uniqueness, so N clicks by the SAME
+// customer on the SAME item created N separate activity-feed rows and
+// inflated the "X loved" badge by N (see Lookbook.jsx bug report — "Taposi
+// liked Fancy dress" appeared 9x with the same timestamp). Fixed by keying
+// state on the (customer, item) pair via item.likedBy: a customer's first
+// like adds them to likedBy (count++, ONE activity event) and their SECOND
+// click on the same item un-likes it (removes them, count--, no new event —
+// unlike is a state change, not a "liked" action, so it should not spam the
+// merchant feed). Re-liking after an unlike is a fresh "first like" again
+// and creates exactly one new event, matching the toggle mental model.
 export function likeItem(userId, itemId) {
   const item = state.catalogueItems.find((i) => i.id === itemId);
   const user = state.users.find((u) => u.id === userId);
   if (!item || !user) return;
-  item.likes = (item.likes || 0) + 1;
-  pushEvent(userId, 'like', `${user.name} liked ${item.title} ♥`);
+
+  // Migrate legacy items (seeded before this fix) that have no likedBy array yet.
+  if (!Array.isArray(item.likedBy)) item.likedBy = [];
+
+  const alreadyLiked = item.likedBy.includes(userId);
+  if (alreadyLiked) {
+    // Unlike: remove this customer, decrement counter. No new feed event —
+    // removing a like is not something the merchant needs to be notified of.
+    item.likedBy = item.likedBy.filter((id) => id !== userId);
+    item.likes = Math.max(0, (item.likes || 0) - 1);
+  } else {
+    // First like from this customer for this item: record + notify once.
+    item.likedBy.push(userId);
+    item.likes = (item.likes || 0) + 1;
+    pushEvent(userId, 'like', `${user.name} liked ${item.title} ♥`);
+  }
   emit();
 }
 export function adjustPoints(userId, delta, reason) {
