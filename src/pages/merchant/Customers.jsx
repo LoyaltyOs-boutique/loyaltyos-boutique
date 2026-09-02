@@ -626,7 +626,23 @@ function Ledger({ userId, db }) {
                 {e.kind === 'order' ? `Order · ${e.items?.[0]?.title || 'lookbook'} · ${e.paymentMethod === 'online' ? 'paid online' : 'reserved'} ${inr(e.finalTotal)}` : e.kind === 'review' ? `Review · ${e.platform === 'gmb' ? 'Google' : 'product'} ${e.stars}★` : `${e.reason}`}
               </td>
               <td className={cls('text-right font-medium whitespace-nowrap', e.kind === 'order' ? '' : e.action === 'redeemed' ? 'text-steel' : 'text-gold')}>
-                {e.kind === 'order' ? inr(e.finalTotal) : `${e.action === 'redeemed' ? '−' : '+'}${e.points}`}
+                {e.kind === 'order'
+                  ? inr(e.finalTotal)
+                  // 'review' entries are a separate record from their matching points
+                  // transaction (state.reviews rows never carry a `points`/`action`
+                  // field — that lives on a SEPARATE 'points' kind entry, e.g. "Google
+                  // Review bonus" +400, pushed to state.pointsLedger at submission
+                  // time). points_awarded is the authoritative linked value: Convex
+                  // sets it to 0 at createReview and to the real tier-rule amount at
+                  // approveReview (convex/reviews.ts), and db.js's toLocalReview /
+                  // submitGmbReview / submitProductReview all carry it onto the local
+                  // row (see their comments). Reviews never carry a negative award in
+                  // this codebase — points_awarded only ever comes from tier bonus
+                  // rules — so this always renders "+N"; a pending review not yet
+                  // approved (or an old row predating this field) shows "+0".
+                  : e.kind === 'review'
+                  ? `+${e.points_awarded ?? 0}`
+                  : `${e.action === 'redeemed' ? '−' : '+'}${e.points}`}
               </td>
             </tr>
           ))}

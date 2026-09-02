@@ -1021,6 +1021,13 @@ function toLocalReview(cvx) {
     stars: cvx.rating ?? 5,
     review_text: cvx.text,
     status: cvx.status,
+    // points_awarded is authoritative from Convex (convex/reviews.ts: 0 at
+    // createReview, real tier-rule value at approveReview — see schema.ts
+    // reviews.points_awarded). Carrying it through here is what lets the
+    // Ledger tab in Customers.jsx show the REAL "+N" points for a review row
+    // instead of "+undefined" (state.reviews rows never had a `points` field
+    // by design — that lives on a separate state.pointsLedger row).
+    points_awarded: cvx.points_awarded,
     createdAt: new Date(cvx.created_at).toISOString(),
   };
 }
@@ -1124,7 +1131,10 @@ export function submitGmbReview(userId, stars, review_text) {
   const bonus = rule.gmbPoints;
 
   // 1. Optimistic local create
-  const review = { id: uid('r'), userId, catalogueItemId: null, platform: 'gmb', stars, review_text, status: 'pending', createdAt: now() };
+  // points_awarded mirrors the matching state.pointsLedger "Google Review
+  // bonus" row pushed below, so the Ledger tab's review row shows the real
+  // "+N" immediately (see toLocalReview's comment for why this field exists).
+  const review = { id: uid('r'), userId, catalogueItemId: null, platform: 'gmb', stars, review_text, status: 'pending', points_awarded: bonus, createdAt: now() };
   state.reviews.unshift(review);
   user.points += bonus;
   state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: bonus, reason: 'Google Review bonus', createdAt: now() });
@@ -1164,7 +1174,9 @@ export function submitProductReview(userId, catalogueItemId, stars, review_text)
   const bonus = rule.productReviewPoints;
 
   // 1. Optimistic local create
-  const review = { id: uid('r'), userId, catalogueItemId, platform: 'in-app', stars, review_text, status: 'approved', createdAt: now() };
+  // points_awarded mirrors the matching state.pointsLedger "Product review"
+  // row pushed below (same reasoning as submitGmbReview above).
+  const review = { id: uid('r'), userId, catalogueItemId, platform: 'in-app', stars, review_text, status: 'approved', points_awarded: bonus, createdAt: now() };
   state.reviews.unshift(review);
   user.points += bonus;
   state.pointsLedger.unshift({ id: uid('l'), userId, action: 'earned', points: bonus, reason: `Product review · ${item.title}`, createdAt: now() });
