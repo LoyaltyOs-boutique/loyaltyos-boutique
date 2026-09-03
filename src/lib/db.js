@@ -305,6 +305,116 @@ function refreshFromConvexSheet(doc) {
   return doc;
 }
 
+/**
+ * Scaling Fix 1 frontend wiring (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md):
+ * server-side cursor pagination for the Customers.jsx default "all clients,
+ * A-Z" view, via getCustomersPaginated (convex/customers.ts) instead of
+ * hydrateCustomers()'s full unpaginated pull.
+ *
+ * Convex's .paginate() is cursor-based, not offset/page-number based — there
+ * is no "give me page 3 directly" call, only "give me the page that follows
+ * THIS cursor". Customers.jsx's Prev/Next footer never jumps to an arbitrary
+ * page though, so a small forward-only cursor cache is enough: cursors[i] is
+ * the cursor that PRODUCES page i (cursors[0] is always null — Convex's
+ * "start from the beginning" cursor), filled in lazily as the merchant pages
+ * forward for the first time. Paging Prev never needs a network call — the
+ * cursor for a previously-visited page index is already cached.
+ *
+ * This cache is a separate, ephemeral, UI-driven module singleton — NOT part
+ * of the persisted `state` object (unlike state.users) — a page reload always
+ * starts back at page 0, same as the existing `page` useState in Customers.jsx
+ * already resets on remount.
+ */
+const paginatedCustomers = {
+  cursors: [null], // cursors[i] = the Convex cursor that fetches page i; index 0 always starts fresh
+  rowsByPage: new Map(), // pageIndex -> merchant-shaped customer rows (already run through toLocalCustomer via mergeConvexCustomer)
+  isDoneByPage: new Map(), // pageIndex -> true once that page's fetch reports isDone (no further pages exist)
+  fetchingPage: null, // pageIndex currently in flight, or null — guards duplicate concurrent fetches
+};
+
+/**
+ * Fetch one page (0-indexed) of the A-Z customer list from Convex and merge
+ * the rows into shared state, same background-hydrate + emit() pattern as
+ * hydrateCustomers() above. Components read the result via
+ * customersPage(pageIndex) below, which stays synchronous like every other
+ * getter in this file — this function only fires the fetch and updates the
+ * cache; re-render happens through the normal subscribe()/emit() flow.
+ *
+ * Self-guards against overlapping concurrent calls (e.g. the merchant
+ * clicking Next twice fast) via `fetchingPage` — a second call for a
+ * DIFFERENT page while one is in flight still queues normally since each
+ * call only checks/sets its own page's fetch state below.
+ */
+export function hydrateCustomersPage(pageIndex, pageSize) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  // Already have this page cached — nothing to fetch (Prev after a prior Next
+  // reads straight from cache, no network round-trip).
+  if (paginatedCustomers.rowsByPage.has(pageIndex)) return;
+  // The cursor that produces this page isn't known yet (merchant jumped ahead
+  // of a page that hasn't loaded) — cannot fetch out of sequence with a pure
+  // forward cursor cache; Customers.jsx only ever asks for page-1-past-the-
+  // furthest-loaded-so-far via Next, so this should not normally trigger.
+  if (paginatedCustomers.cursors[pageIndex] === undefined) return;
+  if (paginatedCustomers.fetchingPage === pageIndex) return;
+
+  paginatedCustomers.fetchingPage = pageIndex;
+  client.query(api.customers.getCustomersPaginated, {
+    paginationOpts: { numItems: pageSize, cursor: paginatedCustomers.cursors[pageIndex] },
+    ...session,
+  })
+    .then((result) => {
+      paginatedCustomers.fetchingPage = null;
+      if (!result || !Array.isArray(result.page)) return;
+      // Merge each row into the shared state.users array (silent — one emit
+      // at the end) so every other reader of customers()/state.users stays in
+      // sync, exactly like hydrateCustomers()'s full-list merge above.
+      for (const c of result.page) mergeConvexCustomer(c, true);
+      paginatedCustomers.rowsByPage.set(pageIndex, result.page.map((c) => c.id));
+      paginatedCustomers.isDoneByPage.set(pageIndex, result.isDone);
+      if (!result.isDone) paginatedCustomers.cursors[pageIndex + 1] = result.continueCursor;
+      emit();
+    })
+    .catch(() => { paginatedCustomers.fetchingPage = null; /* offline — page stays unloaded, caller keeps showing nothing new */ });
+}
+
+/**
+ * Synchronous reader for one cached paginated page — mirrors customers()'s
+ * synchronous contract. Returns { rows, isDone, loaded } where `rows` are the
+ * full local customer objects (looked up live from state.users by id, so
+ * edits made elsewhere — e.g. the profile modal's Save — are reflected
+ * immediately without needing to re-fetch this page), `isDone` is whether
+ * this is the last page (Convex's isDone flag, undefined = not yet known),
+ * and `loaded` is false until hydrateCustomersPage(pageIndex, …) resolves at
+ * least once for this index.
+ */
+export function customersPage(pageIndex) {
+  const ids = paginatedCustomers.rowsByPage.get(pageIndex);
+  if (!ids) return { rows: [], isDone: paginatedCustomers.isDoneByPage.get(pageIndex), loaded: false };
+  const byId = new Map(state.users.map((u) => [u.id, u]));
+  return {
+    rows: ids.map((id) => byId.get(id)).filter(Boolean),
+    isDone: paginatedCustomers.isDoneByPage.get(pageIndex),
+    loaded: true,
+  };
+}
+
+/**
+ * Reset the paginated-page cache back to page 0 — called by Customers.jsx
+ * whenever it switches INTO the default paginated view (mount, or coming
+ * back from a search/filter that was using the full unpaginated list). The
+ * cursor chain is only valid for a fixed page size and a stable underlying
+ * A-Z ordering; starting over is simplest and matches the page-reset-to-0
+ * behavior already required at every mode switch.
+ */
+export function resetCustomersPageCache() {
+  paginatedCustomers.cursors = [null];
+  paginatedCustomers.rowsByPage.clear();
+  paginatedCustomers.isDoneByPage.clear();
+  paginatedCustomers.fetchingPage = null;
+}
+
 /** Full customer list from Convex (async). Falls back to [] when offline/error/no session. */
 export function getCustomers() {
   const client = getConvex();
