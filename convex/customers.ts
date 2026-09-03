@@ -264,6 +264,26 @@ async function findUpcoming(
   return hits;
 }
 
+/**
+ * Single-customer occasion check — reuses the SAME upcomingWindow() date-math
+ * that powers findUpcoming()'s Delight Queue (birthdays/anniversaries) list,
+ * but for exactly one customer's raw birthday/anniversary string instead of
+ * scanning/filtering a whole table. Returns the days-until (0..days) if the
+ * given "M-D"/"MM-DD" string falls within the window, or null otherwise.
+ *
+ * Factored out so getCustomerIntelligenceProfile (below) can determine ONE
+ * customer's upcoming-occasion status without duplicating the window-building
+ * logic in upcomingWindow()/findUpcoming().
+ */
+function checkUpcoming(raw: string | null | undefined, days: number): number | null {
+  const parsed = parseMD(raw);
+  if (!parsed) return null;
+  const { keys, offset } = upcomingWindow(Math.max(0, Math.floor(days)));
+  const key = `${parsed[0]}-${parsed[1]}`;
+  if (!keys.has(key)) return null;
+  return offset.get(key) ?? 0;
+}
+
 /** All customers — merchant CRM list view (all fields, no auth secrets). */
 export const getCustomers = query({
   args: { userId: v.id("users"), token: v.string() },
@@ -838,6 +858,110 @@ export const bulkCreateCustomers = mutation({
       skipped,
       createdCount: created.length,
       skippedCount: skipped.length,
+    };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-04-phase1-customer-intelligence-design.md
+ * Addendum 2026-09-04 (cart/likes deferred — out of scope, see bottom of spec).
+ *
+ * getCustomerIntelligenceProfile — Phase 1 "Customer Intelligence Foundation".
+ * Combines three data paths that ALREADY exist and are indexed (no new
+ * scanning/joins invented here) into one call, so future AI features (draft
+ * generation, personalization) don't have to re-assemble the same joins:
+ *
+ *   1. Core customer row       — same safe projection as getCustomerById
+ *                                 (toMerchantCustomer; measurements/staff_notes
+ *                                 stay merchant-only, same as today).
+ *   2. Full order history      — same rows/shape as getOrdersByUser, via the
+ *                                 existing by_user index. Not truncated.
+ *   3. Full points ledger      — same rows/shape as getPointsHistory, via the
+ *                                 existing by_customer index. Not truncated.
+ *   4. upcoming_occasion       — reuses checkUpcoming() (which itself reuses
+ *                                 upcomingWindow(), the SAME date-window math
+ *                                 that drives the Delight Queue) against this
+ *                                 one customer's birthday/anniversary — zero
+ *                                 duplicated date logic.
+ *
+ * ADDITIVE ONLY: this is a brand-new query. getCustomerById, getOrdersByUser,
+ * getPointsHistory, getUpcomingBirthdays, getUpcomingAnniversaries are all
+ * untouched — every existing call site keeps working exactly as before.
+ *
+ * Guarded with requireMerchantSession, same pattern as every other
+ * merchant-facing query in this file.
+ */
+export const getCustomerIntelligenceProfile = query({
+  args: { customerId: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { customerId, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    // 1. Core customer row — same base projection as getCustomerById, but
+    // with measurements/staff_notes stripped out (see AI-facing note below).
+    const doc = await getCustomerDoc(ctx, customerId);
+    if (!doc) return null;
+    // CONFIDENTIAL EXCLUSION: unlike getCustomerById, this profile is built to
+    // eventually feed AI features (Phase 3+, Gemini) — measurements (body-fit
+    // data) and staff_notes (private staff commentary) must never reach an AI
+    // prompt. Destructure them out immediately after the shared helper call;
+    // toMerchantCustomer itself is untouched so getCustomerById and every
+    // other caller keep returning both fields exactly as before.
+    const { measurements: _measurements, staff_notes: _staff_notes, ...customer } =
+      toMerchantCustomer(doc);
+
+    // 2. Full order history — identical query/shape to getOrdersByUser.
+    const orders = await ctx.db
+      .query("orders")
+      .withIndex("by_user", (q) => q.eq("user_id", customerId))
+      .order("desc")
+      .collect();
+
+    // 3. Full points ledger history — identical query + row-mapping to
+    // getPointsHistory (same field names/derivation, kept in sync manually
+    // since it's a small, stable projection — see getPointsHistory above).
+    const ledgerRows = await ctx.db
+      .query("points_ledger")
+      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .order("desc")
+      .collect();
+    const points_history = ledgerRows.map((r) => ({
+      id: String(r._id),
+      userId: String(r.customer_id),
+      action: r.delta < 0 ? "redeemed" : r.reason_type === "adjustment" ? "adjustment" : "earned",
+      points: Math.abs(r.delta),
+      reason: r.note?.trim() ? r.note.trim() : reasonTypeLabel(r.reason_type),
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+
+    // 4. Upcoming occasion (next 7 days) — reuses the SAME window logic as
+    // the Delight Queue via checkUpcoming(), just scoped to this one customer.
+    const OCCASION_WINDOW_DAYS = 7;
+    const birthdayDays = checkUpcoming(doc.birthday, OCCASION_WINDOW_DAYS);
+    const anniversaryDays = checkUpcoming(doc.anniversary, OCCASION_WINDOW_DAYS);
+
+    // Judgment call: if BOTH fall within the window for the same customer
+    // (rare, but possible), surface whichever is sooner — a single merchant-
+    // facing "what's coming up" signal is simpler to consume than an array,
+    // and "soonest" is the one that's actually time-sensitive/actionable
+    // first. A tie (identical days_until) resolves to birthday, since that's
+    // the flow the Delight Queue tab defaults to showing first.
+    let upcoming_occasion: { type: "birthday" | "anniversary"; days_until: number } | null = null;
+    if (birthdayDays !== null && anniversaryDays !== null) {
+      upcoming_occasion =
+        anniversaryDays < birthdayDays
+          ? { type: "anniversary", days_until: anniversaryDays }
+          : { type: "birthday", days_until: birthdayDays };
+    } else if (birthdayDays !== null) {
+      upcoming_occasion = { type: "birthday", days_until: birthdayDays };
+    } else if (anniversaryDays !== null) {
+      upcoming_occasion = { type: "anniversary", days_until: anniversaryDays };
+    }
+
+    return {
+      customer,
+      orders,
+      points_history,
+      upcoming_occasion,
     };
   },
 });
