@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   getData, subscribe, customers, customerLedger, addStaffNote,
@@ -8,6 +8,7 @@ import {
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
   recordMessageAction, awardPoints,
   hydrateCustomers, hydrateReviews, hydratePointsHistory,
+  hydrateCustomersPage, customersPage, resetCustomersPageCache,
   clearMerchantSession,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
@@ -62,6 +63,37 @@ export default function Customers() {
   // subscribe() picks up to re-render. Both self-guard via their own
   // hydrating flags, so rapid navigate-away-and-back never double-fetches.
   useEffect(() => { hydrateCustomers(); hydrateReviews(); }, []);
+
+  // Scaling Fix 1 wiring (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md):
+  // smart hybrid pagination. "Default view" — no search text typed AND no
+  // birthday/anniversary/reviews tab selected, i.e. the plain "all clients,
+  // A-Z" list — fetches just the current page's 6 rows straight from Convex
+  // via getCustomersPaginated, instead of pulling every customer up front.
+  // The moment a search query is typed or any other tab is picked, the list
+  // below falls back to today's full customers() pull + client-side filter +
+  // client-side slice, completely unchanged from before this task.
+  const isDefaultView = filter === 'all' && !q.trim();
+
+  // Mode switch (default <-> search/filter, in either direction) always resets
+  // to page 0 — the two modes' page N mean completely different things (a
+  // Convex cursor position vs. an index into a client-filtered array), so a
+  // stale page number from one mode is meaningless in the other. Also clears
+  // the cursor cache on entering default view so a fresh A-Z walk starts from
+  // the real first page rather than reusing cursors from a previous visit.
+  const wasDefaultView = useRef(isDefaultView);
+  useEffect(() => {
+    if (wasDefaultView.current !== isDefaultView) {
+      wasDefaultView.current = isDefaultView;
+      setPage(0);
+      if (isDefaultView) resetCustomersPageCache();
+    }
+  }, [isDefaultView]);
+
+  // Default view only: fetch (or read from cache) the current page whenever
+  // the merchant moves Prev/Next. No-op while a search/filter is active.
+  useEffect(() => {
+    if (isDefaultView) hydrateCustomersPage(page, PAGE);
+  }, [isDefaultView, page]);
 
   // Approval modal (Birthdays tomorrow / Anniversaries tomorrow "Approve &
   // Send" flow) — the merchant-configured promo copy (discount/coupon/valid
@@ -146,6 +178,16 @@ export default function Customers() {
   const withLocalShape = (row) => customers().find((u) => u.id === row._id) || { ...row, id: row._id };
 
   const list = useMemo(() => {
+    // Default view (no search, "All clients" tab): the ROWS shown come from
+    // the paginated cache below (hydrateCustomersPage/customersPage), not
+    // from slicing this array — `rows` is overridden in the paginated branch
+    // further down. `list` itself is only kept here for its .length, used by
+    // the footer's "Showing X of Y" total. hydrateCustomers() still runs
+    // unconditionally on mount (effect above, pre-existing/unchanged), so
+    // customers() already reflects the true full count without this view
+    // triggering its own extra full-list fetch.
+    if (isDefaultView) return customers();
+
     // "Tomorrow" tabs read from the separate Convex-fetched days_until state
     // (not the local customers() array) — see the fetch-on-mount effect
     // above. All other tabs are completely unchanged below.
@@ -158,11 +200,29 @@ export default function Customers() {
     else if (query.startsWith('a:')) { const md = query.slice(2); l = l.filter((c) => c.anniversary === md); }
     else if (query) l = l.filter((c) => (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query));
     return l;
-  }, [db, q, filter, tomorrowBirthdays, tomorrowAnniversaries]);
+  }, [db, q, filter, tomorrowBirthdays, tomorrowAnniversaries, isDefaultView]);
 
-  const pages = Math.max(1, Math.ceil(list.length / PAGE));
-  const safePage = Math.min(page, pages - 1);
-  const rows = list.slice(safePage * PAGE, safePage * PAGE + PAGE);
+  // Paginated (default-view) mode reads the current page straight from the
+  // db.js cache populated by hydrateCustomersPage above — real server-side
+  // pagination, 6 rows fetched at a time instead of the full list. Search/
+  // filter mode keeps slicing the full `list` client-side exactly as before
+  // this task — zero behavior change on that path.
+  const currentPage = isDefaultView ? customersPage(page) : null;
+  // Default view: list.length (= customers(), the background-hydrated full
+  // count) gives the normal Math.ceil page total once it has caught up, same
+  // formula as the search/filter branch below. Convex's own isDone flag for
+  // the currently loaded page is the authoritative "is there a next page"
+  // signal though (it can be ahead of a not-yet-finished background count),
+  // so it floors/raises the estimate to stay consistent with what Next/Prev
+  // will actually do: never fewer pages than the one already on screen, and
+  // never claim a next page exists once Convex has reported isDone === true.
+  const pages = isDefaultView
+    ? (currentPage.isDone === false
+        ? Math.max(page + 2, Math.ceil(list.length / PAGE))
+        : Math.max(1, page + 1))
+    : Math.max(1, Math.ceil(list.length / PAGE));
+  const safePage = isDefaultView ? page : Math.min(page, pages - 1);
+  const rows = isDefaultView ? currentPage.rows : list.slice(safePage * PAGE, safePage * PAGE + PAGE);
   const pending = pendingGmbReviews();
   const active = selected ? db.users.find((u) => u.id === selected) : null;
 

@@ -40,9 +40,27 @@ export default defineSchema({
     session_expiry: v.optional(v.number()), // epoch ms — merchant session expiry (7 days)
     role: v.union(v.literal("customer"), v.literal("merchant")),
     name: v.string(),
+    // Scaling Fix 1 — lowercased mirror of `name`, kept in sync on every name
+    // write (createCustomer / bulkCreateCustomers / updateCustomerProfile).
+    // The `by_role_name_lower` index sorts on this so getCustomersPaginated
+    // streams customers in the SAME case-insensitive A-Z order that
+    // getCustomers produces in-memory via localeCompare. Optional at the type
+    // level for schema flexibility; in practice every customer row carries it,
+    // since all name write-paths keep it current.
+    name_lower: v.optional(v.string()),
     points: v.optional(v.number()), // default 0 — treat missing as 0 in app code (Convex has no field defaults)
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
+    // Scaling Fix 3 — zero-padded "MM-DD" mirrors of birthday/anniversary,
+    // kept in sync on every write (createCustomer / bulkCreateCustomers /
+    // updateCustomerProfile). birthday/anniversary above allow both "8-1"
+    // and "08-01" for the same real date (parseMD's regex accepts both),
+    // which sorts incorrectly and inconsistently in a raw string index.
+    // These _md fields always store the zero-padded form, so the
+    // by_role_birthday_md / by_role_anniversary_md indexes below can range-read
+    // the "next N days" window directly instead of scanning every customer row.
+    birthday_md: v.optional(v.string()),
+    anniversary_md: v.optional(v.string()),
     tier: v.optional(
       v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     ),
@@ -71,7 +89,21 @@ export default defineSchema({
     .index("by_mobile", ["mobile"]) // Billing Desk phone lookup; duplicate mobile = unique in app logic
     .index("by_email", ["email"]) // merchant login + forgot-password lookup (PRD §3.1)
     .index("by_magic_token", ["magic_token"]) // magic-link validation (PRD §3.2)
-    .index("by_tier", ["tier"]), // campaign segmentation by loyalty tier
+    .index("by_tier", ["tier"]) // campaign segmentation by loyalty tier
+    // Scaling Fix 1 — sorted pagination for the CRM customer list. Equality on
+    // `role` + range on `name_lower` lets getCustomersPaginated stream
+    // customers in case-insensitive A-Z order (matching getCustomers'
+    // in-memory localeCompare sort) without a full-table .collect() + .sort().
+    // Indexing on `name_lower` (not `name`) is required: Convex indexes sort by
+    // raw byte order (all uppercase before any lowercase), which would NOT
+    // match getCustomers' case-insensitive localeCompare ordering.
+    .index("by_role_name_lower", ["role", "name_lower"])
+    // Scaling Fix 3 — same shape as by_role_name_lower: equality on `role` +
+    // range on the zero-padded _md mirror lets findUpcoming (customers.ts)
+    // fetch the "next N days" birthday/anniversary window via an indexed
+    // range read instead of a full-table scan + per-row parseMD().
+    .index("by_role_birthday_md", ["role", "birthday_md"])
+    .index("by_role_anniversary_md", ["role", "anniversary_md"]),
 
   /** PRD §6 Table `lookbooks` — designer collection groups. */
   lookbooks: defineTable({
@@ -119,7 +151,14 @@ export default defineSchema({
     final_total: v.number(), // PAISE
     points_earned: v.number(), // earnForAmount(subtotal) × tier multiplier, floored
     created_at: v.number(),
-  }).index("by_user", ["user_id"]),
+  })
+    .index("by_user", ["user_id"])
+    // Scaling Fix 2 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md
+    // Addendum 2026-09-04) — lets getTodayOrdersInternal range-read orders
+    // created_at >= startOfToday via .withIndex(...) instead of a full-table
+    // .filter() scan. created_at is a required, always-populated v.number()
+    // epoch-ms timestamp (Date.now() at insert), so no backfill is needed.
+    .index("by_created_at", ["created_at"]),
 
   /** PRD §6 Table `campaigns` — WhatsApp broadcast + creative flyer campaigns. */
   campaigns: defineTable({
