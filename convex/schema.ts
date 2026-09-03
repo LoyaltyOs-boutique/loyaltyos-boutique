@@ -44,9 +44,9 @@ export default defineSchema({
     // write (createCustomer / bulkCreateCustomers / updateCustomerProfile).
     // The `by_role_name_lower` index sorts on this so getCustomersPaginated
     // streams customers in the SAME case-insensitive A-Z order that
-    // getCustomers produces in-memory via localeCompare. Optional because
-    // pre-backfill rows don't have it (see backfillNameLower); missing values
-    // sort first, then are populated by the one-off backfill.
+    // getCustomers produces in-memory via localeCompare. Optional at the type
+    // level for schema flexibility; in practice every customer row carries it,
+    // since all name write-paths keep it current.
     name_lower: v.optional(v.string()),
     points: v.optional(v.number()), // default 0 — treat missing as 0 in app code (Convex has no field defaults)
     birthday: v.optional(v.string()),
