@@ -1,5 +1,6 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
 
@@ -197,6 +198,45 @@ export const getCustomers = query({
   },
 });
 
+/**
+ * Scaling Fix 1 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md):
+ * cursor-paginated customer list for the CRM view.
+ *
+ * getCustomers (above) collects the WHOLE users table on every load even
+ * though the Customers.jsx grid only shows 6 rows at a time — an O(n) full
+ * pull that degrades as the boutique's customer base grows. This function is
+ * the paginated equivalent: SAME underlying query (users, role="customer"
+ * filter) but returns one cursor page via Convex's built-in .paginate()
+ * instead of .collect(), so the frontend can fetch pages on demand.
+ *
+ * Added as a NEW function so the live getCustomers path is untouched — the
+ * frontend switch-over to this is a separate, later task.
+ *
+ * Merchant-only: guarded with requireMerchantSession(userId, token), the
+ * SAME auth pattern as getCustomers. Returns Convex's native paginated shape
+ * { page, isDone, continueCursor }; each page row is projected through
+ * toMerchantCustomer (no auth secrets, confidential fields merchant-only).
+ */
+export const getCustomersPaginated = query({
+  args: {
+    paginationOpts: paginationOptsValidator,
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { paginationOpts, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const result = await ctx.db
+      .query("users")
+      .withIndex("by_role_name_lower", (q) => q.eq("role", "customer"))
+      .order("asc")
+      .paginate(paginationOpts);
+    return {
+      ...result,
+      page: result.page.map(toMerchantCustomer),
+    };
+  },
+});
+
 /** Full customer profile by _id — measurements + staff_notes (merchant-only). */
 export const getCustomerById = query({
   args: { id: v.id("users"), userId: v.id("users"), token: v.string() },
@@ -295,7 +335,11 @@ export const updateCustomerProfile = mutation({
     const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const update: any = {};
-    if (patch.name !== undefined) update.name = patch.name.trim();
+    if (patch.name !== undefined) {
+      update.name = patch.name.trim();
+      // Keep the sort mirror in sync (Scaling Fix 1) — same trim as `name`.
+      update.name_lower = update.name.toLowerCase();
+    }
     if (patch.birthday !== undefined) update.birthday = patch.birthday.trim();
     if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
     if (patch.tier !== undefined) update.tier = patch.tier;
@@ -604,6 +648,7 @@ export const createCustomer = mutation({
     const id = await ctx.db.insert("users", {
       mobile: normalized,
       name: customerName,
+      name_lower: customerName.toLowerCase(), // Scaling Fix 1 — sort mirror
       role: "customer",
       points: 0,
       tier: "silver",
@@ -685,6 +730,7 @@ export const bulkCreateCustomers = mutation({
       const id = await ctx.db.insert("users", {
         mobile: digits,
         name: customerName,
+        name_lower: customerName.toLowerCase(), // Scaling Fix 1 — sort mirror
         role: "customer",
         points: 0,
         tier: "silver",

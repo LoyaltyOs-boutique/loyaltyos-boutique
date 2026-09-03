@@ -40,6 +40,14 @@ export default defineSchema({
     session_expiry: v.optional(v.number()), // epoch ms — merchant session expiry (7 days)
     role: v.union(v.literal("customer"), v.literal("merchant")),
     name: v.string(),
+    // Scaling Fix 1 — lowercased mirror of `name`, kept in sync on every name
+    // write (createCustomer / bulkCreateCustomers / updateCustomerProfile).
+    // The `by_role_name_lower` index sorts on this so getCustomersPaginated
+    // streams customers in the SAME case-insensitive A-Z order that
+    // getCustomers produces in-memory via localeCompare. Optional because
+    // pre-backfill rows don't have it (see backfillNameLower); missing values
+    // sort first, then are populated by the one-off backfill.
+    name_lower: v.optional(v.string()),
     points: v.optional(v.number()), // default 0 — treat missing as 0 in app code (Convex has no field defaults)
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
@@ -71,7 +79,15 @@ export default defineSchema({
     .index("by_mobile", ["mobile"]) // Billing Desk phone lookup; duplicate mobile = unique in app logic
     .index("by_email", ["email"]) // merchant login + forgot-password lookup (PRD §3.1)
     .index("by_magic_token", ["magic_token"]) // magic-link validation (PRD §3.2)
-    .index("by_tier", ["tier"]), // campaign segmentation by loyalty tier
+    .index("by_tier", ["tier"]) // campaign segmentation by loyalty tier
+    // Scaling Fix 1 — sorted pagination for the CRM customer list. Equality on
+    // `role` + range on `name_lower` lets getCustomersPaginated stream
+    // customers in case-insensitive A-Z order (matching getCustomers'
+    // in-memory localeCompare sort) without a full-table .collect() + .sort().
+    // Indexing on `name_lower` (not `name`) is required: Convex indexes sort by
+    // raw byte order (all uppercase before any lowercase), which would NOT
+    // match getCustomers' case-insensitive localeCompare ordering.
+    .index("by_role_name_lower", ["role", "name_lower"]),
 
   /** PRD §6 Table `lookbooks` — designer collection groups. */
   lookbooks: defineTable({
