@@ -86,6 +86,20 @@ function parseMD(s: string | null | undefined): [number, number] | null {
 }
 
 /**
+ * Scaling Fix 3 — normalize a birthday/anniversary string to zero-padded
+ * "MM-DD" (e.g. "8-1" and "08-01" both become "08-01"), for storage in the
+ * birthday_md/anniversary_md sort-mirror fields. Returns undefined when the
+ * input is missing/unparseable, so callers can spread it away (never write
+ * an explicit undefined field into Convex).
+ */
+function toMD(s: string | null | undefined): string | undefined {
+  const parsed = parseMD(s);
+  if (!parsed) return undefined;
+  const [month, day] = parsed;
+  return `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/**
  * IST fix (2026-09-02): 85 Lansdowne operates in India Standard Time
  * (UTC+5:30), but Convex server functions always run in UTC (the V8 isolate
  * has zero local offset — Date's getMonth()/getDate() read back UTC's
@@ -120,6 +134,39 @@ function upcomingWindow(days: number, now = new Date()) {
     if (!offset.has(key)) offset.set(key, i);
   }
   return { keys, offset };
+}
+
+/**
+ * Scaling Fix 3 — the zero-padded "MM-DD" range(s) covering the same window
+ * upcomingWindow() describes (today..today+days, IST calendar, inclusive),
+ * for use as index-range bounds against birthday_md/anniversary_md.
+ *
+ * Returns ONE range [todayMD, endMD] when the window stays within the same
+ * calendar year, or TWO ranges when it crosses year-end: [todayMD, "12-31"]
+ * and ["01-01", wrappedEndMD]. Callers run one .withIndex(...) query per
+ * range and merge the results — a single range query cannot express "wraps
+ * past Dec 31 back to Jan 1" because index ranges are contiguous.
+ */
+function upcomingMDRanges(days: number, now = new Date()): Array<[string, string]> {
+  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
+  const startDay = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+  const endDay = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + days));
+
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const toMDKey = (d: Date) => `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+
+  const startMD = toMDKey(startDay);
+  const endMD = toMDKey(endDay);
+
+  if (startDay.getUTCFullYear() === endDay.getUTCFullYear()) {
+    // Same calendar year — one contiguous range.
+    return [[startMD, endMD]];
+  }
+  // Crosses year-end — two contiguous ranges: today..Dec 31, and Jan 1..wrapped end.
+  return [
+    [startMD, "12-31"],
+    ["01-01", endMD],
+  ];
 }
 
 interface QueueHit {
@@ -158,24 +205,58 @@ async function hasDecidedAction(
  *
  * Excludes any customer already decided (sent/cancelled) for that exact
  * occasion_date via message_actions — see hasDecidedAction above.
+ *
+ * Scaling Fix 3 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md
+ * Addendum 2026-09-04): previously scanned EVERY customer row and parsed
+ * their raw birthday/anniversary string one by one. Now runs one or two
+ * indexed range reads on birthday_md/anniversary_md (via
+ * by_role_birthday_md / by_role_anniversary_md) covering exactly the
+ * requested window — only customers whose occasion falls in-window are
+ * fetched from the database at all. Two ranges are needed when the window
+ * crosses a year boundary (e.g. Dec 29 + 7 days reaches Jan 5); see
+ * upcomingMDRanges. Matching, exclusion, and sort behavior are byte-identical
+ * to the prior full-scan version — this is a fetch-strategy change only.
  */
 async function findUpcoming(
   ctx: QueryCtx,
   days: number,
   field: "birthday" | "anniversary",
 ): Promise<QueueHit[]> {
-  const customers = await ctx.db
-    .query("users")
-    .filter((q) => q.eq(q.field("role"), "customer"))
-    .collect();
-  const { keys, offset } = upcomingWindow(Math.max(0, Math.floor(days)));
+  const clampedDays = Math.max(0, Math.floor(days));
+  const { keys, offset } = upcomingWindow(clampedDays);
+  const ranges = upcomingMDRanges(clampedDays);
+
+  // Fetch one page of candidate customers per MD range (1 range in the
+  // common case, 2 when the window wraps year-end), using the matching
+  // typed index per field — Convex's index query builder needs the field
+  // name as a literal, not a dynamic string, so branch per field rather
+  // than parameterizing the index/field name.
+  const seen = new Map<string, UserDoc>();
+  for (const [lo, hi] of ranges) {
+    const rows =
+      field === "birthday"
+        ? await ctx.db
+            .query("users")
+            .withIndex("by_role_birthday_md", (q) =>
+              q.eq("role", "customer").gte("birthday_md", lo).lte("birthday_md", hi),
+            )
+            .collect()
+        : await ctx.db
+            .query("users")
+            .withIndex("by_role_anniversary_md", (q) =>
+              q.eq("role", "customer").gte("anniversary_md", lo).lte("anniversary_md", hi),
+            )
+            .collect();
+    for (const row of rows) seen.set(row._id, row);
+  }
+
   const hits: QueueHit[] = [];
-  for (const c of customers) {
+  for (const c of seen.values()) {
     const raw = field === "birthday" ? c.birthday : c.anniversary;
     const parsed = parseMD(raw);
     if (!parsed) continue;
     const key = `${parsed[0]}-${parsed[1]}`;
-    if (!keys.has(key)) continue;
+    if (!keys.has(key)) continue; // index range can include the same MM-DD across two years' worth of edge dates; keys is the exact-match filter
     if (await hasDecidedAction(ctx, c._id, field, key)) continue; // already sent/cancelled this year
     hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
   }
@@ -340,8 +421,16 @@ export const updateCustomerProfile = mutation({
       // Keep the sort mirror in sync (Scaling Fix 1) — same trim as `name`.
       update.name_lower = update.name.toLowerCase();
     }
-    if (patch.birthday !== undefined) update.birthday = patch.birthday.trim();
-    if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
+    if (patch.birthday !== undefined) {
+      update.birthday = patch.birthday.trim();
+      // Scaling Fix 3 — keep the zero-padded sort mirror in sync. A blank
+      // string clears birthday_md too (toMD returns undefined for "").
+      update.birthday_md = toMD(update.birthday);
+    }
+    if (patch.anniversary !== undefined) {
+      update.anniversary = patch.anniversary.trim();
+      update.anniversary_md = toMD(update.anniversary);
+    }
     if (patch.tier !== undefined) update.tier = patch.tier;
     if (patch.custom_tags !== undefined) update.custom_tags = patch.custom_tags.map((t: string) => t.trim()).filter(Boolean);
     await ctx.db.patch(customerId, update);
@@ -653,7 +742,9 @@ export const createCustomer = mutation({
       points: 0,
       tier: "silver",
       ...(birthday ? { birthday: birthday.trim() } : {}),
+      ...(toMD(birthday) ? { birthday_md: toMD(birthday) } : {}),
       ...(anniversary ? { anniversary: anniversary.trim() } : {}),
+      ...(toMD(anniversary) ? { anniversary_md: toMD(anniversary) } : {}),
       // Only set consent when explicitly opted in — never persist an explicit false.
       ...(whatsapp_consent ? { whatsapp_consent: true } : {}),
       custom_tags: custom_tags ?? [],
@@ -735,7 +826,9 @@ export const bulkCreateCustomers = mutation({
         points: 0,
         tier: "silver",
         ...(row.birthday ? { birthday: row.birthday.trim() } : {}),
+        ...(toMD(row.birthday) ? { birthday_md: toMD(row.birthday) } : {}),
         ...(row.anniversary ? { anniversary: row.anniversary.trim() } : {}),
+        ...(toMD(row.anniversary) ? { anniversary_md: toMD(row.anniversary) } : {}),
       });
       created.push({ id, name: customerName, mobile: digits });
     }

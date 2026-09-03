@@ -31,3 +31,18 @@ Each fix is verified with real before/after evidence: (a) a functional regressio
 
 ## Build order
 One branch (feat/scale-fixes-pre-ai) off main, 4 fixes built and tested individually within it (small chunks, same discipline as Task 1 — one fix fully tested before starting the next), then one team-tested merge to main before the AI Automation phase branch is rebased on the updated main.
+
+## Addendum 2026-09-04 — Fix 2 & Fix 3 detailed design
+
+Fix 2 (orders today query):
+- Add index .index("by_created_at", ["created_at"]) to the orders table in schema.ts.
+- Change getTodayOrdersInternal (orders.ts) to use .withIndex("by_created_at", q => q.gte("created_at", startOfToday)) instead of the current bare .query("orders").filter(...).
+- No new field, no backfill, no write-path sync needed — created_at is already a required, always-populated v.number() timestamp.
+
+Fix 3 (birthday/anniversary reminder list):
+- Add two new normalized fields to the users table: birthday_md: v.optional(v.string()) and anniversary_md: v.optional(v.string()) — always stored as zero-padded "MM-DD" (e.g. "08-10", never "8-10"), computed from the existing birthday/anniversary fields.
+- Add two new indexes: .index("by_role_birthday_md", ["role", "birthday_md"]) and .index("by_role_anniversary_md", ["role", "anniversary_md"]) on the users table, mirroring the exact shape of the existing by_role_name_lower index from Fix 1.
+- One-off backfill migration populates birthday_md/anniversary_md for all existing customer rows from their current birthday/anniversary value, applying the same zero-pad normalization used going forward. Removed from source after use, per this project's standard cleanup discipline.
+- Write-path sync: every mutation that creates or updates birthday or anniversary must also (re)compute and write the matching _md field in the same write. Find every such call site via grep before editing (createCustomer, updateCustomerProfile, bulkCreateCustomers, and any other mutation touching these fields) — do not assume the list, confirm it.
+- Query logic (findUpcoming): replace the current ctx.db.query("users").filter(...).collect() full scan with an indexed range read on birthday_md/anniversary_md. Because the requested window (days_until 0 to N) can cross the year boundary (e.g. today Dec 29, 7-day window reaches Jan 5), the query must run as ONE indexed range when the window stays within the same year, or TWO indexed ranges (today_md→"12-31" and "01-01"→wrapped_end_md) when it crosses year-end. Do not attempt to express the wraparound as a single range query — it cannot be, per the audit's own finding.
+- hasDecidedAction's message_actions exclusion check and the final days_until sort must behave identically to today — same customers excluded, same sort order. This is a performance change only, not a behavior change.
