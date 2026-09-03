@@ -1,12 +1,18 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  getData, subscribe, derivedMetrics, pendingGmbReviews, activityFeed,
+  getData, subscribe, derivedMetrics, pendingGmbReviews, recentActivityByCustomer,
   getMerchantSession, setReviewStatus,
+  hydrateCustomers, hydrateCatalogue, hydrateReviews,
 } from '../../lib/db.js';
-import { inr, greeting, first, fmtDate, fmtTime, cls } from '../../lib/util.js';
-import { Stat, Stars } from '../../components/ui.jsx';
+import { inr, greeting, first, fmtDate, timeAgo, cls } from '../../lib/util.js';
+import { Stat, Stars, Modal } from '../../components/ui.jsx';
 import { BRAND } from '../../data/seed.js';
+// Recent Activity redesign: reuse the SAME Activity Ledger component/data
+// source (customerLedger() + hydratePointsHistory()) already used by Customer
+// CRM's per-customer detail modal, instead of building a second parallel
+// implementation. Ledger is now exported from Customers.jsx for exactly this.
+import { Ledger } from './Customers.jsx';
 
 const useDb = () => {
   const [, setV] = useState(0);
@@ -27,9 +33,29 @@ export default function Dashboard() {
   const db = useDb();
   const navigate = useNavigate();
   const [me] = useState(() => getMerchantSession());
+  // Recent Activity redesign: which customer's row was clicked to open the
+  // full-history modal — null when closed, matching Customers.jsx's own
+  // `selected` (customer id) / Modal-open-when-truthy pattern.
+  const [activityUserId, setActivityUserId] = useState(null);
+
+  // hydrateCustomers()/hydrateCatalogue()/hydrateReviews() normally run once
+  // at module load — but on a genuinely fresh browser session that one-shot
+  // module-load-only hydrate races ahead of a fresh login's async session
+  // being stored, silently finds no session, and no-ops, leaving this page
+  // stuck on hardcoded seed customers/catalogue/reviews until a hard reload.
+  // Re-running them on mount here re-queries Convex once the real session
+  // exists and merges fresh rows into state, calling emit() when anything
+  // changed, which useDb()'s subscribe() picks up to re-render.
+  useEffect(() => { hydrateCustomers(); hydrateCatalogue(); hydrateReviews(); }, []);
+
   const m = derivedMetrics();
   const pending = pendingGmbReviews();
-  const feed = activityFeed();
+  // Grouped, one-row-per-customer feed (most-recent-activity-first) — see
+  // recentActivityByCustomer()'s own doc comment in db.js for the grouping
+  // rationale. activityUser resolves the clicked row's full customer record
+  // (name, id) for the modal title + Ledger's userId prop.
+  const feed = recentActivityByCustomer();
+  const activityUser = activityUserId ? db.users.find((u) => u.id === activityUserId) : null;
 
   return (
     <div className="space-y-10">
@@ -105,33 +131,52 @@ export default function Dashboard() {
         </section>
       )}
 
-      {/* Recent activity */}
+      {/* Recent activity — grouped one row per customer, most-recent-first.
+          Clicking a row opens that customer's full history (Ledger, reused
+          as-is from Customer CRM) in a modal below. */}
       <section>
         <div className="eyebrow mb-1">Live from your boutique</div>
         <h2 className="luxe-title text-2xl mb-4">Recent activity</h2>
         <div className="card overflow-x-auto">
           <table className="tbl min-w-[560px]">
             <thead>
-              <tr><th>Client</th><th>Event</th><th>When</th></tr>
+              <tr><th>Client</th><th>Latest event</th><th>When</th></tr>
             </thead>
             <tbody>
               {feed.map((e) => {
                 const a = ACTION[e.type] || ACTION.purchase;
+                const name = db.users.find((u) => u.id === e.userId)?.name || 'Boutique';
                 return (
-                  <tr key={e.id}>
+                  <tr
+                    key={e.userId}
+                    onClick={() => setActivityUserId(e.userId)}
+                    className="cursor-pointer hover:bg-mist"
+                  >
                     <td>
                       <span className={cls('inline-flex h-8 w-8 items-center justify-center border border-line text-xs mr-3', e.type === 'like' && 'text-gold')}>{a.icon}</span>
-                      <span className="font-medium text-sm">{db.users.find((u) => u.id === e.userId)?.name || 'Boutique'}</span>
+                      <span className="font-medium text-sm">{name}</span>
                     </td>
                     <td className="text-sm text-ink/75">{e.text}</td>
-                    <td className="text-xs text-steel whitespace-nowrap">{fmtDate(e.ts)} · {fmtTime(e.ts)}</td>
+                    <td className="text-xs text-steel whitespace-nowrap">{timeAgo(e.ts)}</td>
                   </tr>
                 );
               })}
+              {feed.length === 0 && (
+                <tr><td colSpan={3} className="text-sm text-steel text-center py-6">No activity yet.</td></tr>
+              )}
             </tbody>
           </table>
         </div>
       </section>
+
+      {/* Per-customer full activity history modal — SAME Ledger component/data
+          source (customerLedger() + hydratePointsHistory()) as Customer CRM's
+          own "Activity ledger" tab; that existing tab is untouched. */}
+      {activityUser && (
+        <Modal open onClose={() => setActivityUserId(null)} title={`${activityUser.name} — activity history`} wide>
+          <Ledger userId={activityUser.id} db={db} />
+        </Modal>
+      )}
     </div>
   );
 }

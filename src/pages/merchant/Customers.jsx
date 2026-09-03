@@ -7,7 +7,8 @@ import {
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
   recordMessageAction, awardPoints,
-  hydrateCustomers,
+  hydrateCustomers, hydrateReviews, hydratePointsHistory,
+  clearMerchantSession,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
 import { Modal, TierBadge, Tag, Stars, Empty } from '../../components/ui.jsx';
@@ -50,16 +51,17 @@ export default function Customers() {
     return () => { mounted = false; };
   }, []);
 
-  // Main customer list fresh-fetch on mount. customers() reads the shared
-  // module-scoped state singleton, which hydrateCustomers() populates just
-  // once at module load — so SPA navigation away from and back to this page
-  // (no hard refresh) would otherwise keep showing the last full-page-load
-  // snapshot (stale whatsapp_consent, points, tags, etc.). Re-running
-  // hydrateCustomers() on every mount re-queries Convex and merges fresh rows
+  // Main customer list + reviews tab fresh-fetch on mount. customers() and
+  // pendingGmbReviews() both read the shared module-scoped state singleton,
+  // which hydrateCustomers()/hydrateReviews() populate just once at module
+  // load — so SPA navigation away from and back to this page (no hard
+  // refresh) would otherwise keep showing the last full-page-load snapshot
+  // (stale whatsapp_consent, points, tags, pending reviews, etc.). Re-running
+  // both hydrate calls on every mount re-queries Convex and merges fresh rows
   // into state, calling emit() when anything changed, which useDb()'s
-  // subscribe() picks up to re-render. hydrateCustomers() self-guards via its
-  // crmHydrating flag, so rapid navigate-away-and-back never double-fetches.
-  useEffect(() => { hydrateCustomers(); }, []);
+  // subscribe() picks up to re-render. Both self-guard via their own
+  // hydrating flags, so rapid navigate-away-and-back never double-fetches.
+  useEffect(() => { hydrateCustomers(); hydrateReviews(); }, []);
 
   // Approval modal (Birthdays tomorrow / Anniversaries tomorrow "Approve &
   // Send" flow) — the merchant-configured promo copy (discount/coupon/valid
@@ -608,7 +610,20 @@ function StaffNotes({ userId }) {
   );
 }
 
-function Ledger({ userId, db }) {
+// Exported (Dashboard "Recent activity" redesign) so Dashboard.jsx can reuse
+// this EXACT component — same hydratePointsHistory()/customerLedger() data
+// source and rendering — inside its own per-customer activity modal, instead
+// of duplicating this logic. Behavior/props/rendering are UNCHANGED for this
+// file's own existing "Activity ledger" tab usage below.
+export function Ledger({ userId, db }) {
+  // Activity Ledger fix (2026-09-02): manual Points Tool awards/deductions
+  // are written straight to Convex's points_ledger table (awardPoints), which
+  // had no read path back into the UI. Pull this customer's real points
+  // history in the background when the tab opens — same hydrate-on-mount
+  // idea used elsewhere in this file (hydrateCustomers/hydrateReviews) —
+  // customerLedger() below then reads the merged rows synchronously like it
+  // always has, so no other render logic here changes.
+  useEffect(() => { hydratePointsHistory(userId); }, [userId]);
   const entries = customerLedger(userId);
   const icon = { order: '🛍', review: '★', earned: '✦', redeemed: '▼', adjustment: '⚙' };
   return (
@@ -624,7 +639,23 @@ function Ledger({ userId, db }) {
                 {e.kind === 'order' ? `Order · ${e.items?.[0]?.title || 'lookbook'} · ${e.paymentMethod === 'online' ? 'paid online' : 'reserved'} ${inr(e.finalTotal)}` : e.kind === 'review' ? `Review · ${e.platform === 'gmb' ? 'Google' : 'product'} ${e.stars}★` : `${e.reason}`}
               </td>
               <td className={cls('text-right font-medium whitespace-nowrap', e.kind === 'order' ? '' : e.action === 'redeemed' ? 'text-steel' : 'text-gold')}>
-                {e.kind === 'order' ? inr(e.finalTotal) : `${e.action === 'redeemed' ? '−' : '+'}${e.points}`}
+                {e.kind === 'order'
+                  ? inr(e.finalTotal)
+                  // 'review' entries are a separate record from their matching points
+                  // transaction (state.reviews rows never carry a `points`/`action`
+                  // field — that lives on a SEPARATE 'points' kind entry, e.g. "Google
+                  // Review bonus" +400, pushed to state.pointsLedger at submission
+                  // time). points_awarded is the authoritative linked value: Convex
+                  // sets it to 0 at createReview and to the real tier-rule amount at
+                  // approveReview (convex/reviews.ts), and db.js's toLocalReview /
+                  // submitGmbReview / submitProductReview all carry it onto the local
+                  // row (see their comments). Reviews never carry a negative award in
+                  // this codebase — points_awarded only ever comes from tier bonus
+                  // rules — so this always renders "+N"; a pending review not yet
+                  // approved (or an old row predating this field) shows "+0".
+                  : e.kind === 'review'
+                  ? `+${e.points_awarded ?? 0}`
+                  : `${e.action === 'redeemed' ? '−' : '+'}${e.points}`}
               </td>
             </tr>
           ))}
@@ -634,8 +665,31 @@ function Ledger({ userId, db }) {
   );
 }
 
+// Merchant Session Lock follow-up fix: a locked Convex call (e.g. awardPoints)
+// throws a ConvexError whose text is exactly one of these when
+// requireMerchantSession (convex/auth.ts) rejects the merchant's cached
+// {userId, token} — stale/rotated token (e.g. merchant logged in again in
+// another tab/device), expired 7-day session, or a deleted/demoted account.
+// getMerchantSession() only checks LOCALLY that a merchant row exists (see
+// its own comment in src/lib/db.js) — it never re-validates the token against
+// the backend, so the UI can keep showing the merchant as "logged in" while
+// every locked call 403s with one of these messages. Matching on the known
+// rejection text lets us tell that specific case apart from a real offline/
+// validation error and recover cleanly instead of dumping the raw
+// ConvexError string on screen.
+const SESSION_REJECTED_MESSAGES = ['Invalid session', 'Session expired', 'Not authenticated', 'Not authorized'];
+function isSessionRejected(err) {
+  // ConvexError reconstructs client-side with the original thrown value on
+  // `.data` (string here, per convex/auth.ts's `throw new ConvexError("...")`
+  // call sites) — check that first, then fall back to a message substring
+  // match in case of a differently-shaped rejection.
+  const text = (typeof err?.data === 'string' ? err.data : '') || err?.message || '';
+  return SESSION_REJECTED_MESSAGES.some((m) => text.includes(m));
+}
+
 function PointsTool({ userId }) {
   const db = useDb();
+  const navigate = useNavigate();
   const [delta, setDelta] = useState('');
   const [reason, setReason] = useState('');
   const [reasonType, setReasonType] = useState('normal');
@@ -648,6 +702,15 @@ function PointsTool({ userId }) {
     awardPoints(userId, sign * n, reasonType, reason.trim())
       .then(() => { setDelta(''); setReason(''); setReasonType('normal'); })
       .catch((err) => {
+        if (isSessionRejected(err)) {
+          // Stale/rotated/expired session — the local cache still says
+          // "logged in" but the backend has rejected it. Clear the stale
+          // cache and send the merchant back to /login instead of leaving
+          // them stuck on a raw ConvexError with no way to recover.
+          clearMerchantSession();
+          navigate('/login', { replace: true });
+          return;
+        }
         setPointsError(err?.message || 'Could not save this adjustment — try again.');
       });
   };

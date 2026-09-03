@@ -1,5 +1,7 @@
-import { action } from "./_generated/server";
+import { action, internalQuery } from "./_generated/server";
 import { v } from "convex/values";
+import { internal } from "./_generated/api";
+import { requireMerchantSession } from "./auth";
 
 /**
  * WhatsApp Cloud API integration — Templates section (server-side send).
@@ -93,7 +95,33 @@ async function postToGraphApi(
 }
 
 // ============================================================================
-// SECTION 2 — Actions
+// SECTION 2 — Merchant Session Lock helper
+// ============================================================================
+
+/**
+ * Merchant Session Lock (2026-09-01) — internal helper shared by both actions
+ * below. Actions have no ctx.db, so requireMerchantSession (which needs
+ * ctx.db.get) cannot be called directly from an action — it is wrapped in
+ * this internalQuery and invoked via ctx.runQuery, mirroring the identical
+ * checkMerchantSession pattern already used in convex/lookbooks.ts
+ * (generatePdfUploadUrl) and convex/templates.ts (generateTemplateMediaUploadUrl)
+ * for the same reason. One shared internalQuery here serves both
+ * sendWhatsAppTemplateMessage and sendWhatsAppServiceMessage — no need to
+ * duplicate it per-function.
+ * Throws (via requireMerchantSession) rather than returning a boolean, so the
+ * action's runQuery call rejects and the action never proceeds to the
+ * WhatsApp Graph API call for an unauthenticated/expired caller.
+ */
+export const checkMerchantSession = internalQuery({
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    return null;
+  },
+});
+
+// ============================================================================
+// SECTION 3 — Actions
 // ============================================================================
 
 /**
@@ -101,7 +129,12 @@ async function postToGraphApi(
  * outreach). Used by Templates.jsx's MomentCard (Anniversary/Birthday cards)
  * once a real template has been created & approved in WhatsApp Manager.
  *
+ * MERCHANT-ONLY (Merchant Session Lock, 2026-09-01) — session is verified via
+ * checkMerchantSession (see above) before any Graph API call.
+ *
  * Args:
+ *  - userId, token : merchant session credentials, verified before any
+ *                     WhatsApp send happens.
  *  - to           : bare 10-digit customer mobile (or already-prefixed; both
  *                    normalized via toWaPhone).
  *  - templateName : the approved template's name in WhatsApp Manager.
@@ -113,16 +146,24 @@ async function postToGraphApi(
  */
 export const sendWhatsAppTemplateMessage = action({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     to: v.string(),
     templateName: v.string(),
     languageCode: v.string(),
     imageUrl: v.optional(v.string()),
     bodyParams: v.optional(v.array(v.string())),
   },
-  handler: async (ctx, { to, templateName, languageCode, imageUrl, bodyParams }) => {
+  handler: async (ctx, { userId, token, to, templateName, languageCode, imageUrl, bodyParams }) => {
+    await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+
     // Guard-clauses — read secrets inside the handler, fail clearly if unset.
-    const token = process.env.WHATSAPP_ACCESS_TOKEN;
-    if (!token) {
+    // Renamed from `token` to `waAccessToken` — the merchant session arg above
+    // already owns the name `token` in this scope (same collision + same fix
+    // as generateTemplateMediaUploadUrl's BLOB_READ_WRITE_TOKEN var rename to
+    // `blobToken` in convex/templates.ts).
+    const waAccessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    if (!waAccessToken) {
       throw new Error(
         "[sendWhatsAppTemplateMessage] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.",
       );
@@ -164,7 +205,7 @@ export const sendWhatsAppTemplateMessage = action({
       },
     };
 
-    return postToGraphApi(phoneNumberId, token, body, "sendWhatsAppTemplateMessage");
+    return postToGraphApi(phoneNumberId, waAccessToken, body, "sendWhatsAppTemplateMessage");
   },
 });
 
@@ -172,12 +213,17 @@ export const sendWhatsAppTemplateMessage = action({
  * Send a free-form service message — only valid inside an open 24-hour
  * customer service window. Used by Templates.jsx's MediaCard (Card 3).
  *
+ * MERCHANT-ONLY (Merchant Session Lock, 2026-09-01) — session is verified via
+ * checkMerchantSession (see above) before any Graph API call.
+ *
  * Decision 1 (design spec): no session-window tracking is implemented here.
  * The action is simply called; if Meta rejects because no window is open,
  * that rejection surfaces as a normal try/catch failure and the frontend
  * falls back to the wa.me link — no new infrastructure needed.
  *
  * Args:
+ *  - userId, token : merchant session credentials, verified before any
+ *                     WhatsApp send happens.
  *  - to       : bare 10-digit customer mobile (or already-prefixed).
  *  - type     : "text" | "image" — which service-message shape to send.
  *  - text     : message body, required when type === "text".
@@ -185,15 +231,20 @@ export const sendWhatsAppTemplateMessage = action({
  */
 export const sendWhatsAppServiceMessage = action({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     to: v.string(),
     type: v.union(v.literal("text"), v.literal("image")),
     text: v.optional(v.string()),
     imageUrl: v.optional(v.string()),
   },
-  handler: async (ctx, { to, type, text, imageUrl }) => {
+  handler: async (ctx, { userId, token, to, type, text, imageUrl }) => {
+    await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+
     // Same secret-reading/guard-clause pattern as sendWhatsAppTemplateMessage.
-    const token = process.env.WHATSAPP_ACCESS_TOKEN;
-    if (!token) {
+    // Renamed from `token` to `waAccessToken` — same collision + fix as above.
+    const waAccessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    if (!waAccessToken) {
       throw new Error(
         "[sendWhatsAppServiceMessage] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.",
       );
@@ -219,6 +270,6 @@ export const sendWhatsAppServiceMessage = action({
       body.image = { link: imageUrl };
     }
 
-    return postToGraphApi(phoneNumberId, token, body, "sendWhatsAppServiceMessage");
+    return postToGraphApi(phoneNumberId, waAccessToken, body, "sendWhatsAppServiceMessage");
   },
 });

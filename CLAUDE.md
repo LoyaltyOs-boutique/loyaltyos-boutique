@@ -30,6 +30,7 @@ Frontend: React 18 + Vite + Tailwind (Ma'am's UI, luxury design gold #C5A880, in
 Backend: Convex serverless, deployment pleasant-cobra-560.eu-west-1.convex.cloud, team loyaltyos-boutique
 Database: Convex tables — users, lookbooks, catalogue_items, orders, campaigns, settings, reviews
 Auth: convex/auth.ts — bcrypt merchant login, 256-bit magic tokens, 180-day expiry, Resend reset
+Backend auth guard: merchant-only Convex functions (39 fns across customers/lookbooks/orders/reviews/settings/templates/whatsapp) now require session validation via requireMerchantSession() in convex/auth.ts — built and complete on branch feat/merchant-session-lock (commits df25962..a99837f), NOT YET merged to main. main itself does not yet have this protection: until this branch merges, any caller with the public Convex URL can still call merchant-only functions with no auth check.
 Email: Resend, from digital@mouldinnovation.com
 Deploy: Vercel (loyaltyos-boutique-three.vercel.app) + GitHub (LoyaltyOs-boutique/loyaltyos-boutique)
 Old stack (Express/Postgres/Redis/Docker) = ARCHIVED, never reintroduce.
@@ -129,7 +130,7 @@ Keep prompts small — 1-3 files max.
 
 ## 14. PHASE 1 REMAINING
 1. Step 9 - Support Tickets (check with user if required or optional - see PRD vs this file conflict)
-2. Step 10 - Final security audit + production deploy + GDPR/DPDPA basics
+2. Step 10 - Final security audit + production deploy + GDPR/DPDPA basics. NOTE: the merchant-session/auth-gap portion of this audit is already done — Task 1 (Merchant Session Lock, requireMerchantSession() guard) is complete on branch feat/merchant-session-lock (commits df25962..a99837f) but NOT YET merged to main. Remaining action for that portion is merging the branch to main; the rest of Step 10 (production deploy + GDPR/DPDPA basics) is still outstanding.
 3. Then Phase 2 planning (WhatsApp API, OTP, gamification, coupons, campaigns)
 Always ask user what to work on next - never assume.
 

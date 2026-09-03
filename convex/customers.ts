@@ -1,6 +1,7 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import type { Id } from "./_generated/dataModel";
+import { requireMerchantSession } from "./auth";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -83,14 +84,36 @@ function parseMD(s: string | null | undefined): [number, number] | null {
   return [month, day];
 }
 
-/** Build the set of "M-D" keys for the next `days` days (inclusive of today), with day offset. */
+/**
+ * IST fix (2026-09-02): 85 Lansdowne operates in India Standard Time
+ * (UTC+5:30), but Convex server functions always run in UTC (the V8 isolate
+ * has zero local offset — Date's getMonth()/getDate() read back UTC's
+ * calendar day, never IST's). Any time between 00:00 and 05:30 IST, IST's
+ * calendar date is already one day ahead of UTC's. A client onboarded with
+ * birthday/anniversary = "tomorrow" per the merchant's IST-timezone date
+ * picker (see mdFromDate in src/lib/db.js) would be stored correctly as that
+ * IST calendar date, but the OLD code below computed "today"/"tomorrow"
+ * from raw server UTC — so during that ~5.5-hour daily window the stored
+ * date was actually 2 days away by UTC reckoning, not 1, and silently
+ * dropped out of the days_until===1 "tomorrow" tabs (Customers.jsx).
+ * Fix: shift the UTC instant by the fixed +5:30 IST offset before reading
+ * the calendar Y/M/D, so "today" here always matches the boutique's actual
+ * local calendar day. IST has no daylight-saving, so this fixed offset is
+ * always correct (no DST edge cases to handle).
+ */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/** Build the set of "M-D" keys for the next `days` days (inclusive of today, IST calendar), with day offset. */
 function upcomingWindow(days: number, now = new Date()) {
   const keys = new Set<string>();
   const offset = new Map<string, number>();
+  // Shift the UTC instant into IST before reading Y/M/D, so "today" reflects
+  // the boutique's real local calendar day (see IST fix note above).
+  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
   for (let i = 0; i <= days; i++) {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
-    const m = d.getMonth() + 1;
-    const day = d.getDate();
+    const d = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + i));
+    const m = d.getUTCMonth() + 1;
+    const day = d.getUTCDate();
     const key = `${m}-${day}`;
     keys.add(key);
     if (!offset.has(key)) offset.set(key, i);
@@ -161,8 +184,9 @@ async function findUpcoming(
 
 /** All customers — merchant CRM list view (all fields, no auth secrets). */
 export const getCustomers = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const customers = await ctx.db
       .query("users")
       .filter((q) => q.eq(q.field("role"), "customer"))
@@ -175,8 +199,9 @@ export const getCustomers = query({
 
 /** Full customer profile by _id — measurements + staff_notes (merchant-only). */
 export const getCustomerById = query({
-  args: { id: v.id("users") },
-  handler: async (ctx, { id }) => {
+  args: { id: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { id, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const doc = await getCustomerDoc(ctx, id);
     return doc ? toMerchantCustomer(doc) : null;
   },
@@ -189,7 +214,7 @@ export const getCustomerById = query({
  */
 export const updateMeasurements = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     measurements: v.object({
       bust: v.optional(v.number()),
       waist: v.optional(v.number()),
@@ -197,12 +222,15 @@ export const updateMeasurements = mutation({
       height: v.optional(v.string()),
       blouse_size: v.optional(v.string()),
     }),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, measurements }) => {
-    const doc = await getCustomerDoc(ctx, userId);
+  handler: async (ctx, { customerId, measurements, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const merged = { ...(doc.measurements ?? {}), ...measurements };
-    await ctx.db.patch(userId, { measurements: merged });
+    await ctx.db.patch(customerId, { measurements: merged });
     return toMerchantCustomer({ ...doc, measurements: merged });
   },
 });
@@ -213,18 +241,21 @@ export const updateMeasurements = mutation({
  */
 export const addStaffNote = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     text: v.string(),
     author: v.optional(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, text, author }) => {
+  handler: async (ctx, { customerId, text, author, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Staff note text is required.");
-    const doc = await getCustomerDoc(ctx, userId);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const note = { text: trimmed, date: Date.now(), author: author?.trim() || "Owner" };
     const staff_notes = [...(doc.staff_notes ?? []), note];
-    await ctx.db.patch(userId, { staff_notes });
+    await ctx.db.patch(customerId, { staff_notes });
     return toMerchantCustomer({ ...doc, staff_notes });
   },
 });
@@ -232,14 +263,17 @@ export const addStaffNote = mutation({
 /** Replace a customer's custom tags (e.g. ["Hot Lead", "Saree Enthusiast"]). */
 export const updateCustomTags = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     tags: v.array(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, tags }) => {
-    const doc = await getCustomerDoc(ctx, userId);
+  handler: async (ctx, { customerId, tags, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const custom_tags = tags.map((t) => t.trim()).filter(Boolean);
-    await ctx.db.patch(userId, { custom_tags });
+    await ctx.db.patch(customerId, { custom_tags });
     return toMerchantCustomer({ ...doc, custom_tags });
   },
 });
@@ -247,15 +281,18 @@ export const updateCustomTags = mutation({
 /** Update customer profile (name, birthday, anniversary, tier). */
 export const updateCustomerProfile = mutation({
   args: {
-    userId: v.id("users"),
+    customerId: v.id("users"),
     name: v.optional(v.string()),
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
     tier: v.optional(v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum"))),
     custom_tags: v.optional(v.array(v.string())),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { userId, ...patch }) => {
-    const doc = await getCustomerDoc(ctx, userId);
+  handler: async (ctx, { customerId, userId, token, ...patch }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const update: any = {};
     if (patch.name !== undefined) update.name = patch.name.trim();
@@ -263,15 +300,16 @@ export const updateCustomerProfile = mutation({
     if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
     if (patch.tier !== undefined) update.tier = patch.tier;
     if (patch.custom_tags !== undefined) update.custom_tags = patch.custom_tags.map((t: string) => t.trim()).filter(Boolean);
-    await ctx.db.patch(userId, update);
+    await ctx.db.patch(customerId, update);
     return toMerchantCustomer({ ...doc, ...update });
   },
 });
 
 /** Delight Queue — customers with a birthday within the next `days` days. */
 export const getUpcomingBirthdays = query({
-  args: { days: v.optional(v.number()) },
-  handler: async (ctx, { days }) => {
+  args: { days: v.optional(v.number()), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { days, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const hits = await findUpcoming(ctx, days ?? 7, "birthday");
     return hits.map(({ doc, daysUntil }) => ({
       _id: doc._id,
@@ -289,8 +327,9 @@ export const getUpcomingBirthdays = query({
 
 /** Delight Queue — customers with an anniversary within the next `days` days. */
 export const getUpcomingAnniversaries = query({
-  args: { days: v.optional(v.number()) },
-  handler: async (ctx, { days }) => {
+  args: { days: v.optional(v.number()), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { days, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const hits = await findUpcoming(ctx, days ?? 7, "anniversary");
     return hits.map(({ doc, daysUntil }) => ({
       _id: doc._id,
@@ -331,8 +370,11 @@ export const recordMessageAction = mutation({
     occasion_date: v.string(),
     action: v.union(v.literal("sent"), v.literal("cancelled")),
     channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { customer_id, occasion, occasion_date, action, channel }) => {
+  handler: async (ctx, { customer_id, occasion, occasion_date, action, channel, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const doc = await getCustomerDoc(ctx, customer_id);
     if (!doc) throw new Error("Customer not found.");
 
@@ -396,8 +438,11 @@ export const awardPoints = mutation({
       v.literal("purchase"),
     ),
     note: v.optional(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { customer_id, delta, reason_type, note }) => {
+  handler: async (ctx, { customer_id, delta, reason_type, note, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const doc = await getCustomerDoc(ctx, customer_id);
     if (!doc) throw new Error("Customer not found.");
 
@@ -417,6 +462,54 @@ export const awardPoints = mutation({
     return resulting_balance;
   },
 });
+
+/**
+ * Activity Ledger fix (2026-09-02) — getPointsHistory.
+ *
+ * Bug: manual points_ledger transactions written by awardPoints (above) had
+ * NO read path back out of Convex at all — the "future task" flagged in this
+ * table's schema.ts comment. The frontend's customerLedger() (src/lib/db.js)
+ * only ever read a local-only state.pointsLedger array, which awardPoints
+ * never touches, so every manual award/deduction was invisible in the
+ * customer's Activity Ledger tab even though the write itself succeeded.
+ *
+ * Fix: a new merchant-only query reading points_ledger by customer, via the
+ * existing by_customer index (schema.ts), newest-first. Confidential
+ * financial data — locked with requireMerchantSession(userId, token), the
+ * SAME pattern as every other merchant-only query in this file (see
+ * getCustomers above) — this is a brand-new guard call-site on a brand-new
+ * function, not a modification of any existing one.
+ */
+export const getPointsHistory = query({
+  args: { customer_id: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { customer_id, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const rows = await ctx.db
+      .query("points_ledger")
+      .withIndex("by_customer", (q) => q.eq("customer_id", customer_id))
+      .order("desc")
+      .collect();
+    return rows.map((r) => ({
+      id: String(r._id),
+      userId: String(r.customer_id),
+      action: r.delta < 0 ? "redeemed" : r.reason_type === "adjustment" ? "adjustment" : "earned",
+      points: Math.abs(r.delta),
+      reason: r.note?.trim() ? r.note.trim() : reasonTypeLabel(r.reason_type),
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  },
+});
+
+/** Human-readable fallback detail text for a points_ledger row with no merchant-typed note. */
+function reasonTypeLabel(reason_type: string): string {
+  switch (reason_type) {
+    case "birthday": return "Birthday bonus";
+    case "anniversary": return "Anniversary bonus";
+    case "testimonial": return "Review bonus";
+    case "purchase": return "Purchase bonus";
+    default: return "Manual adjustment";
+  }
+}
 
 /**
  * IMPROVEMENT 4 — WhatsApp number as UNIQUE key for customers.
@@ -441,8 +534,9 @@ function normalizeMobile(mobile: string): string {
  * Returns the merchant view of the customer, or null when not found.
  */
 export const findCustomerByMobile = query({
-  args: { mobile: v.string() },
-  handler: async (ctx, { mobile }) => {
+  args: { mobile: v.string(), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { mobile, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const normalized = normalizeMobile(mobile);
     if (!normalized) return null;
     const doc = await ctx.db
@@ -551,8 +645,11 @@ export const bulkCreateCustomers = mutation({
         country: v.optional(v.string()),
       }),
     ),
+    userId: v.id("users"),
+    token: v.string(),
   },
-  handler: async (ctx, { rows }) => {
+  handler: async (ctx, { rows, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
     const created: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
     const skipped: Array<{ name: string; whatsapp: string; reason: string }> = [];
     const seenInFile = new Set<string>();

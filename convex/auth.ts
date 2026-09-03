@@ -1,8 +1,10 @@
 import { action, internalMutation, internalQuery, mutation, query } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import bcrypt from "bcryptjs";
 import { Resend } from "resend";
 import { internal } from "./_generated/api";
+import type { QueryCtx, MutationCtx } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 
 /**
  * LoyaltyOS Boutique — Auth functions (Step 3)
@@ -67,6 +69,40 @@ function toPublicUser(doc: UserDoc) {
 }
 
 /**
+ * Merchant Session Lock (design spec 2026-09-01) — shared session guard.
+ *
+ * Every merchant-only Convex function (customers.ts, orders.ts, lookbooks.ts,
+ * reviews.ts, settings.ts, templates.ts, whatsapp.ts, and generateMagicTokenForCustomer
+ * below) calls this FIRST with the (userId, token) the merchant's browser attaches to
+ * every request (src/lib/db.js — a later step in the build order). This closes the
+ * gap found in the 2026-09-01 audit: session_token/session_expiry were written on
+ * login but never checked again, so an unauthenticated caller could hit the public
+ * Convex URL directly and read/write merchant data.
+ *
+ * Verified via ctx.db.get(userId) + direct field compare rather than a new
+ * by_session_token index — a single point lookup is O(1) already and a merchant
+ * table scan large enough to need an index is not the shape of this workload
+ * (see design spec "Schema change" section for the documented alternative).
+ *
+ * Throws ConvexError (never returns false) so every caller fails loudly instead
+ * of silently returning empty/null data to an unauthenticated request.
+ */
+export async function requireMerchantSession(
+  ctx: QueryCtx | MutationCtx,
+  userId: Id<"users">,
+  token: string,
+): Promise<UserDoc> {
+  const user = await ctx.db.get(userId);
+  if (!user) throw new ConvexError("Not authenticated");
+  if (user.role !== "merchant") throw new ConvexError("Not authorized");
+  if (user.session_token !== token) throw new ConvexError("Invalid session");
+  if (!user.session_expiry || user.session_expiry < Date.now()) {
+    throw new ConvexError("Session expired");
+  }
+  return user;
+}
+
+/**
  * PRD §3.1 — Merchant email + password login.
  * Looks up users.by_email, verifies role === "merchant" and the bcrypt hash,
  * then issues a 256-bit session token (7-day expiry) persisted on the user.
@@ -110,10 +146,92 @@ export const merchantLogin = mutation({
 });
 
 /**
- * PRD §3.2 — Generate a zero-login crypto magic link for a customer.
- * Finds the user by users.by_mobile, rotates the magic token (256-bit),
- * stamps magic_token_created_at for the 180-day expiry check, and returns
- * the personalised portal link: <base>/lookbook?id=<_id>&token=<token>
+ * Shared magic-token issuance logic used by BOTH generateMagicTokenSelf and
+ * generateMagicTokenForCustomer below — extracted so the two entry points
+ * (public self-onboarding vs merchant-authenticated) cannot drift out of sync.
+ * Rotates the magic token (256-bit), stamps magic_token_created_at for the
+ * 180-day expiry check, and returns the personalised portal link:
+ * <base>/lookbook?id=<_id>&token=<token>
+ */
+async function issueMagicToken(
+  ctx: MutationCtx,
+  customer: UserDoc,
+  baseUrl?: string,
+) {
+  const token = randomHex();
+  const now = Date.now();
+  const expiresAt = now + MAGIC_LINK_DAYS * DAY_MS;
+  await ctx.db.patch(customer._id, {
+    magic_token: token,
+    magic_token_created_at: now,
+  });
+
+  const base = (baseUrl ?? PORTAL_BASE_URL).replace(/\/+$/, "");
+  const magicLink = `${base}/lookbook?id=${customer._id}&token=${token}`;
+  // Step 3.6: PRD §3.2 delivers the lookbook link via WhatsApp; Resend email
+  // is a backup channel — reuse the sendResetEmail() Resend pattern
+  // (digital@mouldinnovation.com -> customer email) when needed.
+  return {
+    user: toPublicUser(customer),
+    magicLink,
+    token,
+    expiresAt,
+  };
+}
+
+/**
+ * PRD §3.2 — Generate a zero-login crypto magic link for a customer, self-service.
+ * PUBLIC — no merchant session required. Used by /join self-onboarding, where the
+ * customer supplies their own mobile number and there is no merchant in the loop.
+ * Finds the user by users.by_mobile; behavior is byte-for-byte identical to the
+ * original generateMagicToken (see deprecated alias below).
+ */
+export const generateMagicTokenSelf = mutation({
+  args: {
+    mobile: v.string(),
+    baseUrl: v.optional(v.string()),
+  },
+  handler: async (ctx, { mobile, baseUrl }) => {
+    const digits = mobile.replace(/\D/g, "");
+    const customer = await ctx.db
+      .query("users")
+      .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+      .first();
+    if (!customer || customer.role !== "customer") return null;
+
+    return issueMagicToken(ctx, customer, baseUrl);
+  },
+});
+
+/**
+ * Merchant Session Lock (design spec 2026-09-01) — MERCHANT-ONLY variant.
+ * Used by the merchant onboarding UI to (re)generate a specific customer's
+ * magic link by their Convex user id, e.g. "resend link" from the CRM.
+ * requireMerchantSession is called FIRST — no token rotation happens for an
+ * unauthenticated or expired caller.
+ */
+export const generateMagicTokenForCustomer = mutation({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+    customerId: v.id("users"),
+    baseUrl: v.optional(v.string()),
+  },
+  handler: async (ctx, { userId, token, customerId, baseUrl }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const customer = await ctx.db.get(customerId);
+    if (!customer || customer.role !== "customer") return null;
+
+    return issueMagicToken(ctx, customer, baseUrl);
+  },
+});
+
+/**
+ * @deprecated Kept as a backward-compatible alias so existing callers in
+ * src/lib/db.js (api.auth.generateMagicToken) keep working unchanged. A LATER
+ * build-order step updates db.js to call generateMagicTokenSelf directly, at
+ * which point this alias can be removed. Do not add new callers.
  */
 export const generateMagicToken = mutation({
   args: {
@@ -128,25 +246,7 @@ export const generateMagicToken = mutation({
       .first();
     if (!customer || customer.role !== "customer") return null;
 
-    const token = randomHex();
-    const now = Date.now();
-    const expiresAt = now + MAGIC_LINK_DAYS * DAY_MS;
-    await ctx.db.patch(customer._id, {
-      magic_token: token,
-      magic_token_created_at: now,
-    });
-
-    const base = (baseUrl ?? PORTAL_BASE_URL).replace(/\/+$/, "");
-    const magicLink = `${base}/lookbook?id=${customer._id}&token=${token}`;
-    // Step 3.6: PRD §3.2 delivers the lookbook link via WhatsApp; Resend email
-    // is a backup channel — reuse the sendResetEmail() Resend pattern
-    // (digital@mouldinnovation.com -> customer email) when needed.
-    return {
-      user: toPublicUser(customer),
-      magicLink,
-      token,
-      expiresAt,
-    };
+    return issueMagicToken(ctx, customer, baseUrl);
   },
 });
 

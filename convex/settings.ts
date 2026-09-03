@@ -1,5 +1,6 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
+import { requireMerchantSession } from "./auth";
 
 /**
  * LoyaltyOS Boutique — Centralized Settings backend (Step 5 + Step 5.5, PRD §8)
@@ -494,9 +495,13 @@ export const getSettings = query({
  */
 export const updateSettings = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     settings: loyaltyRulesValidator,
   },
-  handler: async (ctx, { settings }) => {
+  handler: async (ctx, { userId, token, settings }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     // Keep only the known tier keys + known numeric keys so a malformed
     // client payload can never pollute the stored document.
     const nextValue: Partial<Record<TierKey, Record<string, unknown>>> = {};
@@ -524,10 +529,14 @@ export const updateSettings = mutation({
  */
 export const updateTemplate = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     templateKey: templateKeyValidator,
     text: v.string(),
   },
-  handler: async (ctx, { templateKey, text }) => {
+  handler: async (ctx, { userId, token, templateKey, text }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Template text must not be empty.");
 
@@ -574,10 +583,14 @@ export const getTemplateCardUrls = query({
  */
 export const setTemplateCardUrl = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     type: templateCardKeyValidator,
     url: v.string(),
   },
-  handler: async (ctx, { type, url }) => {
+  handler: async (ctx, { userId, token, type, url }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.TEMPLATE_CARDS);
     const stored = existing?.value as Partial<Record<TemplateCardKey, string>> | undefined;
     const current = mergeTemplateCards(stored); // spread the full current state first
@@ -594,8 +607,13 @@ export const setTemplateCardUrl = mutation({
  * approved in WhatsApp Manager — not an error).
  */
 export const getWhatsAppTemplates = query({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
     const stored = doc?.value as
       | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
@@ -617,10 +635,14 @@ export const getWhatsAppTemplates = query({
  */
 export const setWhatsAppTemplate = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     type: whatsAppTemplateTypeValidator,
     config: whatsAppTemplateConfigValidator,
   },
-  handler: async (ctx, { type, config }) => {
+  handler: async (ctx, { userId, token, type, config }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
     const stored = existing?.value as
       | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
@@ -655,9 +677,13 @@ export const setWhatsAppTemplate = mutation({
  */
 export const clearWhatsAppTemplate = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     type: whatsAppTemplateTypeValidator,
   },
-  handler: async (ctx, { type }) => {
+  handler: async (ctx, { userId, token, type }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
     const stored = existing?.value as
       | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
@@ -680,8 +706,13 @@ export const clearWhatsAppTemplate = mutation({
  * error state — matches the merchant not having filled the fields in yet).
  */
 export const getWhatsAppTemplateConfig = query({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
     const stored = doc?.value as
       | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
@@ -704,10 +735,14 @@ export const getWhatsAppTemplateConfig = query({
  */
 export const setWhatsAppTemplateConfig = mutation({
   args: {
+    userId: v.id("users"),
+    token: v.string(),
     type: whatsAppTemplateTypeValidator,
     config: whatsAppTemplateConfigFieldsValidator,
   },
-  handler: async (ctx, { type, config }) => {
+  handler: async (ctx, { userId, token, type, config }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
     const stored = existing?.value as
       | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
@@ -728,8 +763,13 @@ export const setWhatsAppTemplateConfig = mutation({
  * config returned afterwards is exactly the board-approved defaults.
  */
 export const resetSettings = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
     const docs = await ctx.db.query("settings").collect();
     for (const doc of docs) {
       await ctx.db.delete(doc._id);

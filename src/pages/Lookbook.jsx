@@ -149,14 +149,14 @@ export default function Lookbook() {
     const { bonus } = submitGmbReview(customer.id, gmbStars, gmbText.trim());
     setGmbOpen(false); setGmbStars(0); setGmbText('');
     goldBurst();
-    setTimeout(() => alert(`✨ Thank you! ${bonus} loyalty points added to your account. Your review is now with our boutique.`), 250);
+    setTimeout(() => alert(`✨ Thank you! Your review is now with our boutique — ${bonus} points on the way once approved.`), 250);
   };
   const submitProductRev = () => {
     if (!reviewing || reviewStars < 1) return;
     const { bonus } = submitProductReview(customer.id, reviewing.id, reviewStars, reviewText.trim());
     setReviewing(null); setReviewStars(0); setReviewText('');
     goldBurst();
-    setTimeout(() => alert(`✨ ${bonus} points credited for your review.`), 250);
+    setTimeout(() => alert(`✨ Thank you! Your review is pending approval — ${bonus} points on the way once approved.`), 250);
   };
 
   const reviewableItems = myOrders.flatMap((o) => o.items || []).filter((i) => !reviewedItemIds.includes(i.catalogueItemId));
