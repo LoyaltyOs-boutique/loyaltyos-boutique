@@ -85,16 +85,22 @@ function NotificationBell() {
   };
 
   const goToCustomer = (n) => {
-    // Part A finding: the birthday/anniversary tabs do NOT use the Reviews
-    // `state.tab` pattern — they pre-fill the search box via `state.q` with a
-    // `b:M-D` / `a:M-D` marker string (Dashboard.jsx's todayList(), consumed
-    // by Customers.jsx's `list` useMemo: `query.startsWith('b:')` /
-    // `query.startsWith('a:')`, Customers.jsx lines 198-200). Reused here
-    // verbatim, scoped to THIS notification's own occasion_date instead of
-    // today's date, since a notification can be up to 30 days old.
-    const marker = `${n.occasion === 'birthday' ? 'b' : 'a'}:${n.occasion_date}`;
+    // Part A finding: the "Birthdays tomorrow" / "Anniversaries tomorrow" TAB
+    // BUTTONS themselves (Customers.jsx's filter-tab array, `setFilter(k)`)
+    // use the real filter values 'birthday_tomorrow' / 'anniversary_tomorrow'
+    // — a different mechanism from the Dashboard chips' `state.q` search-box
+    // marker previously used here. Navigating with `state.tab` set to one of
+    // these real values lands directly on that tab (Customers.jsx's
+    // filter-initialization line reads `location.state?.tab`), same pattern
+    // already used for the Reviews tab-jump.
+    //
+    // Trade-off (accepted): the target tab is computed from TODAY's date, not
+    // this notification's stored occasion_date, so this only shows the
+    // customer if their occasion is STILL literally tomorrow at click-time —
+    // unlike the old `q`-marker approach, which matched the stored date
+    // directly regardless of how old the notification was.
     setOpen(false);
-    navigate('/merchant/customers', { state: { q: marker } });
+    navigate('/merchant/customers', { state: { tab: n.occasion === 'birthday' ? 'birthday_tomorrow' : 'anniversary_tomorrow' } });
   };
 
   const handleDelete = (n) => {
@@ -123,7 +129,7 @@ function NotificationBell() {
       >
         <span className="text-lg leading-none">🔔</span>
         {unseenCount > 0 && (
-          <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-gold" aria-hidden="true" />
+          <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-red-500 ring-2 ring-white" aria-hidden="true" />
         )}
       </button>
       {open && (

@@ -25,7 +25,12 @@ export default function Customers() {
   const db = useDb();
   const location = useLocation();
   const [q, setQ] = useState(location.state?.q || '');
-  const [filter, setFilter] = useState(location.state?.tab === 'reviews' ? 'reviews' : 'all');
+  const [filter, setFilter] = useState(
+    location.state?.tab === 'reviews' ? 'reviews'
+    : location.state?.tab === 'birthday_tomorrow' ? 'birthday_tomorrow'
+    : location.state?.tab === 'anniversary_tomorrow' ? 'anniversary_tomorrow'
+    : 'all'
+  );
   const [page, setPage] = useState(0);
   const [selected, setSelected] = useState(null);
   const [tab, setTab] = useState('basic');
