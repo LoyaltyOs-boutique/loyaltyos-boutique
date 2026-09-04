@@ -64,6 +64,11 @@ export default defineSchema({
     tier: v.optional(
       v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     ),
+    // Phase 5 (Feature C, Virtual Events) — VVIP-only event access flag,
+    // mirrors whatsapp_consent's optional-boolean shape directly below.
+    // Set from the Onboarding.jsx "Mark as VVIP client" checkbox (separate,
+    // later frontend task — this field only adds the storage slot).
+    vvip: v.optional(v.boolean()),
     custom_tags: v.optional(v.array(v.string())), // e.g. "Saree Enthusiast", "Needs Care"
     whatsapp_consent: v.optional(v.boolean()), // Gate 1 — customer opted in to WhatsApp messages
     is_deleted: v.optional(v.boolean()), // Gate 1 — soft-delete flag; missing/false = active
@@ -103,7 +108,25 @@ export default defineSchema({
     // fetch the "next N days" birthday/anniversary window via an indexed
     // range read instead of a full-table scan + per-row parseMD().
     .index("by_role_birthday_md", ["role", "birthday_md"])
-    .index("by_role_anniversary_md", ["role", "anniversary_md"]),
+    .index("by_role_anniversary_md", ["role", "anniversary_md"])
+    // Phase 5 (Feature C, Virtual Events) — dispatchEvent's recipient lookup.
+    // Field order follows the SAME convention as by_role_birthday_md /
+    // by_role_anniversary_md directly above: the equality-filtered
+    // discriminator that partitions the large, mixed-population `users`
+    // table (merchants + customers) goes FIRST (`role`), exactly like those
+    // two indexes put `role` before the range/equality field that follows.
+    // `whatsapp_consent` is next — every dispatch (VVIP or not) always
+    // filters on it, so it narrows the `role`-partitioned set down to the
+    // consented subset for both event types. `vvip` is last — it is ONLY
+    // constrained when the event being dispatched has vvip_only === true;
+    // for a non-VVIP event, dispatchEvent still range/equality-reads the
+    // same index prefix (role, whatsapp_consent) and simply omits the third
+    // .eq("vvip", ...) clause, which Convex compound indexes support
+    // natively (a query can use any leading prefix of an index). This
+    // "widest/most-selective discriminator first" ordering (Option 2 from
+    // the design doc's (g) discussion) gives BOTH dispatch paths a pure
+    // indexed read with zero in-memory filtering over the users table.
+    .index("by_role_consent_vvip", ["role", "whatsapp_consent", "vvip"]),
 
   /** PRD §6 Table `lookbooks` — designer collection groups. */
   lookbooks: defineTable({
@@ -296,4 +319,37 @@ export default defineSchema({
     // by_customer_occasion_date index shape/style exactly (same field order,
     // same naming convention).
     .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-04-phase5-virtual-events-vvip-design.md
+   * Architecture spec: docs/superpowers/specs/2026-09-03-ai-automation-architecture-design.md §4
+   *
+   * events — Phase 5 (Feature C) virtual-event records. A merchant creates a
+   * draft event (designer, date/time, description, optional VVIP-only gate),
+   * optionally generates an AI draft message (convex/events.ts
+   * generateEventDraft, reusing ai.ts's callGemini), then explicitly clicks
+   * "Dispatch Event" to WhatsApp-send the join link to the right recipient
+   * set. `status` flips "draft" -> "dispatched" only on that explicit click —
+   * see design doc (e) "Nothing auto-sends": there is no cron/time-triggered
+   * send anywhere in this feature.
+   *
+   * `event_datetime` (epoch ms) is also the sole input to getEventAccess's
+   * unlock computation (event_datetime - 5min) — the SEND and the UNLOCK are
+   * two independent mechanisms that must never be conflated (design doc (e)).
+   */
+  events: defineTable({
+    designer_name: v.string(),
+    event_datetime: v.number(), // epoch ms — event start; also drives getEventAccess's 5-min-before unlock window
+    vvip_only: v.boolean(), // true = dispatchEvent restricts recipients to consented VVIP customers only
+    description: v.string(),
+    draft_text: v.optional(v.string()), // AI-generated (or merchant-edited) WhatsApp message body
+    status: v.union(v.literal("draft"), v.literal("dispatched")),
+    created_at: v.number(), // epoch ms — Date.now() at insert
+  })
+    // "Upcoming events" range read — see design doc (a): events is a small,
+    // single-purpose table (unlike users, no mixed-population equality
+    // prefix is needed), so a plain range index on the date field alone is
+    // sufficient for getEvents' indexed "soonest first" query with no
+    // full-table scan.
+    .index("by_event_datetime", ["event_datetime"]),
 });

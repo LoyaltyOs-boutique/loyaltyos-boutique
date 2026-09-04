@@ -51,7 +51,7 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 const GEMINI_TIMEOUT_MS = 10_000;
 
 /** Result shape every callGemini() caller gets — never a thrown error. */
-type GeminiResult = { success: true; text: string } | { success: false };
+export type GeminiResult = { success: true; text: string } | { success: false };
 
 /**
  * Shared internal helper — the ONE place that knows how to call Gemini.
@@ -65,7 +65,7 @@ type GeminiResult = { success: true; text: string } | { success: false };
  * exactly, EXCEPT every failure resolves to { success: false } instead of
  * throwing — see file header for why.
  */
-async function callGemini(prompt: string): Promise<GeminiResult> {
+export async function callGemini(prompt: string): Promise<GeminiResult> {
   // Guard-clause — read the secret inside the function (never module scope)
   // so a missing key fails clearly at call time. Unlike whatsapp.ts, we do
   // NOT throw here — we log and return the fallback signal so the caller
