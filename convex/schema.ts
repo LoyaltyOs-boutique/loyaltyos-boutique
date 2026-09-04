@@ -265,4 +265,35 @@ export default defineSchema({
     // Per-customer history lookup (Activity Ledger tab, future task) — matches
     // this file's by_<field> index-naming convention.
     .index("by_customer", ["customer_id"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md
+   * Architecture spec: docs/superpowers/specs/2026-09-03-ai-automation-architecture-design.md:17
+   *
+   * ai_message_drafts — Gemini-generated WhatsApp draft text for an upcoming
+   * birthday/anniversary, written ONLY by the daily crons.ts cron
+   * (generateDailyDrafts -> ai.ts generateMessageDraft). Draft-creation only
+   * (Phase 3 Option 3, design doc §c) — sending/approval wiring is a deferred,
+   * separate task. A cron only ever writes status:"pending"; "used"/
+   * "discarded" are reserved for that later wiring, not set by this table's
+   * writer today.
+   *
+   * `occasion_date` mirrors message_actions' "M-D" string convention (e.g.
+   * "8-27") — see message_actions' own comment above — so the
+   * by_customer_occasion_date index below can use the exact same tuple shape
+   * for the "don't regenerate an existing draft" duplicate check.
+   */
+  ai_message_drafts: defineTable({
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(),
+    draft_text: v.string(),
+    generated_at: v.number(), // epoch ms
+    status: v.union(v.literal("pending"), v.literal("used"), v.literal("discarded")),
+  })
+    // Duplicate-prevention + single-draft lookup for a given
+    // (customer, occasion, occasion_date) tuple — mirrors message_actions'
+    // by_customer_occasion_date index shape/style exactly (same field order,
+    // same naming convention).
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
 });

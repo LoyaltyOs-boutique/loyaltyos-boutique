@@ -1,7 +1,8 @@
-import { action, internalQuery } from "./_generated/server";
+import { action, internalAction, internalQuery } from "./_generated/server";
 import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
+import { SETTINGS_KEYS, type WhatsAppTemplateType } from "./settings";
 
 /**
  * Gemini AI integration — Phase A plumbing only.
@@ -143,7 +144,110 @@ export const checkMerchantSession = internalQuery({
 });
 
 // ============================================================================
-// SECTION 3 — Test-only scaffolding (Phase 2 verification)
+// SECTION 3 — Phase 3: generateMessageDraft (AI-drafted WhatsApp messages)
+// Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md
+// ============================================================================
+
+/**
+ * Internal read of the merchant's configured WhatsApp promo copy (Discount%,
+ * Coupon Code, Valid Days) for ONE occasion type — the same
+ * "whatsapp_template_config" settings doc that settings.ts's
+ * getWhatsAppTemplateConfig serves, but WITHOUT the merchant-session guard,
+ * for the same reason customers.ts's findUpcomingInternal skips
+ * requireMerchantSession: a cron has no live merchant session to supply.
+ *
+ * Deliberately NOT a change to convex/settings.ts (out of this task's STRICT
+ * scope) — reads the singleton doc directly via the `by_key` index, reusing
+ * settings.ts's own exported SETTINGS_KEYS constant so the settings-group key
+ * string stays a single source of truth. The missing-field-safe defaulting
+ * (empty string, never undefined) mirrors settings.ts's private
+ * mergeWhatsAppTemplateConfig helper — small enough (2 fields) that
+ * duplicating just the default-fallback here is simpler than exporting new
+ * surface from a file this task must not touch.
+ */
+export const getWhatsAppTemplateConfigInternal = internalQuery({
+  args: {
+    type: v.union(v.literal("anniversary"), v.literal("birthday")),
+  },
+  handler: async (ctx, { type }) => {
+    const doc = await ctx.db
+      .query("settings")
+      .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG))
+      .first();
+    const stored = doc?.value as
+      | Partial<Record<WhatsAppTemplateType, { discountPercent?: string; couponCode?: string; validDays?: string }>>
+      | undefined;
+    const entry = stored?.[type];
+    return {
+      discountPercent: entry?.discountPercent ?? "",
+      couponCode: entry?.couponCode ?? "",
+      validDays: entry?.validDays ?? "",
+    };
+  },
+});
+
+/**
+ * generateMessageDraft — Phase 3 Feature A. Builds a Gemini prompt for one
+ * customer's upcoming birthday/anniversary and returns the drafted message
+ * text, or null on ANY failure (never throws — matches Phase 2's
+ * fail-gracefully contract for callGemini, so a cron loop over many
+ * customers can never be halted by one bad/missing-key call).
+ *
+ * CONFIDENTIALITY (same rule already established for
+ * getCustomerIntelligenceProfile, Phase 1): the prompt is built from ONLY
+ * name, tier, occasion type, and the merchant's configured promo copy.
+ * measurements and staff_notes are NEVER read or referenced here — this
+ * function doesn't even fetch the full customer document, only the minimal
+ * fields passed in as args, so there is no accidental confidential-field
+ * leak path into the prompt string.
+ *
+ * internalAction (not a public `action`) — only ever called from
+ * crons.ts's generateDailyDrafts, never from the frontend directly.
+ */
+export const generateMessageDraft = internalAction({
+  args: {
+    customerName: v.string(),
+    tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+  },
+  handler: async (ctx, { customerName, tier, occasion }): Promise<string | null> => {
+    // Promo context — merchant's configured Discount/Coupon/Valid-Days for
+    // this occasion type, read via the internal (no-session) settings path
+    // above. Empty strings are a valid "not configured" state (matches
+    // settings.ts's own DEFAULT_WHATSAPP_TEMPLATE_CONFIG), so the prompt
+    // simply omits a promo line when none of the three fields are filled in.
+    const promo = await ctx.runQuery(internal.ai.getWhatsAppTemplateConfigInternal, {
+      type: occasion,
+    });
+
+    const hasPromo = Boolean(promo.discountPercent || promo.couponCode || promo.validDays);
+    const promoLine = hasPromo
+      ? `Weave in this promo naturally if it fits: ${promo.discountPercent ? `${promo.discountPercent}% discount` : ""}${promo.couponCode ? `, coupon code ${promo.couponCode}` : ""}${promo.validDays ? `, valid for ${promo.validDays} days` : ""}.`
+      : "";
+
+    const occasionLabel = occasion === "birthday" ? "birthday" : "wedding anniversary";
+
+    const prompt = [
+      `You are writing a short, warm WhatsApp message on behalf of "85 Lansdowne", a luxury fashion boutique in Kolkata.`,
+      `The message is for a ${tier}-tier customer named ${customerName}, whose ${occasionLabel} is coming up.`,
+      `Write a warm, on-brand, personal-sounding ${occasionLabel} message (2-4 sentences, no emojis overload, luxury tone, not generic/spammy).`,
+      promoLine,
+      `Return ONLY the message text — no preamble, no quotation marks, no explanation.`,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const result = await callGemini(prompt);
+    if (!result.success) return null;
+
+    const trimmed = result.text.trim();
+    if (!trimmed) return null;
+    return trimmed;
+  },
+});
+
+// ============================================================================
+// SECTION 4 — Test-only scaffolding (Phase 2 verification)
 // ============================================================================
 
 /**

@@ -1,4 +1,4 @@
-import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
+import { mutation, query, internalQuery, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
@@ -499,6 +499,64 @@ export const getUpcomingAnniversaries = query({
 });
 
 /**
+ * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md §b
+ *
+ * findUpcomingInternal — internal-query variant of getUpcomingBirthdays /
+ * getUpcomingAnniversaries for callers with NO live merchant session (i.e.
+ * the daily drafts cron in crons.ts). A cron fires on a schedule with no
+ * human in the loop supplying userId/token, so it cannot call
+ * requireMerchantSession — this function is the same underlying read,
+ * exposed via `internalQuery` (private, callable only from other Convex
+ * functions via ctx.runQuery(internal.customers.findUpcomingInternal, ...)),
+ * with the session-guard line simply omitted.
+ *
+ * REUSES, does not duplicate, the existing date-window/index logic:
+ * delegates straight to findUpcoming() (same function that powers both
+ * public queries above), which itself runs indexed range reads via
+ * by_role_birthday_md / by_role_anniversary_md — no new scanning path.
+ *
+ * Returns the SAME fields getUpcomingBirthdays/getUpcomingAnniversaries
+ * return (including whatsapp_consent, the gate the cron filters on before
+ * ever calling Gemini — see crons.ts).
+ */
+export const findUpcomingInternal = internalQuery({
+  args: {
+    days: v.optional(v.number()),
+    field: v.union(v.literal("birthday"), v.literal("anniversary")),
+  },
+  handler: async (ctx, { days, field }) => {
+    const hits = await findUpcoming(ctx, days ?? 7, field);
+    return hits.map(({ doc, daysUntil }) => {
+      // Same parseMD() call findUpcoming() itself already used internally to
+      // match this hit — re-derive the exact "M-D" key (unpadded, matching
+      // message_actions'/ai_message_drafts' occasion_date convention, e.g.
+      // "8-27") here so callers (the drafts cron) get a ready-to-use
+      // occasion_date string without duplicating date-parsing logic.
+      const raw = field === "birthday" ? doc.birthday : doc.anniversary;
+      const parsed = parseMD(raw);
+      const occasionDate = parsed ? `${parsed[0]}-${parsed[1]}` : null;
+      return {
+        _id: doc._id,
+        name: doc.name,
+        birthday: doc.birthday ?? null,
+        anniversary: doc.anniversary ?? null,
+        mobile: doc.mobile,
+        tier: doc.tier ?? "silver",
+        points: doc.points ?? 0,
+        // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it) —
+        // and, for the AI drafts cron, the gate on whether Gemini is ever called at all.
+        whatsapp_consent: doc.whatsapp_consent ?? false,
+        days_until: daysUntil,
+        // "M-D" string, e.g. "8-27" — see comment above. Should never be null
+        // in practice (findUpcoming already required a valid parseMD to
+        // produce this hit), but typed nullable defensively.
+        occasion_date: occasionDate,
+      };
+    });
+  },
+});
+
+/**
  * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
  *
  * recordMessageAction — admin decision-log write for the Delight Queue's
@@ -962,6 +1020,61 @@ export const getCustomerIntelligenceProfile = query({
       orders,
       points_history,
       upcoming_occasion,
+    };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md
+ *
+ * getDraftForCustomer — merchant-guarded read of the current draft (if any)
+ * for a given customer/occasion/date, written by the daily AI-drafts cron
+ * (crons.ts -> ai.ts generateMessageDraft). Queries the SAME
+ * by_customer_occasion_date index the cron uses for its own duplicate check,
+ * so the tuple lookup semantics stay identical on both the write and read
+ * sides.
+ *
+ * "Current" draft = the newest "pending" row for the tuple (a merchant may
+ * eventually see a "used"/"discarded" history here too, in a later task —
+ * for now the cron only ever writes "pending", so filtering to that status
+ * is the correct/only meaningful read).
+ *
+ * This is a read-path-only addition for a later frontend task (per the
+ * Phase 3 design doc) — no UI wiring happens in this task. Guarded with
+ * requireMerchantSession, the SAME pattern as every other merchant-facing
+ * query in this file.
+ */
+export const getDraftForCustomer = query({
+  args: {
+    customerId: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { customerId, occasion, occasionDate, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const rows = await ctx.db
+      .query("ai_message_drafts")
+      .withIndex("by_customer_occasion_date", (q) =>
+        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      )
+      .collect();
+
+    const pending = rows.filter((r) => r.status === "pending");
+    if (pending.length === 0) return null;
+    // Newest pending row wins, in case more than one ever exists for the tuple.
+    pending.sort((a, b) => b.generated_at - a.generated_at);
+    const doc = pending[0];
+    return {
+      _id: doc._id,
+      customer_id: doc.customer_id,
+      occasion: doc.occasion,
+      occasion_date: doc.occasion_date,
+      draft_text: doc.draft_text,
+      generated_at: doc.generated_at,
+      status: doc.status,
     };
   },
 });

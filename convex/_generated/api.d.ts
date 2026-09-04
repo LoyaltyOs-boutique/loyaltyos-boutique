@@ -10,6 +10,7 @@
 
 import type * as ai from "../ai.js";
 import type * as auth from "../auth.js";
+import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
 import type * as lookbooks from "../lookbooks.js";
 import type * as orders from "../orders.js";
@@ -27,6 +28,7 @@ import type {
 declare const fullApi: ApiFromModules<{
   ai: typeof ai;
   auth: typeof auth;
+  crons: typeof crons;
   customers: typeof customers;
   lookbooks: typeof lookbooks;
   orders: typeof orders;
