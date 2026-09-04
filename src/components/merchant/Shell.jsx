@@ -121,9 +121,9 @@ function NotificationBell() {
         className="btn-ghost !px-3 !py-1.5 text-[10px] relative"
         aria-label="Notifications"
       >
-        🔔
+        <span className="text-lg leading-none">🔔</span>
         {unseenCount > 0 && (
-          <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-gold" aria-hidden="true" />
+          <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-gold" aria-hidden="true" />
         )}
       </button>
       {open && (
@@ -140,17 +140,21 @@ function NotificationBell() {
               rows.map((n) => {
                 const [name, rest] = splitName(n.message);
                 return (
-                <div key={n._id} className="px-4 py-3 border-b border-line last:border-b-0 flex items-start gap-2">
+                <div
+                  key={n._id}
+                  onClick={() => goToCustomer(n)}
+                  className="px-4 py-3 border-b border-line last:border-b-0 flex items-start gap-2 cursor-pointer hover:bg-mist"
+                >
                   <div className="flex-1 min-w-0">
                     <div className="text-sm">
-                      <button onClick={() => goToCustomer(n)} className="text-gold hover:underline font-medium">{name}</button>
+                      <span className="text-gold font-medium">{name}</span>
                       {rest}
                     </div>
                     <div className="text-[10px] text-steel mt-1">{timeAgo(n.created_at)}</div>
                   </div>
                   <div className="relative shrink-0">
                     <button
-                      onClick={() => setMenuFor(menuFor === n._id ? null : n._id)}
+                      onClick={(e) => { e.stopPropagation(); setMenuFor(menuFor === n._id ? null : n._id); }}
                       className="text-steel hover:text-ink px-1.5 leading-none text-sm"
                       aria-label="Notification options"
                     >
@@ -159,7 +163,7 @@ function NotificationBell() {
                     {menuFor === n._id && (
                       <div className="absolute right-0 top-full mt-1 w-28 bg-white border border-line shadow-lg z-50">
                         <button
-                          onClick={() => handleDelete(n)}
+                          onClick={(e) => { e.stopPropagation(); handleDelete(n); }}
                           className="w-full text-left px-3 py-2 text-[11px] text-steel hover:text-ink hover:bg-mist"
                         >
                           Delete
