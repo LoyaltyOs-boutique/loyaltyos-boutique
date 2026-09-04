@@ -230,7 +230,156 @@ export const generateDailyDrafts = internalAction({
 });
 
 // ============================================================================
-// SECTION 4 — Cron registration
+// SECTION 5 — Dashboard Notifications (bell icon) daily cron
+// Design spec: docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
+//
+// SIBLING to generateDailyDrafts above — generateDailyDrafts itself is NOT
+// modified anywhere in this addition. This section reuses the SAME
+// internal.customers.findUpcomingInternal read (now automatically
+// benefiting from the is_deleted exclusion fix in customers.ts's
+// findUpcoming), but:
+//   - has NO consent gate (whatsapp_consent is irrelevant — this never
+//     messages the customer, it only informs the merchant), and
+//   - makes NO Gemini call (no ai.ts import anywhere in this section).
+// ============================================================================
+
+/** Notification rows older than this are expired and get swept at the end of each run. */
+const NOTIFICATION_THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * hasExistingNotification — duplicate-prevention check, mirrors
+ * hasExistingDraft's exact shape (SECTION 2 above) but reads the
+ * `notifications` table's by_customer_occasion_date index instead of
+ * ai_message_drafts'. Unlike hasExistingDraft there is no "discarded"
+ * status to exclude here (notifications have no status field) — any
+ * existing row for the tuple counts as "already notified".
+ */
+export const hasExistingNotification = internalQuery({
+  args: {
+    customerId: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+  },
+  handler: async (ctx, { customerId, occasion, occasionDate }) => {
+    const existing = await ctx.db
+      .query("notifications")
+      .withIndex("by_customer_occasion_date", (q) =>
+        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      )
+      .first();
+    return existing !== null;
+  },
+});
+
+/**
+ * insertNotification — the cron's only write for a new hit. Mirrors
+ * insertDraft's exact shape (SECTION 2 above). `message` is a plain,
+ * generic string built in code — no Gemini call, no ai.ts import.
+ */
+export const insertNotification = internalMutation({
+  args: {
+    customerId: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+    message: v.string(),
+  },
+  handler: async (ctx, { customerId, occasion, occasionDate, message }) => {
+    await ctx.db.insert("notifications", {
+      customer_id: customerId,
+      occasion,
+      occasion_date: occasionDate,
+      message,
+      created_at: Date.now(),
+      seen: false,
+    });
+  },
+});
+
+/**
+ * deleteExpiredNotifications — sweeps every notification row older than 30
+ * days. Range-reads via by_created_at (no full-table scan) and deletes each
+ * match. Run once at the end of generateDailyNotifications — this is the
+ * feature's "auto-expiry, no separate cron needed" mechanism.
+ */
+export const deleteExpiredNotifications = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - NOTIFICATION_THIRTY_DAYS_MS;
+    const expired = await ctx.db
+      .query("notifications")
+      .withIndex("by_created_at", (q) => q.lt("created_at", cutoff))
+      .collect();
+    await Promise.all(expired.map((r) => ctx.db.delete(r._id)));
+    return { deleted: expired.length };
+  },
+});
+
+/**
+ * generateDailyNotifications — the notifications cron's body. Runs once per
+ * day (see SECTION 6). Sibling to generateDailyDrafts — does NOT call or
+ * modify it.
+ *
+ * Steps:
+ *   1. Fetch tomorrow's (days: 1) birthday + anniversary candidates via the
+ *      SAME internal.customers.findUpcomingInternal calls generateDailyDrafts
+ *      already makes (now is_deleted-excluded per customers.ts's fix).
+ *   2. NO consent gate — this never messages the customer, only the
+ *      merchant sees it.
+ *   3. Skip any customer who already has a notification for this exact
+ *      (customer_id, occasion, occasion_date) tuple, so re-running the cron
+ *      never duplicates a row.
+ *   4. Insert a new notification row per remaining eligible hit — NO Gemini
+ *      call, just a generic templated string.
+ *   5. Sweep expired (30+ day old) rows once at the end of the run.
+ */
+export const generateDailyNotifications = internalAction({
+  args: {},
+  handler: async (ctx): Promise<{ scanned: number; created: number; expiredDeleted: number }> => {
+    // Step 1 — same indexed, tomorrow-only candidate fetch generateDailyDrafts uses.
+    const [birthdayHits, anniversaryHits] = await Promise.all([
+      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday" }),
+      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary" }),
+    ]);
+
+    const candidates: Array<{ hit: EligibleCustomer; occasion: "birthday" | "anniversary" }> = [
+      ...birthdayHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "birthday" as const })),
+      ...anniversaryHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "anniversary" as const })),
+    ].filter(({ hit }) => hit.days_until === 1);
+
+    let createdCount = 0;
+
+    for (const { hit, occasion } of candidates) {
+      if (!hit.occasion_date) continue; // defensive — should never happen, see findUpcomingInternal's comment
+
+      // Step 3 — duplicate-prevention via the by_customer_occasion_date index.
+      const alreadyExists = await ctx.runQuery(internal.crons.hasExistingNotification, {
+        customerId: hit._id,
+        occasion,
+        occasionDate: hit.occasion_date,
+      });
+      if (alreadyExists) continue;
+
+      // Step 4 — generic, non-AI message string.
+      const message = `${hit.name}'s ${occasion} is tomorrow!`;
+
+      await ctx.runMutation(internal.crons.insertNotification, {
+        customerId: hit._id,
+        occasion,
+        occasionDate: hit.occasion_date,
+        message,
+      });
+      createdCount += 1;
+    }
+
+    // Step 5 — sweep expired rows once at the end of this run.
+    const { deleted: expiredDeleted } = await ctx.runMutation(internal.crons.deleteExpiredNotifications, {});
+
+    return { scanned: candidates.length, created: createdCount, expiredDeleted };
+  },
+});
+
+// ============================================================================
+// SECTION 6 — Cron registration
 // ============================================================================
 
 const crons = cronJobs();
@@ -238,5 +387,9 @@ const crons = cronJobs();
 // Runs once every 24 hours — crons.interval, per this project's pinned
 // guidelines (never crons.daily()/.hourly()/.weekly()).
 crons.interval("generate whatsapp ai drafts", { hours: 24 }, internal.crons.generateDailyDrafts, {});
+
+// New, separate registration — added alongside (not replacing/merging into)
+// the drafts cron above.
+crons.interval("generate dashboard notifications", { hours: 24 }, internal.crons.generateDailyNotifications, {});
 
 export default crons;

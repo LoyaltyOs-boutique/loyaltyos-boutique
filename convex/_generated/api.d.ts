@@ -14,6 +14,7 @@ import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
 import type * as events from "../events.js";
 import type * as lookbooks from "../lookbooks.js";
+import type * as notifications from "../notifications.js";
 import type * as orders from "../orders.js";
 import type * as reviews from "../reviews.js";
 import type * as settings from "../settings.js";
@@ -33,6 +34,7 @@ declare const fullApi: ApiFromModules<{
   customers: typeof customers;
   events: typeof events;
   lookbooks: typeof lookbooks;
+  notifications: typeof notifications;
   orders: typeof orders;
   reviews: typeof reviews;
   settings: typeof settings;

@@ -352,4 +352,38 @@ export default defineSchema({
     // sufficient for getEvents' indexed "soonest first" query with no
     // full-table scan.
     .index("by_event_datetime", ["event_datetime"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
+   *
+   * notifications — merchant-internal, non-AI daily birthday/anniversary
+   * reminders shown via a bell icon on the merchant Dashboard. Written ONLY
+   * by the daily crons.ts cron (generateDailyNotifications), which reuses
+   * the SAME internal.customers.findUpcomingInternal read
+   * generateDailyDrafts already calls (crons.ts) — no new scanning path on
+   * `users`. Unlike ai_message_drafts, this feature never messages a
+   * customer (no WhatsApp send, no consent gate, no Gemini call) — it only
+   * informs the merchant.
+   *
+   * `occasion_date` mirrors message_actions'/ai_message_drafts' "M-D" string
+   * convention (e.g. "8-27") — same tuple shape for the dedup index below.
+   */
+  notifications: defineTable({
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(), // "M-D" string, e.g. "8-27"
+    message: v.string(),
+    created_at: v.number(), // epoch ms
+    seen: v.boolean(),
+  })
+    // Dedup check in the daily generator — mirrors hasExistingDraft's tuple
+    // lookup (crons.ts) and message_actions'/ai_message_drafts'
+    // by_customer_occasion_date convention exactly (same field order/naming).
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"])
+    // Equality-only prefix on `seen` — efficient "unseen count" reads, same
+    // "narrow with an equality field first" style as by_role_consent_vvip.
+    .index("by_seen", ["seen"])
+    // Range-read "not expired" (< 30 days old) rows — same shape as orders'
+    // by_created_at index (schema.ts:184).
+    .index("by_created_at", ["created_at"]),
 });

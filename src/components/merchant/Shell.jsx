@@ -1,7 +1,11 @@
 import { NavLink, useNavigate } from 'react-router-dom';
-import { clearMerchantSession, getMerchantSession } from '../../lib/db.js';
-import { useState } from 'react';
-import { cls } from '../../lib/util.js';
+import {
+  clearMerchantSession, getMerchantSession,
+  hydrateNotifications, notifications, markAllSeenRemote, deleteNotificationRemote,
+  subscribe,
+} from '../../lib/db.js';
+import { useEffect, useState } from 'react';
+import { cls, timeAgo } from '../../lib/util.js';
 import { BRAND } from '../../data/seed.js';
 
 const NAV = [
@@ -38,6 +42,142 @@ function NavList({ onNavigate }) {
   );
 }
 
+/**
+ * Dashboard Notifications bell — design spec:
+ * docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
+ *
+ * Placement: lives here in Shell.jsx (not Dashboard.jsx) since this file
+ * owns the shared header/top bar across every merchant page (§A1/A2 of the
+ * design doc) — a new addition to the existing mobile top bar's flex row and
+ * a new small top-right row above {children} on desktop, neither a
+ * restructure of any existing element.
+ *
+ * Judgment call: bell glyph is the Unicode "🔔" character, matching this
+ * file's existing convention of plain Unicode glyphs for icon-ish UI (the
+ * ☰ Menu button, the NAV list's ◈/◐/✍/✆/❖/▤/✪/✦ glyphs) rather than an SVG —
+ * no SVG icon set exists in this file to match instead. Sized/colored with
+ * the same text-[10px]/btn-ghost convention already used for small icon
+ * buttons elsewhere in this file (e.g. the ☰ Menu button).
+ */
+function NotificationBell() {
+  const [, setV] = useState(0);
+  useEffect(() => subscribe(() => setV((v) => v + 1)), []);
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [menuFor, setMenuFor] = useState(null); // notification _id whose kebab menu is open, or null
+
+  const rows = notifications();
+  const unseenCount = rows.filter((n) => !n.seen).length;
+
+  // Refresh-on-mount: same "fetch fresh data when the merchant lands on a
+  // page/component" idiom already used across this codebase (e.g.
+  // Customers.jsx's `useEffect(() => { hydrateCustomers(); hydrateReviews(); }, [])`)
+  // — a light one-shot hydrate, not a polling loop.
+  useEffect(() => { hydrateNotifications(); }, []);
+
+  const togglePanel = () => {
+    const next = !open;
+    setOpen(next);
+    setMenuFor(null);
+    // "Calling markAllSeen should fire when the panel opens" (task spec) —
+    // only on the open transition, not on close.
+    if (next && unseenCount > 0) markAllSeenRemote();
+  };
+
+  const goToCustomer = (n) => {
+    // Part A finding: the birthday/anniversary tabs do NOT use the Reviews
+    // `state.tab` pattern — they pre-fill the search box via `state.q` with a
+    // `b:M-D` / `a:M-D` marker string (Dashboard.jsx's todayList(), consumed
+    // by Customers.jsx's `list` useMemo: `query.startsWith('b:')` /
+    // `query.startsWith('a:')`, Customers.jsx lines 198-200). Reused here
+    // verbatim, scoped to THIS notification's own occasion_date instead of
+    // today's date, since a notification can be up to 30 days old.
+    const marker = `${n.occasion === 'birthday' ? 'b' : 'a'}:${n.occasion_date}`;
+    setOpen(false);
+    navigate('/merchant/customers', { state: { q: marker } });
+  };
+
+  const handleDelete = (n) => {
+    setMenuFor(null);
+    deleteNotificationRemote(n._id);
+  };
+
+  // The notifications schema stores no separate `name` field (schema.ts —
+  // only customer_id/occasion/occasion_date/message/created_at/seen), and
+  // convex/ is out of scope for this task. The backend's message string has
+  // a fixed, known template (crons.ts: `${hit.name}'s ${occasion} is
+  // tomorrow!`), so the customer's name is the text before "'s " — reused
+  // here purely for display/click-target splitting, not sent anywhere.
+  const splitName = (message) => {
+    const idx = message.indexOf("'s ");
+    if (idx === -1) return [message, ''];
+    return [message.slice(0, idx), message.slice(idx)];
+  };
+
+  return (
+    <div className="relative">
+      <button
+        onClick={togglePanel}
+        className="btn-ghost !px-3 !py-1.5 text-[10px] relative"
+        aria-label="Notifications"
+      >
+        🔔
+        {unseenCount > 0 && (
+          <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-gold" aria-hidden="true" />
+        )}
+      </button>
+      {open && (
+        <>
+          {/* Backdrop click-to-close — same idiom as the mobile nav drawer below
+              (`<div className="absolute inset-0 ..." onClick={close} />`),
+              adapted to a small anchored panel instead of a full-screen overlay. */}
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 top-full mt-2 w-80 max-w-[90vw] bg-white border border-line shadow-lg z-50 max-h-96 overflow-y-auto scroll-thin">
+            <div className="px-4 py-3 border-b border-line eyebrow">Notifications</div>
+            {rows.length === 0 ? (
+              <div className="px-4 py-6 text-sm text-steel text-center">No notifications yet.</div>
+            ) : (
+              rows.map((n) => {
+                const [name, rest] = splitName(n.message);
+                return (
+                <div key={n._id} className="px-4 py-3 border-b border-line last:border-b-0 flex items-start gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm">
+                      <button onClick={() => goToCustomer(n)} className="text-gold hover:underline font-medium">{name}</button>
+                      {rest}
+                    </div>
+                    <div className="text-[10px] text-steel mt-1">{timeAgo(n.created_at)}</div>
+                  </div>
+                  <div className="relative shrink-0">
+                    <button
+                      onClick={() => setMenuFor(menuFor === n._id ? null : n._id)}
+                      className="text-steel hover:text-ink px-1.5 leading-none text-sm"
+                      aria-label="Notification options"
+                    >
+                      ⋮
+                    </button>
+                    {menuFor === n._id && (
+                      <div className="absolute right-0 top-full mt-1 w-28 bg-white border border-line shadow-lg z-50">
+                        <button
+                          onClick={() => handleDelete(n)}
+                          className="w-full text-left px-3 py-2 text-[11px] text-steel hover:text-ink hover:bg-mist"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                );
+              })
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function Shell({ children }) {
   const navigate = useNavigate();
   const [me] = useState(() => getMerchantSession());
@@ -50,7 +190,10 @@ export default function Shell({ children }) {
       {/* Mobile top bar */}
       <div className="lg:hidden sticky top-0 z-30 flex items-center justify-between bg-white border-b border-line px-4 py-3">
         <img src={BRAND.logo} alt="85 Lansdowne" className="h-7 object-contain" />
-        <button onClick={() => setOpen(true)} className="btn-ink !px-3 !py-1.5 text-[10px]">☰ Menu</button>
+        <div className="flex items-center gap-2">
+          <NotificationBell />
+          <button onClick={() => setOpen(true)} className="btn-ink !px-3 !py-1.5 text-[10px]">☰ Menu</button>
+        </div>
       </div>
 
       {/* Desktop sidebar */}
@@ -90,6 +233,15 @@ export default function Shell({ children }) {
 
       {/* Content */}
       <main className="lg:ml-60">
+        {/* Desktop-only top-right row (no persistent desktop top strip existed
+            before this — a pure addition, not a resize/restructure of the
+            sidebar or any existing element). Same max-w-6xl mx-auto px-4
+            sm:px-6 content-width wrapper as {children} below, so the bell
+            aligns with existing page content instead of floating at an
+            arbitrary width. */}
+        <div className="hidden lg:flex max-w-6xl mx-auto px-4 sm:px-6 pt-6 justify-end">
+          <NotificationBell />
+        </div>
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 lg:py-8">{children}</div>
       </main>
     </div>

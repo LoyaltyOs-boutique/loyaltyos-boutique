@@ -1796,6 +1796,80 @@ export function dispatchEventRemote(eventId) {
     .catch((err) => ({ ok: false, error: err?.message || 'Dispatch failed.' }));
 }
 
+/* ---------- Dashboard Notifications (bell icon) → Convex bridge ---------- */
+// Design spec: docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
+// Contract parity: function names mirror convex/notifications.ts. Same
+// local-first hydrate-then-subscribe/emit shape as hydrateCustomers()/
+// customers() above — Shell.jsx calls hydrateNotifications() on mount (fire
+// the fetch) and notifications() synchronously (read the cached result),
+// re-rendering via the same subscribe()/emit() flow every other bridge in
+// this file already uses. Unlike customers()/state.users, notifications have
+// no localStorage/offline seed (seed.js is out of scope — see CLAUDE.md
+// 5.4 — and this data is 100% merchant-internal, generated only by the daily
+// cron), so the cache lives in a module-scoped array here, the same idea as
+// the paginatedCustomers cache above, not a new state.* field.
+let notificationsCache = [];
+let notificationsHydrating = false;
+
+/**
+ * Background hydrate: pull the last-30-days notification rows from Convex
+ * and replace the local cache, then emit() so Shell.jsx's useDb()-style
+ * subscribe() re-renders with the real unseen count / row list. Self-guards
+ * against overlapping concurrent calls, same as hydrateCatalogue()/
+ * hydrateCustomers() above.
+ */
+export function hydrateNotifications() {
+  if (notificationsHydrating) return;
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  notificationsHydrating = true;
+  client.query(api.notifications.getNotifications, session)
+    .then((rows) => {
+      notificationsHydrating = false;
+      if (!Array.isArray(rows)) return;
+      notificationsCache = rows;
+      emit();
+    })
+    .catch(() => { notificationsHydrating = false; /* offline — keep last-known cache */ });
+}
+
+/** Synchronous reader for the cached notification rows (newest-first, as returned by Convex). */
+export function notifications() { return notificationsCache; }
+
+/**
+ * Mark every currently-cached row seen (called when the bell panel opens).
+ * Optimistically flips the local cache to seen:true first (so the red dot
+ * clears immediately without waiting on the round-trip), then confirms with
+ * Convex and re-hydrates to pick up anything that arrived in between.
+ */
+export function markAllSeenRemote() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  notificationsCache = notificationsCache.map((n) => ({ ...n, seen: true }));
+  emit();
+  return client.mutation(api.notifications.markAllSeen, session)
+    .then((res) => { hydrateNotifications(); return { ok: true, ...res }; })
+    .catch((err) => ({ ok: false, error: err?.message || 'Could not mark notifications seen.' }));
+}
+
+/**
+ * Delete one notification row (kebab menu → Delete). Optimistically removes
+ * it from the local cache first, then confirms with Convex. Only ever
+ * touches the notifications table server-side (convex/notifications.ts) —
+ * never the underlying birthday/anniversary customer data.
+ */
+export function deleteNotificationRemote(notificationId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  notificationsCache = notificationsCache.filter((n) => n._id !== notificationId);
+  emit();
+  return client.mutation(api.notifications.deleteNotification, { notificationId, ...session })
+    .catch((err) => { hydrateNotifications(); return { ok: false, error: err?.message || 'Delete failed.' }; });
+}
+
 /* ---------- Client onboarding & magic links ---------- */
 const mdFromDate = (iso) => {
   if (!iso) return null;
@@ -2016,3 +2090,8 @@ hydrateCatalogue();
 // background. /merchant/dashboard and /merchant/customers render the
 // localStorage seed instantly, then swap in live Convex reviews.
 hydrateReviews();
+// Dashboard Notifications bridge: hydrate the bell panel's data in the
+// background too, same no-op-until-session-exists guard as the bridges
+// above (merchantSessionArgs() returns null before login, so this is a
+// harmless early no-op on a fresh /login page load).
+hydrateNotifications();

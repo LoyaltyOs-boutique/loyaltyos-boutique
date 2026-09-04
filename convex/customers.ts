@@ -254,6 +254,12 @@ async function findUpcoming(
 
   const hits: QueueHit[] = [];
   for (const c of seen.values()) {
+    // Soft-delete exclusion (schema.ts:74 — "Gate 1 — soft-delete flag;
+    // missing/false = active"): a customer marked is_deleted:true must never
+    // appear in the Delight Queue / AI-drafts cron / Dashboard Notifications,
+    // all three of which share this function. Strict === true check so
+    // missing/undefined/false rows (the vast majority) are unaffected.
+    if (c.is_deleted === true) continue;
     const raw = field === "birthday" ? c.birthday : c.anniversary;
     const parsed = parseMD(raw);
     if (!parsed) continue;
