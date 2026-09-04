@@ -210,6 +210,34 @@ export const generateEventDraft = internalAction({
   },
 });
 
+/**
+ * generateEventDraftPublic — thin public entry point in front of
+ * generateEventDraft (internalAction, above). Internal Convex functions are
+ * never exposed on the generated `api.*` surface, so the frontend has no way
+ * to invoke generateEventDraft directly — this wrapper is the fix.
+ *
+ * Mirrors dispatchEvent's own shape exactly (session-guard-then-delegate):
+ *  1. ctx.runQuery(internal.events.checkMerchantSession, ...) — SAME guard
+ *     dispatchEvent uses below, actions have no ctx.db so the guard is
+ *     wrapped in an internalQuery (see checkMerchantSession's own comment).
+ *  2. ctx.runAction(internal.events.generateEventDraft, ...) — delegates to
+ *     the existing, already-built-and-tested internal action verbatim. No
+ *     logic duplicated, no behavior changed — this wrapper only adds the
+ *     merchant-session check in front of it and forwards the result.
+ */
+export const generateEventDraftPublic = action({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+    eventId: v.id("events"),
+    eventTitle: v.optional(v.string()),
+  },
+  handler: async (ctx, { userId, token, eventId, eventTitle }): Promise<string | null> => {
+    await ctx.runQuery(internal.events.checkMerchantSession, { userId, token });
+    return await ctx.runAction(internal.events.generateEventDraft, { eventId, eventTitle });
+  },
+});
+
 // ============================================================================
 // SECTION 3 — dispatchEvent (merchant-guarded ACTION)
 // ============================================================================

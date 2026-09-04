@@ -1737,6 +1737,65 @@ export function getMerchantSession() {
 }
 export function clearMerchantSession() { localStorage.removeItem(MERC_KEY); }
 
+/* ---------- Virtual Events (Phase 5, Feature C) — Campaigns.jsx "Event Setter" bridge ---------- */
+// Thin wrappers over convex/events.ts, same merchantSessionArgs() pattern as
+// createLookbook/getLookbooksForSelector above — MERCHANT-ONLY, session-gated,
+// local-first-render-free (events have no local/offline seed, so a missing
+// session or client simply yields an empty list / a null result, matching
+// this file's existing offline convention).
+
+/** List events, soonest-first (async). MERCHANT-ONLY. */
+export function getEvents() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.events.getEvents, session).catch(() => []);
+}
+
+/** Create a draft event on Convex (async). MERCHANT-ONLY. */
+export function createEvent(args) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.mutation(api.events.createEvent, { ...args, ...session })
+    .then((doc) => (doc ? { ok: true, event: doc } : { ok: false }))
+    .catch(() => ({ ok: false }));
+}
+
+/**
+ * Ask Gemini to draft an event invitation message (async). MERCHANT-ONLY.
+ *
+ * FIX: convex/events.ts's generateEventDraft is an `internalAction`, not a
+ * public `action` — internal Convex functions are never exposed on the
+ * generated `api.*` surface, so there was no `api.events.generateEventDraft`
+ * for a client to call at all (this used to throw "Could not find public
+ * function" regardless of whether GEMINI_API_KEY was set). Fixed by adding
+ * generateEventDraftPublic, a thin public wrapper in convex/events.ts that
+ * mirrors dispatchEvent's session-guard-then-delegate shape (checkMerchantSession
+ * then ctx.runAction into the real internal action). This call site now
+ * points at that wrapper and passes through the merchant session it requires.
+ */
+export async function generateEventDraftRemote(eventId, eventTitle) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.events.generateEventDraftPublic, { eventId, eventTitle, ...session });
+  } catch {
+    return null;
+  }
+}
+
+/** Dispatch an event's WhatsApp invitations (async). MERCHANT-ONLY. */
+export function dispatchEventRemote(eventId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.action(api.events.dispatchEvent, { eventId, ...session })
+    .then((res) => ({ ok: true, ...res }))
+    .catch((err) => ({ ok: false, error: err?.message || 'Dispatch failed.' }));
+}
+
 /* ---------- Client onboarding & magic links ---------- */
 const mdFromDate = (iso) => {
   if (!iso) return null;
@@ -1845,6 +1904,9 @@ export async function onboardCustomerRemote(f) {
       ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
       ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
       ...(f.whatsapp_consent ? { whatsapp_consent: true } : {}),
+      // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
+      // "only send when truthy" shape immediately above.
+      ...(f.vvip ? { vvip: true } : {}),
     });
     // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
     if (created && !created.ok) {

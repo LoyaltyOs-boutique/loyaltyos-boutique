@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import confetti from 'canvas-confetti';
-import { getData, subscribe, customers, dispatchCampaign } from '../../lib/db.js';
+import { getData, subscribe, customers, dispatchCampaign, getLookbooksForSelector, getEvents, createEvent, generateEventDraftRemote, dispatchEventRemote } from '../../lib/db.js';
 import { cls, fmtDate, inr } from '../../lib/util.js';
 import { Toggle, Tag, Empty } from '../../components/ui.jsx';
 
@@ -24,6 +24,94 @@ export default function Campaigns() {
   const [sending, setSending] = useState(false);
   const [done, setDone] = useState(null);
   const fileRef = useRef(null);
+
+  // Event Setter (Phase 5, Feature C) — fully independent of the Creative
+  // Flyer / Dispatch campaign state above: own fields, own dispatch state,
+  // own handler. Nothing here is read or written by the campaign flow.
+  const [eventTitle, setEventTitle] = useState('');
+  const [eventDesigner, setEventDesigner] = useState('');
+  const [eventDate, setEventDate] = useState('');
+  const [eventTime, setEventTime] = useState('');
+  const [eventAudience, setEventAudience] = useState('all'); // 'all' | 'vvip'
+  const [eventDescription, setEventDescription] = useState('');
+  const [eventMessage, setEventMessage] = useState('');
+  const [eventLookbookOptions, setEventLookbookOptions] = useState([]);
+  const [draftBusy, setDraftBusy] = useState(false);
+  const [draftError, setDraftError] = useState('');
+  const [eventSending, setEventSending] = useState(false);
+  const [eventDone, setEventDone] = useState(null); // dispatch result summary or null
+  const [eventCreateError, setEventCreateError] = useState('');
+  const [events, setEvents] = useState([]);
+
+  // Designer options — reuses Catalogue.jsx's exact getLookbooksForSelector()
+  // pattern (thin {_id, name, kind} projection), filtered to non-PDF designer
+  // lookbooks the same way Catalogue.jsx's designerLookbooks does.
+  useEffect(() => {
+    let mounted = true;
+    getLookbooksForSelector().then((rows) => { if (mounted && Array.isArray(rows)) setEventLookbookOptions(rows); });
+    return () => { mounted = false; };
+  }, []);
+  const eventDesignerLookbooks = eventLookbookOptions.filter((lb) => lb.kind !== 'pdf');
+
+  const refreshEvents = () => { getEvents().then((rows) => { if (Array.isArray(rows)) setEvents(rows); }); };
+  useEffect(() => { refreshEvents(); }, []);
+
+  const eventFieldsMissing = !eventTitle.trim() || !eventDesigner || !eventDate || !eventTime;
+
+  const generateDraft = async () => {
+    setDraftBusy(true);
+    setDraftError('');
+    // Create (or reuse) the draft event first — generateEventDraft needs a
+    // persisted eventId to read title/designer/description from.
+    const eventDatetime = new Date(`${eventDate}T${eventTime}`).getTime();
+    const res = await createEvent({
+      designer_name: eventDesigner,
+      event_datetime: Number.isFinite(eventDatetime) ? eventDatetime : Date.now(),
+      vvip_only: eventAudience === 'vvip',
+      description: eventDescription,
+    });
+    if (!res.ok || !res.event) {
+      setDraftBusy(false);
+      setDraftError("Couldn't generate a draft — try again or write your own.");
+      return;
+    }
+    const draft = await generateEventDraftRemote(res.event._id || res.event.id, eventTitle);
+    setDraftBusy(false);
+    if (!draft) {
+      setDraftError("Couldn't generate a draft — try again or write your own.");
+      return;
+    }
+    setEventMessage(draft);
+    refreshEvents();
+  };
+
+  const dispatchEventSetter = async () => {
+    setEventSending(true);
+    setEventCreateError('');
+    const eventDatetime = new Date(`${eventDate}T${eventTime}`).getTime();
+    const created = await createEvent({
+      designer_name: eventDesigner,
+      event_datetime: Number.isFinite(eventDatetime) ? eventDatetime : Date.now(),
+      vvip_only: eventAudience === 'vvip',
+      description: eventDescription,
+      ...(eventMessage.trim() ? { draft_text: eventMessage.trim() } : {}),
+    });
+    if (!created.ok || !created.event) {
+      setEventSending(false);
+      setEventCreateError('Could not save the event — please try again.');
+      return;
+    }
+    const eventId = created.event._id || created.event.id;
+    const dispatchRes = await dispatchEventRemote(eventId);
+    setEventSending(false);
+    if (!dispatchRes.ok) {
+      setEventCreateError(dispatchRes.error || 'Dispatch failed — please try again.');
+      return;
+    }
+    setEventDone(dispatchRes);
+    confetti({ particleCount: 140, spread: 100, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF'] });
+    refreshEvents();
+  };
 
   const targets = customers().filter((c) => {
     if (!tiers[c.tier]) return false;
@@ -63,6 +151,79 @@ export default function Campaigns() {
       <div className="grid lg:grid-cols-[1fr_360px] gap-8">
         {/* Left — configuration */}
         <div className="space-y-6">
+          <section className="card p-6">
+            <div className="eyebrow mb-4">0 · Event setter</div>
+            <div>
+              <label className="label">Event title</label>
+              <input className="input" value={eventTitle} onChange={(e) => setEventTitle(e.target.value)} placeholder="e.g. Autumn Preview Evening" />
+            </div>
+            <div className="grid sm:grid-cols-2 gap-3 mt-3">
+              <div>
+                <label className="label">Designer</label>
+                <select className="input" value={eventDesigner} onChange={(e) => setEventDesigner(e.target.value)}>
+                  <option value="">Select a designer…</option>
+                  {eventDesignerLookbooks.map((lb) => <option key={lb._id} value={lb.name}>{lb.name}</option>)}
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="label">Date</label>
+                  <input type="date" className="input" value={eventDate} onChange={(e) => setEventDate(e.target.value)} />
+                </div>
+                <div>
+                  <label className="label">Time</label>
+                  <input type="time" className="input" value={eventTime} onChange={(e) => setEventTime(e.target.value)} />
+                </div>
+              </div>
+            </div>
+            <div className="mt-3">
+              <div className="label">Audience</div>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => setEventAudience('all')} className={eventAudience === 'all' ? 'btn-gold' : 'btn-ghost'}>All customers</button>
+                <button type="button" onClick={() => setEventAudience('vvip')} className={eventAudience === 'vvip' ? 'btn-gold' : 'btn-ghost'}>VVIP only</button>
+              </div>
+            </div>
+            <div className="mt-3">
+              <label className="label">Description</label>
+              <textarea className="input min-h-[130px]" value={eventDescription} onChange={(e) => setEventDescription(e.target.value)} placeholder="What should clients know about this event?" />
+            </div>
+            <div className="mt-3">
+              <div className="flex items-center justify-between">
+                <label className="label !mb-0">Message</label>
+                <button type="button" onClick={generateDraft} disabled={draftBusy || eventFieldsMissing} className="btn-ghost !py-1.5 text-[10px] disabled:opacity-40">
+                  {draftBusy ? 'Generating…' : 'Generate AI Draft'}
+                </button>
+              </div>
+              <textarea className="input min-h-[130px] mt-1" value={eventMessage} onChange={(e) => setEventMessage(e.target.value)} placeholder="Invitation message sent to the audience above" />
+              {draftError && <div className="text-xs text-steel mt-1">{draftError}</div>}
+            </div>
+            <div className="flex items-center justify-between gap-4 mt-4">
+              <div className="text-xs text-steel">{eventAudience === 'vvip' ? 'Sent to consented VVIP customers only' : 'Sent to all consented customers'}</div>
+              <button onClick={dispatchEventSetter} disabled={eventSending || eventFieldsMissing} className="btn-gold disabled:opacity-40">
+                {eventSending ? <><span className="h-3 w-3 border-2 border-white/40 border-t-white rounded-full animate-spin" /> Dispatching…</> : 'Dispatch Event'}
+              </button>
+            </div>
+            {eventCreateError && <div className="text-xs text-red-600 mt-2">{eventCreateError}</div>}
+            {eventDone !== null && (
+              <div className="text-sm text-gold animate-fadeUp mt-2">✓ Event dispatched to {eventDone.sentCount ?? 0} of {eventDone.recipientCount ?? 0} recipients.</div>
+            )}
+
+            {/* Past/upcoming events — minimal list, reused getEvents() rows. */}
+            <div className="mt-5 pt-4 border-t border-line">
+              <div className="text-[10px] tracking-wide2 uppercase text-steel mb-2">Events</div>
+              {events.length ? (
+                <div className="space-y-1">
+                  {events.map((ev) => (
+                    <div key={ev.id} className="text-sm text-steel flex items-center justify-between gap-2">
+                      <span>{ev.designer_name} · {new Date(ev.event_datetime).toLocaleString()}</span>
+                      <span className="text-[10px] tracking-wide2 uppercase">{ev.status}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : <div className="text-sm text-steel">No events yet.</div>}
+            </div>
+          </section>
+
           <section className="card p-6">
             <div className="eyebrow mb-4">1 · Creative flyer</div>
             <div

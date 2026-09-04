@@ -61,6 +61,8 @@ function toMerchantCustomer(doc: UserDoc) {
     magic_token_created_at: doc.magic_token_created_at ?? null,
     // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
     whatsapp_consent: doc.whatsapp_consent ?? false,
+    // Phase 5 (Feature C) — VVIP flag drives dispatchEvent's vvip-only recipient filter.
+    vvip: doc.vvip ?? false,
     // CONFIDENTIAL — merchant-only: body-fit measurements + internal staff notes.
     measurements: doc.measurements ?? {},
     staff_notes: doc.staff_notes ?? [],
@@ -778,8 +780,11 @@ export const createCustomer = mutation({
     anniversary: v.optional(v.string()),
     custom_tags: v.optional(v.array(v.string())),
     whatsapp_consent: v.optional(v.boolean()),
+    // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
+    // optional-boolean, upgrade-only shape below (never silently downgraded).
+    vvip: v.optional(v.boolean()),
   },
-  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent }) => {
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent, vvip }) => {
     const digits = mobile.replace(/\D/g, '');
     if (digits.length !== 10) {
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };
@@ -803,6 +808,13 @@ export const createCustomer = mutation({
         await ctx.db.patch(existing._id, { whatsapp_consent: true });
         record = { ...existing, whatsapp_consent: true };
       }
+      // Same upgrade-only shape as whatsapp_consent above — re-onboarding a
+      // customer can mark them VVIP, but a resubmission without the flag
+      // must never silently downgrade an already-VVIP customer.
+      if (vvip === true && existing.vvip !== true) {
+        await ctx.db.patch(existing._id, { vvip: true });
+        record = { ...record, vvip: true };
+      }
       return {
         ok: true,
         isExisting: true,
@@ -825,6 +837,8 @@ export const createCustomer = mutation({
       ...(toMD(anniversary) ? { anniversary_md: toMD(anniversary) } : {}),
       // Only set consent when explicitly opted in — never persist an explicit false.
       ...(whatsapp_consent ? { whatsapp_consent: true } : {}),
+      // Same "only set when true" shape — never persist an explicit false.
+      ...(vvip ? { vvip: true } : {}),
       custom_tags: custom_tags ?? [],
     });
     const created = await ctx.db.get(id);

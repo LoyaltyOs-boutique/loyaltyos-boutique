@@ -22,7 +22,7 @@ const csvToMD = (v) => {
 
 export default function Onboarding() {
   useDb(); // hydrate local customer cache so CSV preview can detect duplicates
-  const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false });
+  const [f, setF] = useState({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false, vvip: false });
   const [result, setResult] = useState(null); // {user, magicLink}
   const [copied, setCopied] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -222,6 +222,18 @@ export default function Onboarding() {
                 I agree to receive WhatsApp updates (birthday/anniversary wishes and offers) from 85 Lansdowne.
               </label>
             </div>
+            <div className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                id="vvip"
+                checked={f.vvip || false}
+                onChange={(e) => setF({ ...f, vvip: e.target.checked })}
+                className="mt-1"
+              />
+              <label htmlFor="vvip" className="text-sm text-steel">
+                Mark this customer as VVIP (for exclusive event invites).
+              </label>
+            </div>
             <button className="btn-ink w-full" type="submit" disabled={creating}>
               {creating ? 'Minting secure link…' : 'Generate magic link'}
             </button>
@@ -253,7 +265,7 @@ export default function Onboarding() {
               <a href={genUrl(result.magicLink)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-2 !border-transparent !text-gold text-[10px]">
                 Preview their lookbook ↗
               </a>
-              <button onClick={() => { setResult(null); setF({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false }); }} className="btn-ghost w-full mt-2 !py-2 text-[10px] border-white/10 text-white/70 hover:text-ink">
+              <button onClick={() => { setResult(null); setF({ name: '', whatsapp: '', calling: '', birthday: '', anniversary: '', city: '', country: 'India', note: '', whatsapp_consent: false, vvip: false }); }} className="btn-ghost w-full mt-2 !py-2 text-[10px] border-white/10 text-white/70 hover:text-ink">
                 ＋ Onboard another client
               </button>
             </div>
