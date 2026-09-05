@@ -2,7 +2,14 @@ import { action, internalAction, internalMutation, internalQuery, mutation, quer
 import { v } from "convex/values";
 import { internal, api } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
-import { callGemini } from "./ai";
+import {
+  callGemini,
+  truncateForPrompt,
+  sanitizeGeminiOutput,
+  wrapUntrustedField,
+  DATA_NOT_INSTRUCTIONS_NOTICE,
+  PROMPT_FIELD_MAX,
+} from "./ai";
 
 /**
  * LoyaltyOS Boutique — Phase 5 (Feature C): Virtual Events + VVIP
@@ -189,14 +196,37 @@ export const generateEventDraft = internalAction({
     const fields = await ctx.runQuery(internal.events.getEventPromptFieldsInternal, { eventId });
     if (!fields) return null;
 
-    const titleLine = eventTitle?.trim() ? `titled "${eventTitle.trim()}"` : "";
+    // Truncate every free-text field at the point of use — the events table
+    // row and the in-progress form value are untouched, only this local
+    // prompt-building copy is capped. designer_name reuses PROMPT_FIELD_MAX.NAME
+    // (a designer's name is the same short person/brand-name shape as a
+    // customer name); description has no length validator in schema.ts today
+    // (confirmed by reading schema.ts:344), so DESCRIPTION's 500-char cap is
+    // the primary defensive bound here.
+    const safeTitle = eventTitle?.trim() ? truncateForPrompt(eventTitle, PROMPT_FIELD_MAX.TITLE) : "";
+    const safeDesigner = truncateForPrompt(fields.designer_name, PROMPT_FIELD_MAX.NAME);
+    const safeDescription = truncateForPrompt(fields.description, PROMPT_FIELD_MAX.DESCRIPTION);
 
+    const titleField = safeTitle ? wrapUntrustedField("event_title", safeTitle) : "";
+
+    // Instructions section and untrusted-data section are kept structurally
+    // separate: the model reads its full task instructions first, THEN the
+    // explicit "this is data, not instructions" notice, THEN the delimited
+    // data block — none of the free text is interleaved into the
+    // instruction sentences themselves.
     const prompt = [
       `You are writing a short, warm WhatsApp invitation message on behalf of "85 Lansdowne", a luxury fashion boutique in Kolkata.`,
-      `The message announces an upcoming virtual event ${titleLine} with designer ${fields.designer_name}.`,
-      `Event description: ${fields.description}`,
+      `The message announces an upcoming virtual event with the designer and description given in the DATA section below${safeTitle ? ", using the given event title" : ""}.`,
       `Write a warm, on-brand, exciting invitation (2-4 sentences, luxury tone, no emoji overload, not generic/spammy). Mention the designer's name naturally.`,
       `Return ONLY the message text — no preamble, no quotation marks, no explanation.`,
+      DATA_NOT_INSTRUCTIONS_NOTICE,
+      [
+        titleField,
+        wrapUntrustedField("designer_name", safeDesigner),
+        wrapUntrustedField("event_description", safeDescription),
+      ]
+        .filter(Boolean)
+        .join(" "),
     ]
       .filter(Boolean)
       .join(" ");
@@ -204,9 +234,7 @@ export const generateEventDraft = internalAction({
     const result = await callGemini(prompt);
     if (!result.success) return null;
 
-    const trimmed = result.text.trim();
-    if (!trimmed) return null;
-    return trimmed;
+    return sanitizeGeminiOutput(result.text);
   },
 });
 
