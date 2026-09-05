@@ -1957,21 +1957,35 @@ export function onboardCustomer(f) {
 
 /**
  * Merchant Client Onboarding (magic-link fix): creates the customer on Convex
- * (createCustomer — unique per WhatsApp number) and rotates a BACKEND-issued
- * magic token (generateMagicToken). The returned link is keyed to the Convex
- * user id, so the client can open their PERSONAL MODULE directly from ANY
- * device — Lookbook.jsx validates via api.auth.validateMagicToken instead of
- * the local-only sync check. Falls back to the local link when Convex is
- * unreachable (same-browser demo keeps working).
+ * (createCustomer — unique per WhatsApp number) and returns a working magic
+ * link. The returned link is keyed to the Convex user id, so the client can
+ * open their PERSONAL MODULE directly from ANY device — Lookbook.jsx
+ * validates via api.auth.validateMagicToken instead of the local-only sync
+ * check. Falls back to the local link when Convex is unreachable (same-
+ * browser demo keeps working).
+ *
+ * SECURITY FIX (2026-09-05): createCustomer now issues the magic token
+ * DIRECTLY on a brand-new signup (same call — see convex/customers.ts), and
+ * on a duplicate mobile it returns ONLY a minimal { isExisting,
+ * alreadyRegistered } signal — no id/token/customer, so anonymous callers
+ * can never pull an existing customer's data. generateMagicTokenSelf now
+ * refuses to (re)issue a token once a customer already has one (closes the
+ * anonymous account-takeover hole), so it can no longer be used here as a
+ * second, unconditional call. This function is merchant-authenticated
+ * (Onboarding.jsx sits behind /login), so the duplicate-mobile branch below
+ * uses the merchant-guarded findCustomerByMobile + generateMagicTokenForCustomer
+ * pair instead — the same pair the CRM's own "resend link" action would use.
  */
 export async function onboardCustomerRemote(f) {
   const client = getConvex();
   if (!client) return createLocalCustomer(f);
 
   const mobile = waDigits(f.whatsapp || f.calling);
+  const baseUrlArg = typeof location !== 'undefined' ? { baseUrl: location.origin } : {};
   try {
-    // One WhatsApp number = ONE profile (createCustomer refuses duplicates and
-    // returns the existing id — re-onboarding then just rotates the token).
+    // One WhatsApp number = ONE profile. A brand-new mobile now gets its
+    // magic token issued in THIS call; a duplicate mobile returns no
+    // identifying data at all (see security-fix note above).
     const created = await client.mutation(api.customers.createCustomer, {
       mobile,
       name: (f.name || 'New Client').trim(),
@@ -1981,26 +1995,37 @@ export async function onboardCustomerRemote(f) {
       // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
       // "only send when truthy" shape immediately above.
       ...(f.vvip ? { vvip: true } : {}),
+      ...baseUrlArg,
     });
-    // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
     if (created && !created.ok) {
-        return { error: created.error };
+      return { error: created.error };
     }
-    
-    // If it's a duplicate or new, we proceed to magic token generation.
-    // If it's a new customer, created.id is the new one.
-    // If it's existing, created.existingId is the existing one.
-    const cvxId = created && (created.id || created.existingId);
 
-    // Rotate/issue the 256-bit magic token on Convex (180-day validity).
-    // Merchant Session Lock (Task 1, Step 9): switched from the deprecated
-    // api.auth.generateMagicToken alias to api.auth.generateMagicTokenSelf —
-    // the PUBLIC variant with byte-identical behavior (see convex/auth.ts's
-    // deprecation comment on generateMagicToken).
-    const linkRes = await client.mutation(api.auth.generateMagicTokenSelf, {
-      mobile,
-      ...(typeof location !== 'undefined' ? { baseUrl: location.origin } : {}),
-    });
+    let linkRes;
+    let cvxId;
+    if (created && created.id && created.token) {
+      // Brand-new signup — createCustomer already minted the token, no
+      // second call needed (the old follow-up call is now blocked anyway).
+      linkRes = { user: created.customer, token: created.token };
+      cvxId = created.id;
+    } else if (created && created.alreadyRegistered) {
+      // Duplicate mobile — merchant-authenticated re-onboarding. Look the
+      // existing customer up via the merchant-guarded query, then mint a
+      // fresh link via the merchant-guarded issuer (never the public,
+      // now-locked generateMagicTokenSelf).
+      const session = merchantSessionArgs();
+      if (!session) return createLocalCustomer(f);
+      const existing = await client.query(api.customers.findCustomerByMobile, { mobile, ...session });
+      if (!existing) return createLocalCustomer(f);
+      linkRes = await client.mutation(api.auth.generateMagicTokenForCustomer, {
+        ...session,
+        customerId: existing.id,
+        ...baseUrlArg,
+      });
+      cvxId = existing.id;
+    } else {
+      return createLocalCustomer(f);
+    }
     if (!linkRes || !linkRes.user || !cvxId) return createLocalCustomer(f);
 
     // Stamp a local row keyed by the CONVEX id so likes/checkout/ledger and

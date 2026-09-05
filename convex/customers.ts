@@ -2,7 +2,7 @@ import { mutation, query, internalQuery, type MutationCtx, type QueryCtx } from 
 import { v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
-import { requireMerchantSession } from "./auth";
+import { requireMerchantSession, issueMagicToken } from "./auth";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -772,11 +772,46 @@ export const findCustomerByMobile = query({
  *
  * UNIQUE KEY CHECK — one WhatsApp number = ONE customer profile:
  * queries users by the by_mobile index first. If ANY user (customer or
- * merchant) already holds this mobile, returns { ok:false, error } and
- * DOES NOT insert a duplicate row.
+ * merchant) already holds this mobile, returns a minimal, non-confidential
+ * "already registered" response (see SECURITY FIX below) and DOES NOT insert
+ * a duplicate row.
  *
- * On success returns { ok:true, id, customer } with the merchant view of
- * the new profile (points: 0, tier: "silver").
+ * On success (brand-new customer) returns { ok:true, id, customer, magicLink,
+ * token, expiresAt } — the new profile PLUS a working magic link issued in
+ * this same call, so a legitimate new signup never needs a separate
+ * self-service token call.
+ *
+ * SECURITY FIX (2026-09-05, anonymous-takeover + dup-mobile-leak audit
+ * finding): this function is PUBLIC (no merchant session — /join self-
+ * onboarding calls it with no auth in the loop). Previously, when `mobile`
+ * matched a PRE-EXISTING customer, the response echoed that customer's full
+ * merchant view — including magic_token, measurements, and staff_notes — to
+ * whoever made the anonymous call. That let anyone who knew/guessed another
+ * customer's WhatsApp number pull their confidential profile data straight
+ * out of this endpoint (a data leak), and separately let auth.ts's
+ * generateMagicTokenSelf mint a fresh working session for that same number
+ * with zero authentication (an account-takeover primitive) — see auth.ts's
+ * fix note.
+ *
+ * Fix, in two parts:
+ *   1. New-insert branch (genuinely new mobile) — issues the magic token
+ *      directly via issueMagicToken (auth.ts), the SAME helper
+ *      generateMagicTokenSelf/generateMagicTokenForCustomer use, so token
+ *      generation logic lives in exactly one place. The new customer gets a
+ *      real, working link from this one call — no follow-up call needed.
+ *   2. Duplicate-mobile branch (mobile belongs to an EXISTING customer) — no
+ *      longer returns the customer record at all. Returns only
+ *      { ok:true, isExisting:true, alreadyRegistered:true } — a safe signal
+ *      the frontend can use to show "you're already on our list", with NO
+ *      magic_token, NO id, NO name, NO measurements, NO staff_notes, and no
+ *      other identifying data about the existing account. The legitimate
+ *      "I already have an account, send my link again" flow belongs to an
+ *      AUTHENTICATED path (magic-link-in-hand or merchant resend via
+ *      generateMagicTokenForCustomer), not an anonymous mobile-number guess.
+ *
+ * Consent/VVIP upgrade-only patch behavior for the duplicate-mobile case is
+ * PRESERVED (still runs, still upgrade-only) — only the RESPONSE shape
+ * changed to stop leaking the record back to the caller.
  */
 export const createCustomer = mutation({
   args: {
@@ -789,8 +824,12 @@ export const createCustomer = mutation({
     // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
     // optional-boolean, upgrade-only shape below (never silently downgraded).
     vvip: v.optional(v.boolean()),
+    // Optional — forwarded to issueMagicToken so the returned magicLink is
+    // built against the calling browser's own origin (mirrors baseUrl on
+    // generateMagicTokenSelf / generateMagicTokenForCustomer).
+    baseUrl: v.optional(v.string()),
   },
-  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent, vvip }) => {
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent, vvip, baseUrl }) => {
     const digits = mobile.replace(/\D/g, '');
     if (digits.length !== 10) {
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };
@@ -809,23 +848,21 @@ export const createCustomer = mutation({
       // A resubmission without the box ticked must not silently downgrade a
       // customer who consented on a prior visit — clearing consent is a
       // separate, more sensitive action outside this flow's scope.
-      let record = existing;
       if (whatsapp_consent === true && existing.whatsapp_consent !== true) {
         await ctx.db.patch(existing._id, { whatsapp_consent: true });
-        record = { ...existing, whatsapp_consent: true };
       }
       // Same upgrade-only shape as whatsapp_consent above — re-onboarding a
       // customer can mark them VVIP, but a resubmission without the flag
       // must never silently downgrade an already-VVIP customer.
       if (vvip === true && existing.vvip !== true) {
         await ctx.db.patch(existing._id, { vvip: true });
-        record = { ...record, vvip: true };
       }
+      // SECURITY FIX — minimal, non-confidential shape only. No id, no name,
+      // no magic_token, no measurements, no staff_notes. See fix note above.
       return {
         ok: true,
         isExisting: true,
-        existingId: record._id,
-        customer: toMerchantCustomer(record),
+        alreadyRegistered: true,
       };
     }
 
@@ -848,10 +885,25 @@ export const createCustomer = mutation({
       custom_tags: custom_tags ?? [],
     });
     const created = await ctx.db.get(id);
+    if (!created) {
+      // Should be unreachable (we just inserted this row) — defensive fallback.
+      return { ok: true, id, customer: null };
+    }
+
+    // SECURITY FIX — issue the magic token for the brand-new customer in this
+    // SAME call, reusing issueMagicToken (auth.ts) so token-generation logic
+    // is never duplicated/diverged across modules. A genuinely new signup now
+    // gets a working link directly from createCustomer — no separate
+    // generateMagicTokenSelf follow-up call needed.
+    const { magicLink, token, expiresAt } = await issueMagicToken(ctx, created, baseUrl);
+
     return {
       ok: true,
       id,
-      customer: created ? toMerchantCustomer(created) : null,
+      customer: toMerchantCustomer({ ...created, magic_token: token, magic_token_created_at: Date.now() }),
+      magicLink,
+      token,
+      expiresAt,
     };
   },
 });

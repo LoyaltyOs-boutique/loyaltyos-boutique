@@ -1,10 +1,20 @@
 import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { onboardCustomerRemote, waMessage, waDigits, customerById } from '../lib/db.js';
+import { waMessage, waDigits, customerById, syncMagicLinkCustomer } from '../lib/db.js';
 import { COUNTRIES, BRAND } from '../data/seed.js';
 
 const input = 'w-full border border-line bg-white px-3 py-3 text-sm outline-none focus:border-ink transition-colors placeholder:text-steel/50';
+
+// Same ISO-date -> "M-D" conversion as db.js's private mdFromDate (not
+// exported, so mirrored here 1:1) — createCustomer expects "M-D", but the
+// <input type="date"> fields on this form give an ISO "YYYY-MM-DD" string.
+const mdFromDate = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${d.getMonth() + 1}-${d.getDate()}`;
+};
 
 export default function Join() {
   const [params] = useSearchParams();
@@ -42,42 +52,59 @@ export default function Join() {
       return;
     }
 
-    const res = await onboardCustomerRemote(f);
-    if (res.error) {
-      // If existing customer (duplicate mobile), generate magic link and show it
-      if (res.existingId) {
-        const client = await import('../lib/db.js').then(m => m.getConvex());
-        if (client) {
-          const { api } = await import('../../convex/_generated/api.js');
-          const linkRes = await client.mutation(api.auth.generateMagicToken, {
-            mobile: mobile,
-            baseUrl: location.origin,
-          });
-          if (linkRes && linkRes.user) {
-            const { syncMagicLinkCustomer } = await import('../lib/db.js');
-            const synced = syncMagicLinkCustomer(linkRes.user, linkRes.token, linkRes.user.id, {
-              location: { city: f.city || '', country: f.country || 'India' },
-            });
-            if (synced) {
-              setResult({ user: synced, magicLink: `/lookbook?id=${linkRes.user.id}&token=${linkRes.token}` });
-              confetti({ particleCount: 150, spread: 100, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF', '#F5EFE6'] });
-              return;
-            }
-          }
-        }
-        // Fallback to local
-        const { createLocalCustomer } = await import('../lib/db.js');
-        const local = createLocalCustomer(f);
-        setResult(local);
-        confetti({ particleCount: 150, spread: 100, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF', '#F5EFE6'] });
+    // SECURITY FIX (2026-09-05): call createCustomer directly instead of the
+    // old db.js onboardCustomerRemote -> generateMagicTokenSelf two-call
+    // chain. createCustomer now issues the magic link for a brand-new
+    // signup in this SAME call (see convex/customers.ts) — no separate
+    // self-service token call needed. On a duplicate mobile it now returns
+    // only a minimal { alreadyRegistered: true } signal, never the existing
+    // customer's magic_token/measurements/staff_notes (closes the anonymous
+    // account-takeover + data-leak hole the old flow had).
+    try {
+      const client = await import('../lib/db.js').then((m) => m.getConvex());
+      const { api } = await import('../../convex/_generated/api.js');
+      if (!client) {
+        setMobileError('Unable to connect — please try again.');
         return;
       }
-      // Invalid number - show inline error
-      setMobileError(res.error);
-      return;
+
+      const created = await client.mutation(api.customers.createCustomer, {
+        mobile,
+        name: f.name.trim(),
+        ...(mdFromDate(f.birthday) ? { birthday: mdFromDate(f.birthday) } : {}),
+        ...(mdFromDate(f.anniversary) ? { anniversary: mdFromDate(f.anniversary) } : {}),
+        ...(f.whatsapp_consent ? { whatsapp_consent: true } : {}),
+        baseUrl: location.origin,
+      });
+
+      if (!created || !created.ok) {
+        // Invalid mobile (createCustomer's own 10-digit check) — show inline error.
+        setMobileError((created && created.error) || 'Please enter a valid 10-digit mobile number');
+        return;
+      }
+
+      if (created.alreadyRegistered) {
+        // Duplicate mobile — no token/profile data was returned (by design).
+        // We deliberately do NOT mint a link for someone else's number from
+        // an anonymous form submit; ask them to use their existing link instead.
+        setMobileError('This WhatsApp number is already registered. Please use the link we sent you earlier, or contact the boutique to have it resent.');
+        return;
+      }
+
+      // Brand-new signup — createCustomer already issued a working magic link.
+      const synced = syncMagicLinkCustomer(created.customer, created.token, created.id, {
+        location: { city: f.city || '', country: f.country || 'India' },
+      });
+      if (!synced) {
+        setMobileError('Something went wrong — please try again.');
+        return;
+      }
+
+      setResult({ user: synced, magicLink: `/lookbook?id=${created.id}&token=${created.token}` });
+      confetti({ particleCount: 150, spread: 100, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF', '#F5EFE6'] });
+    } catch {
+      setMobileError('Something went wrong — please try again.');
     }
-    setResult(res);
-    confetti({ particleCount: 150, spread: 100, origin: { y: 0.3 }, colors: ['#C5A880', '#111111', '#E9DFCF', '#F5EFE6'] });
   };
 
   const link = result ? `${location.origin}${result.magicLink}` : '';

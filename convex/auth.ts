@@ -153,7 +153,7 @@ export const merchantLogin = mutation({
  * 180-day expiry check, and returns the personalised portal link:
  * <base>/lookbook?id=<_id>&token=<token>
  */
-async function issueMagicToken(
+export async function issueMagicToken(
   ctx: MutationCtx,
   customer: UserDoc,
   baseUrl?: string,
@@ -181,10 +181,26 @@ async function issueMagicToken(
 
 /**
  * PRD §3.2 — Generate a zero-login crypto magic link for a customer, self-service.
- * PUBLIC — no merchant session required. Used by /join self-onboarding, where the
- * customer supplies their own mobile number and there is no merchant in the loop.
- * Finds the user by users.by_mobile; behavior is byte-for-byte identical to the
- * original generateMagicToken (see deprecated alias below).
+ * PUBLIC — no merchant session required. Historically used by /join self-onboarding
+ * for BOTH brand-new signups and the duplicate-mobile ("already registered") path.
+ *
+ * SECURITY FIX (2026-09-05, anonymous-takeover audit finding):
+ * createCustomer (convex/customers.ts) now issues the magic token DIRECTLY on its
+ * new-insert branch, so a legitimate brand-new signup no longer needs this function
+ * at all. That leaves this function's only remaining exposure as the anonymous
+ * "regenerate a link for an existing mobile number" path — which is exactly the
+ * account-takeover primitive the audit flagged: any caller who knows/guesses a
+ * customer's mobile number could mint a fresh working session for THEIR account
+ * with zero authentication.
+ *
+ * FIX: refuse to (re)issue a token once a customer already has one. A customer's
+ * magic_token is set the moment they are created (see createCustomer), so under the
+ * new flow this guard means the function can never touch a pre-existing customer's
+ * session — it is only a no-op safety net for a legacy row with no token yet, not a
+ * live self-service "get me a new link" endpoint. This does NOT change the return
+ * shape (still `{ user, magicLink, token, expiresAt } | null`); it just adds one more
+ * condition under which the existing `return null` fires — every caller already
+ * treats null as "could not issue a link" and falls back accordingly.
  */
 export const generateMagicTokenSelf = mutation({
   args: {
@@ -198,6 +214,9 @@ export const generateMagicTokenSelf = mutation({
       .withIndex("by_mobile", (q) => q.eq("mobile", digits))
       .first();
     if (!customer || customer.role !== "customer") return null;
+    // Anonymous-takeover guard — never mint/rotate a token for a customer who
+    // already has one. See fix note above.
+    if (customer.magic_token) return null;
 
     return issueMagicToken(ctx, customer, baseUrl);
   },
@@ -228,10 +247,17 @@ export const generateMagicTokenForCustomer = mutation({
 });
 
 /**
- * @deprecated Kept as a backward-compatible alias so existing callers in
- * src/lib/db.js (api.auth.generateMagicToken) keep working unchanged. A LATER
- * build-order step updates db.js to call generateMagicTokenSelf directly, at
- * which point this alias can be removed. Do not add new callers.
+ * @deprecated Kept as a backward-compatible alias so existing callers
+ * (src/pages/Onboarding.jsx's duplicate-mobile fallback still calls
+ * api.auth.generateMagicToken directly — out of this task's edit scope) keep
+ * working unchanged. Do not add new callers; new code should call
+ * createCustomer (new signups) or generateMagicTokenForCustomer (merchant-
+ * guarded resend) instead.
+ *
+ * SECURITY FIX (2026-09-05): same anonymous-takeover guard as
+ * generateMagicTokenSelf above — this alias must never diverge from that
+ * function's safety behavior, since it is byte-for-byte the same handler.
+ * See generateMagicTokenSelf's doc comment for the full rationale.
  */
 export const generateMagicToken = mutation({
   args: {
@@ -245,6 +271,9 @@ export const generateMagicToken = mutation({
       .withIndex("by_mobile", (q) => q.eq("mobile", digits))
       .first();
     if (!customer || customer.role !== "customer") return null;
+    // Anonymous-takeover guard — never mint/rotate a token for a customer who
+    // already has one. See generateMagicTokenSelf's fix note above.
+    if (customer.magic_token) return null;
 
     return issueMagicToken(ctx, customer, baseUrl);
   },
