@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
+import { rateLimiter } from "./rateLimits";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -796,6 +797,20 @@ export const createCustomer = mutation({
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };
     }
     const normalized = digits;
+
+    // Rate limit (design spec 2026-09-05, Part A4/B) — defense-in-depth
+    // against Critical #2's duplicate-mobile leak vector (see rateLimits.ts).
+    // Non-throwing form ONLY: src/lib/db.js's onboardCustomerRemote wraps
+    // this whole call in a bare `catch { return createLocalCustomer(f) }` —
+    // a thrown rejection would be silently swallowed into a fake local-only
+    // phantom customer with no error shown. Returns the SAME {ok:false,
+    // error} shape as the invalid-mobile check just above, which Join.jsx's
+    // existing res.error / setMobileError handling already renders inline —
+    // zero frontend changes needed.
+    const rl = await rateLimiter.limit(ctx, "createCustomerByMobile", { key: normalized });
+    if (!rl.ok) {
+      return { ok: false, error: "Too many attempts — please try again in a few minutes." };
+    }
     const customerName = name.trim();
     if (!customerName) throw new Error("Customer name is required.");
 

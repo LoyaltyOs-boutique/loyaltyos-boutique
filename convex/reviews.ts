@@ -2,6 +2,7 @@ import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 import { requireMerchantSession } from "./auth";
+import { rateLimiter } from "./rateLimits";
 
 // ============================================================================
 // SECTION 1 — Validators
@@ -55,6 +56,24 @@ export const createReview = mutation({
     rating: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    // Rate limit (design spec 2026-09-05, Part A4/B) — coarser backstop
+    // against deliberate pending-review spam, separate from the existing
+    // DUPLICATE_SUBMIT_WINDOW_MS accidental-double-click guard below. Placed
+    // FIRST, before the existing duplicate-submit lookup, per the design's
+    // "before or alongside" note (Part B files list) — first is simplest and
+    // avoids the duplicate-scan read on an already-throttled caller.
+    // Non-throwing form: src/lib/db.js's submitGmbReview/submitProductReview
+    // write-through already has a bare `.catch(() => {})` on this call (a
+    // pre-existing, out-of-scope gap the design doc's A5 flags explicitly —
+    // a thrown ConvexError would be silently absorbed the same way any other
+    // Convex-side rejection already is today). Returning {ok:false} instead
+    // of throwing keeps this function's own behavior explicit and matches
+    // the non-throwing pattern used everywhere else in this task.
+    const rl = await rateLimiter.limit(ctx, "createReviewByUser", { key: String(args.user_id) });
+    if (!rl.ok) {
+      return { ok: false, error: "Too many review submissions — please try again later.", rateLimited: true };
+    }
+
     const cutoff = Date.now() - DUPLICATE_SUBMIT_WINDOW_MS;
     const recentOwnReviews = await ctx.db
       .query("reviews")

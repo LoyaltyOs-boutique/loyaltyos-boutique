@@ -16,6 +16,7 @@ import type * as events from "../events.js";
 import type * as lookbooks from "../lookbooks.js";
 import type * as notifications from "../notifications.js";
 import type * as orders from "../orders.js";
+import type * as rateLimits from "../rateLimits.js";
 import type * as reviews from "../reviews.js";
 import type * as settings from "../settings.js";
 import type * as templates from "../templates.js";
@@ -36,6 +37,7 @@ declare const fullApi: ApiFromModules<{
   lookbooks: typeof lookbooks;
   notifications: typeof notifications;
   orders: typeof orders;
+  rateLimits: typeof rateLimits;
   reviews: typeof reviews;
   settings: typeof settings;
   templates: typeof templates;
@@ -68,4 +70,6 @@ export declare const internal: FilterApi<
   FunctionReference<any, "internal">
 >;
 
-export declare const components: {};
+export declare const components: {
+  rateLimiter: import("@convex-dev/rate-limiter/_generated/component.js").ComponentApi<"rateLimiter">;
+};

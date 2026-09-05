@@ -5,6 +5,7 @@ import { Resend } from "resend";
 import { internal } from "./_generated/api";
 import type { QueryCtx, MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
+import { rateLimiter } from "./rateLimits";
 
 /**
  * LoyaltyOS Boutique — Auth functions (Step 3)
@@ -193,6 +194,28 @@ export const generateMagicTokenSelf = mutation({
   },
   handler: async (ctx, { mobile, baseUrl }) => {
     const digits = mobile.replace(/\D/g, "");
+
+    // Rate limit (design spec 2026-09-05, Part A4/B) — defense-in-depth
+    // against Critical #1's takeover vector (mints a working 180-day session
+    // for any existing mobile, no auth — see rateLimits.ts). Non-throwing
+    // form ONLY: src/lib/db.js's onboardCustomerRemote wraps this call in a
+    // bare `catch { return createLocalCustomer(f) }` — a THROWN rejection
+    // would be silently swallowed. This function currently returns bare
+    // `null` on "customer not found"; a rate-limit rejection returns an
+    // explicit, distinguishable, non-null object instead ({ok:false,
+    // error, rateLimited:true}) so it is never confused with "not found" by
+    // a caller inspecting the result. (Open item from the design spec's A5:
+    // onboardCustomerRemote's existing `if (!linkRes || !linkRes.user...)
+    // return createLocalCustomer(f)` line still treats ANY non-`.user`
+    // result — including this one — as "fall back to local customer"; that
+    // fallback behavior is a pre-existing gap in src/lib/db.js, explicitly
+    // out of scope for this task per its STRICT FILE SCOPE, and is not made
+    // worse by this change — see task report for detail.)
+    const rl = await rateLimiter.limit(ctx, "magicTokenByMobile", { key: digits });
+    if (!rl.ok) {
+      return { ok: false, error: "Too many attempts — please try again in a few minutes.", rateLimited: true };
+    }
+
     const customer = await ctx.db
       .query("users")
       .withIndex("by_mobile", (q) => q.eq("mobile", digits))
@@ -240,6 +263,18 @@ export const generateMagicToken = mutation({
   },
   handler: async (ctx, { mobile, baseUrl }) => {
     const digits = mobile.replace(/\D/g, "");
+
+    // Rate limit — SAME named limiter as generateMagicTokenSelf (design spec
+    // 2026-09-05, Part A4): this alias has a byte-identical body and is
+    // still an actively-called self-service entry point (Onboarding.jsx /
+    // Join.jsx per the revert's root-cause trace), so it shares one bucket
+    // per mobile rather than getting a second, independent allowance. See
+    // generateMagicTokenSelf above for the full non-throwing-shape rationale.
+    const rl = await rateLimiter.limit(ctx, "magicTokenByMobile", { key: digits });
+    if (!rl.ok) {
+      return { ok: false, error: "Too many attempts — please try again in a few minutes.", rateLimited: true };
+    }
+
     const customer = await ctx.db
       .query("users")
       .withIndex("by_mobile", (q) => q.eq("mobile", digits))

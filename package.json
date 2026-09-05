@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@convex-dev/rate-limiter": "^0.3.2",
     "@vercel/blob": "^2.8.0",
     "@vercel/functions": "^3.9.5",
     "bcryptjs": "^3.0.3",
