@@ -445,12 +445,46 @@ export const getEventForDispatchInternal = internalQuery({
  * becomes openable — it has no bearing on whether/when dispatchEvent runs
  * (design doc (e)).
  *
- * customerId is accepted (per the design doc's signature) so a future
- * VVIP-gate check could be layered on here without changing the call shape;
- * Phase 5 does not add a per-customer VVIP re-check on this read path
- * because dispatchEvent already restricted WHO received the link in the
- * first place — same trust model as validateMagicToken, which does not
- * re-derive eligibility, only validates the token/expiry it already issued.
+ * customerId is accepted (per the design doc's signature) so a per-customer
+ * VVIP-gate check can be layered on here without changing the call shape.
+ *
+ * VVIP RE-CHECK (post-time-lock, added after the original Phase 5 build):
+ * once the time-lock above has already passed (i.e. only on the path that
+ * would otherwise return "unlocked"), a `vvip_only` event additionally
+ * re-reads the REQUESTING customer's CURRENT `vvip` field from `customer`
+ * (the same doc already fetched above by customerId — never a caller-passed
+ * flag; there is no vvip arg in this function's args and none should be
+ * added) and denies access if it is not `true` at read-time. This closes a
+ * gap where dispatchEvent's recipient filter (SECTION 3 above) only
+ * evaluated VVIP eligibility ONCE, at dispatch time — if a merchant later
+ * revokes a customer's `vvip` flag, the customer's already-sent link
+ * (customerId + eventId, no separate secret token — see below) would
+ * otherwise keep working forever, because nothing re-verified eligibility
+ * on the read side. The denial reuses the EXACT SAME response shape as the
+ * time-lock's own denial (`{ status: "locked", event_datetime }`) rather
+ * than a new shape, so the frontend's existing "locked" handling covers
+ * this case with zero changes.
+ *
+ * WHY NO TOKEN WAS ADDED (id-only stays, matching validateMagicToken's
+ * OWN documented reason for requiring one does not apply here):
+ * validateMagicToken requires a real secret 256-bit `token` alongside the
+ * customer id because ITS response returns `toPublicUser(customer)` —
+ * customer-identifying data (name, tier, points, etc.) keyed off a
+ * guessable Convex `_id` alone would let anyone enumerate `_id`s and read
+ * other customers' profiles. getEventAccess's response (`toEventView`)
+ * carries ONLY event fields (designer_name, event_datetime, description,
+ * draft_text, status) — the exact same no-secrets shape already accepted
+ * for `getLookbookById`/`getCatalogueItemById` (convex/lookbooks.ts), which
+ * are public, id-only, no-token reads backing the shipped
+ * `/lookbook/public/:id` route. customerId here is used only to decide
+ * WHICH answer to give (locked/unlocked/denied), never to disclose that
+ * customer's data back to the caller — so the "id alone is enough" public-
+ * lookbook precedent is the one that actually matches this read's shape,
+ * not validateMagicToken's "id alone would leak PII" precedent. Guessing a
+ * customerId here reveals nothing about that customer; it can at most let
+ * someone view the SAME non-secret event details real recipients already
+ * see, or (new, since this is the point of the added check) get correctly
+ * refused if that guessed customer isn't a current VVIP.
  */
 export const getEventAccess = query({
   args: {
@@ -469,6 +503,16 @@ export const getEventAccess = query({
     const unlocked = nowMs >= event.event_datetime - 5 * 60_000;
 
     if (!unlocked) {
+      return { status: "locked" as const, event_datetime: event.event_datetime };
+    }
+
+    // VVIP re-check — ONLY runs once the time-lock has already passed, and
+    // ONLY for vvip_only events; a non-VVIP event's `unlocked` path is
+    // completely untouched by this block (condition is false, falls straight
+    // through to the existing "unlocked" return below, same as before this
+    // change). `customer.vvip` is read fresh from the db.get above — never
+    // trusted from a caller-supplied arg (no such arg exists on this query).
+    if (event.vvip_only && customer.vvip !== true) {
       return { status: "locked" as const, event_datetime: event.event_datetime };
     }
 
