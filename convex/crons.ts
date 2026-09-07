@@ -21,10 +21,33 @@ import { internalAction, internalMutation, internalQuery } from "./_generated/se
  * (convex/_generated/ai/guidelines.md:372-396, "Cron guidelines"):
  *   "Only use the `crons.interval` or `crons.cron` methods to schedule cron
  *    jobs. Do NOT use the `crons.hourly`, `crons.daily`, or `crons.weekly`
- *    helpers." — so this file uses `crons.interval(name, { hours: 24 }, ...)`,
- *    never `crons.daily()`, and registers via the same top-level
- *    `cronJobs()` -> `.interval(...)` -> `export default crons` shape as the
+ *    helpers." — so this file uses `crons.cron(name, "<cron-expression>", ...)`,
+ *    never `crons.daily()`/`.hourly()`/`.weekly()`, and registers via the
+ *    same top-level `cronJobs()` -> `export default crons` shape as the
  *    guidelines' own worked example (guidelines.md:378-396).
+ *
+ * FIXED WALL-CLOCK SCHEDULE (2026-09-07 fix — was `crons.interval({hours:24})`):
+ * `crons.interval({hours: 24})` fires exactly 24h after the last deploy, so
+ * its fire time silently drifts every redeploy — it could land at 3am, 11am,
+ * anything, with no relation to the boutique's actual calendar day. These two
+ * crons compute "tomorrow's" birthday/anniversary window for 85 Lansdowne,
+ * which operates in India Standard Time (UTC+5:30, no daylight-saving — see
+ * customers.ts's `IST_OFFSET_MS` fix, same fixed-offset assumption reused
+ * here), so they need a PREDICTABLE fixed local time, not a deploy-relative
+ * one. Target: 00:05 AM IST (5 minutes past local midnight) daily.
+ *
+ * IST -> UTC arithmetic (double-checked both directions):
+ *   IST = UTC + 5:30  =>  UTC = IST - 5:30
+ *   00:05 - 5:30  =>  borrow a day: 24:05 - 5:30 = 18:35, on the PREVIOUS
+ *   UTC calendar day. So 00:05 IST = 18:35 UTC (the day before).
+ *   Forward check: 18:35 UTC + 5:30 = 24:05 = 00:05 IST the NEXT day. Matches.
+ * => cron expression "35 18 * * *" (minute=35, hour=18 UTC, every day),
+ *    per `crons.cron()`'s real signature (node_modules/convex/src/server/cron.ts):
+ *    `cron(cronIdentifier: string, cron: CronString, functionReference, ...args)`
+ *    where CronString is a standard 5-field expression, e.g. "15 7 * * *".
+ *    `crons.daily({hourUTC, minuteUTC}, ...)` is a real, documented Convex
+ *    helper too, but this project's own guidelines explicitly forbid it — so
+ *    `crons.cron()` with an equivalent expression is the correct choice here.
  */
 
 // ============================================================================
@@ -384,12 +407,15 @@ export const generateDailyNotifications = internalAction({
 
 const crons = cronJobs();
 
-// Runs once every 24 hours — crons.interval, per this project's pinned
-// guidelines (never crons.daily()/.hourly()/.weekly()).
-crons.interval("generate whatsapp ai drafts", { hours: 24 }, internal.crons.generateDailyDrafts, {});
+// Runs daily at a FIXED wall-clock time — 00:05 AM IST == 18:35 UTC the
+// previous day (see the file-header comment above for the full IST<->UTC
+// arithmetic). Uses crons.cron() with a standard 5-field cron expression,
+// per this project's pinned guidelines (never crons.daily()/.hourly()/.weekly()).
+// "35 18 * * *" = minute 35, hour 18 UTC, every day/month/day-of-week.
+crons.cron("generate whatsapp ai drafts", "35 18 * * *", internal.crons.generateDailyDrafts, {});
 
 // New, separate registration — added alongside (not replacing/merging into)
-// the drafts cron above.
-crons.interval("generate dashboard notifications", { hours: 24 }, internal.crons.generateDailyNotifications, {});
+// the drafts cron above. Same fixed 18:35 UTC (00:05 IST) daily schedule.
+crons.cron("generate dashboard notifications", "35 18 * * *", internal.crons.generateDailyNotifications, {});
 
 export default crons;
