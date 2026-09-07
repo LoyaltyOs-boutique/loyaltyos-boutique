@@ -128,10 +128,36 @@ Keep prompts small — 1-3 files max.
 5. Magic link session breaks if magic_token_created_at not preserved through hydration.
 6. Frontend is sacred — ask before editing, verify git diff before merging.
 
-## 14. PHASE 1 REMAINING
-1. Step 9 - Support Tickets (check with user if required or optional - see PRD vs this file conflict)
-2. Step 10 - Final security audit + production deploy + GDPR/DPDPA basics. NOTE: the merchant-session/auth-gap portion of this audit is done and merged — Task 1 (Merchant Session Lock, requireMerchantSession() guard) from branch feat/merchant-session-lock (commits df25962..a99837f) is merged to main via commit 85e20b4. The rest of Step 10 (production deploy + GDPR/DPDPA basics) is still outstanding.
-3. Then Phase 2 planning (WhatsApp API, OTP, gamification, coupons, campaigns)
+## 14. CURRENT STATE + REMAINING (updated 2026-09-07)
+
+Two tiers below. MERGED TO MAIN = live/shipped, usable today on loyaltyos-boutique-three.vercel.app. BRANCH-ONLY (feat/ai-automation-gemini-phase) = built and tested, NOT deployed/live. Always confirm via git branch -vv / git log main..feat/ai-automation-gemini-phase before telling the team something is live — do not assume from memory.
+
+### Done and merged to main, beyond the original Step 1-8 MVP (see PROJECT SUMMARY/TECH STACK for that baseline)
+- Gate 1+2 (4b828e2): CSV bulk customer import, lookbook per-piece share fix + selector, Buy Now/Inquire buttons, PDF in-app preview, OG-preview middleware, whatsapp_consent/is_deleted/size/colour schema fields.
+- Templates Phase 1+2+3 (fbaca0e): media-upload backend, Anniversary/Birthday/Media-Send page, static card-image WhatsApp send via OG-preview middleware, merchant-replaceable card images.
+- WhatsApp Cloud API + Points Ledger + fixes (d013ffd): WhatsApp Cloud API integration + template config + Approve & Send flow, manual-entry drag-drop media upload, WhatsApp consent checkbox + gating, Points Ledger (points_ledger table, awardPoints mutation, tier editor, reason-type dropdown), plus bundled fixes (testimonial-points hardcode, tier-multiplier, Settings layout, Lookbook staleness, stale-CRM-refresh, CRM tab removal, message-action tracking).
+- Merchant Session Lock (85e20b4, ledgered ff1cbcb): requireMerchantSession() guard on 39 merchant-only functions across customers/lookbooks/orders/reviews/settings/templates/whatsapp, db.js wired with session args, plus post-merge fixes (hydration-timing gaps, broken CSV import regression fixed, Points Tool stale-session detection, Activity Ledger fixes, onboarding Staff Note fix, like-toggle fix, premature points-crediting fix, IST timezone fix for birthdays/anniversaries, Dashboard Recent Activity redesign, review-approval crash fix). auth.ts has been touched repeatedly across all of this — never assume it is untouched.
+
+### Built and tested on branch feat/ai-automation-gemini-phase — NOT merged, NOT live
+- Phase 0 scaling fixes: CRM pagination, indexed today's-orders + birthday/anniversary queries.
+- Phase 1 Customer Intelligence: getCustomerIntelligenceProfile (cart/likes intelligence explicitly deferred, Option B).
+- Phase 2: convex/ai.ts Gemini plumbing (fails gracefully with no key).
+- Phase 3: AI message drafts backend (draft-only, does not touch send/approve flow).
+- Phase 5: Events + VVIP backend/frontend (events table, users.vvip, Event Setter UI).
+- Dashboard Notifications bell: notifications table + daily cron + Shell.jsx bell UI, plus UI polish and a red-dot/real-tab-navigation follow-up fix.
+- 2026-09-04/05 full security audit (docs/full-system-audit-2026-09-04.html) + fix round: rate limiting (@convex-dev/rate-limiter) on generateMagicToken*/createCustomer/createReview; AI prompt-injection + output-sanitization hardening in ai.ts/events.ts; getEventAccess VVIP read-time re-check; daily-cron fixed-schedule fix (00:05 AM IST instead of deploy-relative); this CLAUDE.md correction round (an earlier pass fixed 3 stale claims; this is the broader current-state/remaining rewrite that pass deferred).
+- Critical #1/#2 (magic-link account takeover, createCustomer confidential-data leak): a fix was built, pushed, and then REVERTED after it broke live CRM listing + re-onboarding — both vulnerabilities are OPEN AGAIN today, on main and on this branch. Do not re-attempt without reading the 2026-09-05 revert + root-cause-correction ledger entries first.
+
+### Remaining / genuinely open today
+1. Critical #1/#2 — still open, needs a proper fix (OTP/ownership step, or merchant-only token issuance) — last attempt regressed two live flows.
+2. Forgot-password reset still incomplete — no resetPassword mutation consumes the token; /reset-password has no completion path.
+3. Deployed settings data bug — gold.purchasePercent = 0 live (masked by fallback), stray gold.anniversaryBonus = 205.
+4. Events dispatch uses service (24h-window) messages — most cold recipients silently fail; tied to the D-17 WhatsApp large-placeholder template, which is decided but not yet built and is blocked on Meta template approval.
+5. Unbounded .collect() reads remain in getCustomers/getOrders/getReviews/getLookbooks — need pagination before real scale.
+6. Cart/likes intelligence deferred (Option B); Phase 4 of the AI automation plan not started.
+7. External audit items open: CORS credentials issue, customer-enumeration oracle, missing security headers (CSP/XFO/nosniff/Referrer-Policy), tokens in plain localStorage (not HttpOnly), npm audit findings needing breaking major-version bumps (vite/react-router-dom).
+8. Whether/when to merge feat/ai-automation-gemini-phase to main is itself an open decision — nothing on it is live yet.
+9. Phase 2 (original plan): OTP verification (directly relevant to fixing Critical #1/#2), gamification, coupons, broadcast engine, bulk Instagram parser.
 Always ask user what to work on next - never assume.
 
 ---
