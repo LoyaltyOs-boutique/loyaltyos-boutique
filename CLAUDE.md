@@ -29,8 +29,8 @@ Reviews: pending -> owner approves -> points credited.
 Frontend: React 18 + Vite + Tailwind (Ma'am's UI, luxury design gold #C5A880, ink #111111, Playfair Display + Montserrat)
 Backend: Convex serverless, deployment pleasant-cobra-560.eu-west-1.convex.cloud, team loyaltyos-boutique
 Database: Convex tables — users, lookbooks, catalogue_items, orders, campaigns, settings, reviews
-Auth: convex/auth.ts — bcrypt merchant login, 256-bit magic tokens, 180-day expiry, Resend reset
-Backend auth guard: merchant-only Convex functions (39 fns across customers/lookbooks/orders/reviews/settings/templates/whatsapp) now require session validation via requireMerchantSession() in convex/auth.ts — built and complete on branch feat/merchant-session-lock (commits df25962..a99837f), NOT YET merged to main. main itself does not yet have this protection: until this branch merges, any caller with the public Convex URL can still call merchant-only functions with no auth check.
+Auth: convex/auth.ts — bcrypt merchant login, 256-bit magic tokens, 180-day expiry, Resend reset. auth.ts has been modified repeatedly since Step 3.7, not left untouched: 5162ac4 (requireMerchantSession helper), 5545175 (Critical #1/#2 audit fixes) + 1c19ccb (revert of that commit), 4fe1273 (rate limiting via @convex-dev/rate-limiter on generateMagicToken/createCustomer/createReview).
+Backend auth guard: merchant-only Convex functions (39 fns across customers/lookbooks/orders/reviews/settings/templates/whatsapp) now require session validation via requireMerchantSession() in convex/auth.ts — built on branch feat/merchant-session-lock (commits df25962..a99837f) and MERGED to main via merge commit 85e20b4 (ledger recorded in follow-up commit ff1cbcb). auth.ts has also been modified multiple times since that merge — see TECH STACK auth.ts note below.
 Email: Resend, from digital@mouldinnovation.com
 Deploy: Vercel (loyaltyos-boutique-three.vercel.app) + GitHub (LoyaltyOs-boutique/loyaltyos-boutique)
 Old stack (Express/Postgres/Redis/Docker) = ARCHIVED, never reintroduce.
@@ -62,7 +62,7 @@ Readable structure, comments explaining why, typed validators, single source of 
 DO NOT edit: src/components/, src/pages/ (except approved flows), src/App.jsx, src/index.css, src/data/
 Allowed files: src/lib/db.js, src/main.jsx
 Approved flow files (specific sections only): Login.jsx (forgot-password), Lookbook.jsx (auth/waLink), Join.jsx (onboarding), Onboarding.jsx, Customers.jsx (eye/copy/share/edit), Catalogue.jsx (copy/share), PublicLookbook.jsx
-Build must stay ~28.60 kB CSS (grew during WhatsApp Cloud API + Points Ledger feature work on branch feat/whatsapp-cloud-api, not yet merged to main) — report exact size if it changes.
+Build must stay ~30.00 kB CSS (real `npm run build` on 2026-09-07 on branch feat/ai-automation-gemini-phase: dist/assets/index-CCDmCF7r.css 30.00 kB) — report exact size if it changes.
 
 ### 5.5 Ledger rules
 Canonical ledger: .superpowers/sdd/progress.md
@@ -130,7 +130,7 @@ Keep prompts small — 1-3 files max.
 
 ## 14. PHASE 1 REMAINING
 1. Step 9 - Support Tickets (check with user if required or optional - see PRD vs this file conflict)
-2. Step 10 - Final security audit + production deploy + GDPR/DPDPA basics. NOTE: the merchant-session/auth-gap portion of this audit is already done — Task 1 (Merchant Session Lock, requireMerchantSession() guard) is complete on branch feat/merchant-session-lock (commits df25962..a99837f) but NOT YET merged to main. Remaining action for that portion is merging the branch to main; the rest of Step 10 (production deploy + GDPR/DPDPA basics) is still outstanding.
+2. Step 10 - Final security audit + production deploy + GDPR/DPDPA basics. NOTE: the merchant-session/auth-gap portion of this audit is done and merged — Task 1 (Merchant Session Lock, requireMerchantSession() guard) from branch feat/merchant-session-lock (commits df25962..a99837f) is merged to main via commit 85e20b4. The rest of Step 10 (production deploy + GDPR/DPDPA basics) is still outstanding.
 3. Then Phase 2 planning (WhatsApp API, OTP, gamification, coupons, campaigns)
 Always ask user what to work on next - never assume.
 
