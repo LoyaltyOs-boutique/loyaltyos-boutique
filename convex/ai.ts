@@ -182,12 +182,18 @@ export function sanitizeGeminiOutput(text: string): string | null {
 }
 
 /**
- * Gemini REST endpoint — pinned to a stable dated model (gemini-2.0-flash),
+ * Gemini REST endpoint — pinned to a stable named model (gemini-3.5-flash-lite),
  * not "latest", matching whatsapp.ts's GRAPH_API_VERSION pinning discipline.
  * Endpoint shape confirmed against Google's official Gemini API reference
  * (generateContent method) — see PR/report citation for source URLs.
+ *
+ * UPDATED 2026-09-08: gemini-2.0-flash was confirmed retired by Google as of
+ * June 1, 2026. Swapped to gemini-3.5-flash-lite — Google's current,
+ * lowest-cost, GA model per Google's own official model docs. Pure
+ * string-value swap only — callGemini's logic/headers/retry/request-shape
+ * are unchanged.
  */
-const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 /** Hard timeout so a slow/hanging Gemini call can never block the merchant flow. */
