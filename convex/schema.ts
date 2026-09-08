@@ -438,4 +438,38 @@ export default defineSchema({
     // range-only index on created_at (mirrors orders' by_created_at,
     // schema.ts:184) avoids a full-table scan for that global scan.
     .index("by_created_at", ["created_at"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md §b.3
+   *
+   * customer_activity_summaries — one row PER CUSTOMER, upserted (overwritten)
+   * on each daily refresh, never accumulated as history. Holds the latest
+   * Gemini-generated activity summary text for that customer, written ONLY by
+   * convex/crons.ts's generateDailyActivitySummaries cron (via
+   * convex/ai.ts's generateCustomerActivitySummary + the upsert mutation in
+   * ai.ts).
+   *
+   * Deliberately a SEPARATE table from `ai_message_drafts`, not a reuse of
+   * it, even though both are Gemini-generated text rows written by a daily
+   * cron — per the design doc's own §b.3 reasoning: a WhatsApp draft
+   * (customer-facing, sendable, one row per occasion-date awaiting merchant
+   * approve/discard) and an internal activity summary (merchant-facing only,
+   * NEVER sent to the customer, always just "the latest state" not a queue
+   * of pending items) are different concepts with different consumers and
+   * different lifecycle semantics (upsert-latest vs. append-and-triage) —
+   * the same reasoning the design doc gives for keeping this out of
+   * getCustomerIntelligenceProfile too. Confirmed this table's shape matches
+   * that reasoning: no `status` field (nothing to approve/discard, unlike
+   * ai_message_drafts), one row per customer_id (not per occasion/date).
+   */
+  customer_activity_summaries: defineTable({
+    customer_id: v.id("users"),
+    summary_text: v.string(),
+    generated_at: v.number(), // epoch ms — Date.now() at each (re)generation
+  })
+    // Single-row-per-customer upsert + latest-lookup — same "equality-only
+    // point lookup" style as points_ledger's by_customer index, but here the
+    // upsert mutation additionally uses this index to find (and patch) any
+    // existing row instead of always inserting a new one.
+    .index("by_customer", ["customer_id"]),
 });

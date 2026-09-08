@@ -582,6 +582,126 @@ export const generateWeeklyActivityNotifications = internalAction({
 });
 
 // ============================================================================
+// SECTION 5C — Daily per-customer AI activity summary
+// Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md §b.3
+//
+// SIBLING to generateDailyDrafts (SECTION 3) and generateDailyNotifications /
+// generateWeeklyActivityNotifications (SECTIONS 5/5B) — none of those three
+// are modified anywhere in this addition. Finds customers with any tracked
+// activity in the last 7 days (reusing getRecentActivityCustomerIdsInternal,
+// SECTION 5B above, verbatim — same indexed by_created_at global scan the
+// weekly cron already established, no new query invented), then calls
+// ai.ts's generateCustomerActivitySummary + upsertActivitySummary for each,
+// capped + paced with the SAME discipline (constant names reused, not
+// reinvented) as generateDailyDrafts' MAX_DRAFTS_PER_RUN / GEMINI_CALL_DELAY_MS.
+// ============================================================================
+
+/**
+ * Hard cap on how many Gemini activity-summary calls this cron makes per run.
+ *
+ * JUDGMENT CALL: reuses generateDailyDrafts' MAX_DRAFTS_PER_RUN reasoning
+ * (SECTION 1) verbatim rather than inventing a new number — same "50/day
+ * comfortably covers 85 Lansdowne's current and near-term customer base"
+ * argument applies equally here: the set of customers with ANY tracked
+ * activity in a 7-day window is realistically a small fraction of the total
+ * customer base, so 50 is a generous ceiling, not a routine bottleneck.
+ * Named separately from MAX_DRAFTS_PER_RUN (not literally the same constant)
+ * because the two crons cap two independent, unrelated batches — a future
+ * change to one cap should not silently change the other's behavior — but
+ * the VALUE is deliberately kept identical per the instruction to reuse this
+ * project's established cap discipline rather than invent new numbers
+ * without reason.
+ */
+const MAX_ACTIVITY_SUMMARIES_PER_RUN = 50;
+
+/**
+ * getCustomerTierInternal — tiny by-_id lookup used only to fetch the tier
+ * enum generateCustomerActivitySummary's args require (name is already
+ * available from crons.ts's own getCustomerNameInternal, SECTION 5B — this
+ * adds the one additional field that helper doesn't return). A single
+ * point-lookup by primary key, not a scan.
+ *
+ * Defensive default: a customer row with no `tier` set (schema.ts allows
+ * v.optional) falls back to "silver" — matches this codebase's existing
+ * "silver is the baseline/default tier" convention (tier rules: minPoints 0
+ * for silver, the lowest tier a customer can be in).
+ */
+export const getCustomerTierInternal = internalQuery({
+  args: { customerId: v.id("users") },
+  handler: async (ctx, { customerId }) => {
+    const doc = await ctx.db.get(customerId);
+    return (doc?.tier ?? "silver") as "silver" | "gold" | "platinum";
+  },
+});
+
+/**
+ * generateDailyActivitySummaries — this cron's body (SECTION 6 registers it,
+ * daily at 00:15 AM IST — see registration comment for the double-checked
+ * IST->UTC arithmetic). Runs independently of, and does not call or modify,
+ * generateDailyDrafts / generateDailyNotifications / generateWeeklyActivityNotifications.
+ *
+ * Steps:
+ *   1. Find all customers with any tracked activity (like/cart_add/
+ *      lookbook_view/event_link_click) in the last 7 days — the SAME
+ *      indexed by_created_at global scan getRecentActivityCustomerIdsInternal
+ *      (SECTION 5B) already implements for the weekly notification cron;
+ *      reused verbatim rather than re-implemented.
+ *   2. Reduce to a distinct customer_id list (dedup — a customer with 5
+ *      events should only get ONE summary call, not 5).
+ *   3. Cap at MAX_ACTIVITY_SUMMARIES_PER_RUN (batch discipline, see above).
+ *   4. For each remaining customer (sequential, paced): fetch name+tier,
+ *      call ai.ts's generateCustomerActivitySummary, and on a non-null
+ *      result upsert it via ai.ts's upsertActivitySummary. Paced with the
+ *      SAME GEMINI_CALL_DELAY_MS (SECTION 1) generateDailyDrafts already
+ *      uses between sequential Gemini calls — not a new delay value.
+ */
+export const generateDailyActivitySummaries = internalAction({
+  args: {},
+  handler: async (ctx): Promise<{ activeCustomers: number; summarized: number }> => {
+    // Step 1 — same indexed 7-day global read the weekly cron uses.
+    const customerIds = await ctx.runQuery(internal.crons.getRecentActivityCustomerIdsInternal, {
+      sinceMs: Date.now() - SEVEN_DAYS_MS,
+    });
+
+    // Step 2 — dedup to distinct customers.
+    const distinctCustomerIds = Array.from(new Set(customerIds));
+
+    let summarizedCount = 0;
+
+    for (const customerId of distinctCustomerIds) {
+      // Step 3 — cap: stop generating new summaries once this run's batch
+      // limit is reached (mirrors generateDailyDrafts' identical cap check).
+      if (summarizedCount >= MAX_ACTIVITY_SUMMARIES_PER_RUN) break;
+
+      // Step 4 — fetch the two fields generateCustomerActivitySummary's args
+      // require beyond customerId itself.
+      const name = await ctx.runQuery(internal.crons.getCustomerNameInternal, { customerId });
+      const tier = await ctx.runQuery(internal.crons.getCustomerTierInternal, { customerId });
+
+      const summaryText: string | null = await ctx.runAction(internal.ai.generateCustomerActivitySummary, {
+        customerId,
+        customerName: name,
+        tier,
+      });
+
+      if (summaryText) {
+        await ctx.runMutation(internal.ai.upsertActivitySummary, {
+          customerId,
+          summaryText,
+        });
+        summarizedCount += 1;
+      }
+
+      // Pacing — sequential, spaced-out Gemini calls, same fixed delay
+      // generateDailyDrafts already uses (SECTION 1), not a new value.
+      await delay(GEMINI_CALL_DELAY_MS);
+    }
+
+    return { activeCustomers: distinctCustomerIds.length, summarized: summarizedCount };
+  },
+});
+
+// ============================================================================
 // SECTION 6 — Cron registration
 // ============================================================================
 
@@ -627,6 +747,31 @@ crons.cron(
   "generate weekly activity notifications",
   "40 18 * * 0",
   internal.crons.generateWeeklyActivityNotifications,
+  {},
+);
+
+// Daily per-customer AI activity summary (Customer Activity Intelligence
+// Part 3a, SECTION 5C above) — runs every day at a FIXED wall-clock time,
+// 00:15 AM IST, DISTINCT from the 00:05 IST slot the two existing daily
+// crons use above (deliberately staggered so all three daily jobs don't fire
+// in the same minute).
+//
+// IST -> UTC arithmetic (double-checked both directions, same method as the
+// file-header comment's and SECTION 6's weekly-cron derivation above — this
+// project has already caught one real off-by-one error in the design doc's
+// own worked cron example, so this is re-derived from scratch, not assumed):
+//   IST = UTC + 5:30  =>  UTC = IST - 5:30
+//   00:15 - 5:30  =>  borrow a day: 24:15 - 5:30 = 18:45, on the PREVIOUS
+//   UTC calendar day. So 00:15 IST = 18:45 UTC (the day before).
+//   Forward check: 18:45 UTC + 5:30 = 24:15 = 00:15 IST the NEXT day. Matches.
+// Unlike the weekly cron above, this fires every day (no day-of-week
+// restriction), so the day-of-week field stays "*", same as the two existing
+// daily crons.
+// => cron expression "45 18 * * *" (minute=45, hour=18 UTC, every day).
+crons.cron(
+  "generate daily activity summaries",
+  "45 18 * * *",
+  internal.crons.generateDailyActivitySummaries,
   {},
 );
 

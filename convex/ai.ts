@@ -1,8 +1,9 @@
-import { action, internalAction, internalQuery } from "./_generated/server";
+import { action, internalAction, internalMutation, internalQuery, query } from "./_generated/server";
 import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
 import { SETTINGS_KEYS, type WhatsAppTemplateType } from "./settings";
+import type { Id } from "./_generated/dataModel";
 
 /**
  * Gemini AI integration — Phase A plumbing only.
@@ -431,5 +432,272 @@ export const testGeminiConnection = action({
     await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
 
     return callGemini("Reply with the single word: OK");
+  },
+});
+
+// ============================================================================
+// SECTION 5 — Customer Activity Intelligence Part 3a: per-customer AI summary
+// Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md §b.3, §b.4
+//
+// Part 1 (commits 6abc85f/cd69533) built real customer_activity_events
+// tracking (convex/activity.ts). Part 2 (commits 3832593/89fc9b1) built the
+// weekly "most active" bell notification. This part builds the DAILY,
+// per-customer Gemini-written activity summary — co-located here in ai.ts,
+// not a new file, matching this file's established scope ("ai.ts ... is
+// reserved for actions that call the external Gemini API", Phase 1 doc's own
+// file-placement reasoning, restated in the design doc §b.3).
+// ============================================================================
+
+const SEVEN_DAYS_MS_AI = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * getRecentActivityCountsInternal — per-customer, 7-day-bounded activity
+ * counts by action type, read via the by_customer_created_at index (Part 1's
+ * FIRST index, purpose-built for exactly this "one customer's activity in
+ * [start, now]" read pattern — see schema.ts's own comment on that index).
+ * Bounded by one customer's one-week event volume, not a full-table scan.
+ *
+ * Returns only aggregate counts — never raw per-event rows — since the
+ * summary prompt only needs "2 likes, 1 cart-add, 1 lookbook view", not the
+ * underlying catalogue_item_id/lookbook_id detail.
+ */
+export const getRecentActivityCountsInternal = internalQuery({
+  args: { customerId: v.id("users"), sinceMs: v.number() },
+  handler: async (ctx, { customerId, sinceMs }) => {
+    const rows = await ctx.db
+      .query("customer_activity_events")
+      .withIndex("by_customer_created_at", (q) =>
+        q.eq("customer_id", customerId).gte("created_at", sinceMs),
+      )
+      .collect();
+
+    let likes = 0;
+    let cartAdds = 0;
+    let lookbookViews = 0;
+    for (const row of rows) {
+      if (row.action === "like") likes += 1;
+      else if (row.action === "cart_add") cartAdds += 1;
+      else if (row.action === "lookbook_view") lookbookViews += 1;
+      // event_link_click intentionally not surfaced in the summary prompt —
+      // not part of the "likes/cart-adds/lookbook-views" picture this task
+      // scopes; nothing currently writes that action type either (Part 1's
+      // documented gap).
+    }
+    return { likes, cartAdds, lookbookViews };
+  },
+});
+
+/**
+ * getPurchaseSummaryInternal — this customer's purchase-history AGGREGATE
+ * (order count + total spend in paise) read directly from the existing
+ * `orders` table via its by_user index (same index getCustomerIntelligenceProfile
+ * and getOrdersByUser already use, customers.ts) — no duplication of order
+ * data into a new table, per the design doc §a's "purchases are explicitly
+ * NOT duplicated" rule.
+ *
+ * Deliberately returns ONLY a count + a paise total, never raw order rows or
+ * any other free-text order field — orders in this schema carry no free-text
+ * fields today (subtotal/points_applied/discount_value/payment_method/
+ * final_total/points_earned/created_at are all numbers or a closed
+ * literal-union), so there is no untrusted free text here that would need
+ * the truncateForPrompt/wrapUntrustedField treatment Fix 5 established for
+ * genuinely free-text fields (customer name, event description, etc.) — the
+ * only free text this prompt ever interpolates is customerName, handled the
+ * same way generateMessageDraft already handles it below.
+ */
+export const getPurchaseSummaryInternal = internalQuery({
+  args: { customerId: v.id("users") },
+  handler: async (ctx, { customerId }) => {
+    const orders = await ctx.db
+      .query("orders")
+      .withIndex("by_user", (q) => q.eq("user_id", customerId))
+      .collect();
+    const totalSpendPaise = orders.reduce((sum, o) => sum + o.final_total, 0);
+    return { orderCount: orders.length, totalSpendPaise };
+  },
+});
+
+/**
+ * generateCustomerActivitySummary — Part 3a. Builds a Gemini prompt for one
+ * customer's recent (last 7 days) engagement + purchase-history aggregate and
+ * returns a merchant-facing summary of their activity, or null on ANY
+ * failure — same fail-gracefully contract as generateMessageDraft (never
+ * throws, so a cron loop over many customers can never be halted by one
+ * bad/missing-key call).
+ *
+ * CONFIDENTIALITY (structural, same guarantee generateMessageDraft already
+ * has — see that function's own comment above): this handler's own DB reads
+ * are exactly two internal queries — getRecentActivityCountsInternal
+ * (customer_activity_events) and getPurchaseSummaryInternal (orders). Neither
+ * table has a `measurements` or `staff_notes` column, so there is no code
+ * path by which either confidential field could reach this prompt — it is
+ * impossible by construction, not merely by convention. This function never
+ * fetches the full `users` document at all; `customerName`/`tier` are passed
+ * in as args by the caller (crons.ts), exactly matching generateMessageDraft's
+ * own args-only shape.
+ *
+ * internalAction (not a public `action`) — only ever called from crons.ts's
+ * generateDailyActivitySummaries, never from the frontend directly.
+ */
+export const generateCustomerActivitySummary = internalAction({
+  args: {
+    customerId: v.id("users"),
+    customerName: v.string(),
+    tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+  },
+  handler: async (ctx, { customerId, customerName, tier }): Promise<string | null> => {
+    // Aggregate activity picture — last 7 days, indexed per-customer read.
+    const activity = await ctx.runQuery(internal.ai.getRecentActivityCountsInternal, {
+      customerId,
+      sinceMs: Date.now() - SEVEN_DAYS_MS_AI,
+    });
+
+    // Purchase-history aggregate — read directly from `orders`, not duplicated.
+    const purchases = await ctx.runQuery(internal.ai.getPurchaseSummaryInternal, { customerId });
+    const totalSpendRupees = Math.floor(purchases.totalSpendPaise / 100);
+
+    // Truncate every free-text field at the point of use — same discipline
+    // generateMessageDraft uses; only customerName/tier are free-ish text
+    // here (tier is a closed enum, capped anyway per PROMPT_FIELD_MAX's own
+    // "defense in depth" reasoning for ENUM fields).
+    const safeName = truncateForPrompt(customerName, PROMPT_FIELD_MAX.NAME);
+    const safeTier = truncateForPrompt(tier, PROMPT_FIELD_MAX.ENUM);
+
+    // Activity/purchase counts are all plain numbers computed server-side
+    // (never user-supplied free text), so they are interpolated directly —
+    // no wrapUntrustedField needed for pure numeric aggregates, same posture
+    // generateMessageDraft takes with its own numeric-shaped promo fields.
+    const activitySummaryLine =
+      `In the last 7 days: ${activity.likes} like(s), ${activity.cartAdds} cart-add(s), ` +
+      `${activity.lookbookViews} lookbook view(s).`;
+    const purchaseSummaryLine =
+      purchases.orderCount > 0
+        ? `Purchase history: ${purchases.orderCount} order(s) totalling approximately ₹${totalSpendRupees}.`
+        : `Purchase history: no orders yet.`;
+
+    const prompt = [
+      `You are writing a short, internal note for the staff of "85 Lansdowne", a luxury fashion boutique in Kolkata, about one of their loyalty customers.`,
+      `Write a brief (2-3 sentences), factual, merchant-facing summary of this customer's recent engagement and purchase history, in a professional tone. This note is for STAFF EYES ONLY — it will never be sent to the customer, so do not address them directly or write it as a message to them.`,
+      `Base the summary ONLY on the DATA section below (the customer's name/tier and the activity/purchase figures) — do not invent details not present in the data.`,
+      `Return ONLY the summary text — no preamble, no quotation marks, no explanation.`,
+      DATA_NOT_INSTRUCTIONS_NOTICE,
+      [
+        wrapUntrustedField("customer_name", safeName),
+        wrapUntrustedField("customer_tier", safeTier),
+        wrapUntrustedField("recent_activity", activitySummaryLine),
+        wrapUntrustedField("purchase_history", purchaseSummaryLine),
+      ].join(" "),
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const result = await callGemini(prompt);
+    if (!result.success) return null;
+
+    return sanitizeGeminiOutput(result.text);
+  },
+});
+
+/**
+ * upsertActivitySummary — internal mutation, one row PER CUSTOMER in
+ * customer_activity_summaries: patches the existing row if one exists for
+ * this customer_id (queried via the by_customer index, never a scan),
+ * otherwise inserts a new one. Matches schema.ts's own "upserted, never
+ * accumulated as history" comment on that table.
+ *
+ * Called only from crons.ts's generateDailyActivitySummaries, once per
+ * active customer, after a non-null generateCustomerActivitySummary result.
+ */
+export const upsertActivitySummary = internalMutation({
+  args: {
+    customerId: v.id("users"),
+    summaryText: v.string(),
+  },
+  handler: async (ctx, { customerId, summaryText }) => {
+    const existing = await ctx.db
+      .query("customer_activity_summaries")
+      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .first();
+
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        summary_text: summaryText,
+        generated_at: Date.now(),
+      });
+    } else {
+      await ctx.db.insert("customer_activity_summaries", {
+        customer_id: customerId,
+        summary_text: summaryText,
+        generated_at: Date.now(),
+      });
+    }
+    return null;
+  },
+});
+
+/**
+ * getActiveCustomers — merchant-guarded query (Part 3a backend prep for the
+ * future Part 3b Dashboard section — NOT wired to any UI in this task).
+ *
+ * FILE PLACEMENT judgment call: kept here in ai.ts (not customers.ts) for
+ * cohesion with the rest of this Customer Activity Intelligence Part 3a
+ * work (getRecentActivityCountsInternal, generateCustomerActivitySummary,
+ * upsertActivitySummary all live here too), and because this task's STRICT
+ * scope only permits touching schema.ts/ai.ts/crons.ts — customers.ts is not
+ * in scope for this task. The design doc's own §b.4 sketch also placed this
+ * in "convex/customerActivity.ts" (a file that, per the real Part 1 code,
+ * turned out to be named activity.ts instead) rather than customers.ts, so
+ * co-locating in ai.ts is consistent with that intent even though the exact
+ * filename differs from the doc's sketch.
+ *
+ * Returns customers with activity in the last `days` (default 7) days,
+ * joined with their latest cached summary_text (null if none generated yet).
+ * Indexed range read only (by_created_at on customer_activity_events, bounded
+ * by the days window) + one by_customer point-lookup per distinct active
+ * customer for the summary join — no unbounded .collect() over users or
+ * customer_activity_summaries, matching Part F #9's stated concern.
+ */
+export const getActiveCustomers = query({
+  args: { userId: v.id("users"), token: v.string(), days: v.optional(v.number()) },
+  handler: async (
+    ctx,
+    { userId, token, days },
+  ): Promise<Array<{ customerId: Id<"users">; name: string; activityCount: number; latestSummary: string | null }>> => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const since = Date.now() - (days ?? 7) * 24 * 60 * 60 * 1000;
+    const events = await ctx.db
+      .query("customer_activity_events")
+      .withIndex("by_created_at", (q) => q.gte("created_at", since))
+      .collect();
+
+    // Group + count in memory — bounded by one window's event volume, not
+    // the full table (same posture as crons.ts's
+    // generateWeeklyActivityNotifications count-by-customer reduction).
+    const countByCustomer = new Map<Id<"users">, number>();
+    for (const row of events) {
+      countByCustomer.set(row.customer_id, (countByCustomer.get(row.customer_id) ?? 0) + 1);
+    }
+
+    const results: Array<{ customerId: Id<"users">; name: string; activityCount: number; latestSummary: string | null }> = [];
+    for (const [customerId, activityCount] of countByCustomer.entries()) {
+      const customerDoc = await ctx.db.get(customerId);
+      if (!customerDoc) continue; // defensive — customer deleted since the event was recorded
+
+      const summaryRow = await ctx.db
+        .query("customer_activity_summaries")
+        .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+        .first();
+
+      results.push({
+        customerId,
+        name: customerDoc.name,
+        activityCount,
+        latestSummary: summaryRow?.summary_text ?? null,
+      });
+    }
+
+    results.sort((a, b) => b.activityCount - a.activityCount);
+    return results;
   },
 });
