@@ -386,4 +386,45 @@ export default defineSchema({
     // Range-read "not expired" (< 30 days old) rows — same shape as orders'
     // by_created_at index (schema.ts:184).
     .index("by_created_at", ["created_at"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md
+   *
+   * customer_activity_events — real, durable per-customer tracking of the
+   * four non-purchase engagement signals (cart_add, like, lookbook_view,
+   * event_link_click), replacing today's frontend-only like/cart state with
+   * real Convex persistence. Written ONLY by convex/activity.ts's
+   * trackActivity mutation, which is deliberately PUBLIC/unguarded (no
+   * requireMerchantSession) — the caller is always the customer's own
+   * browser, which has no merchant token (customers authenticate via a
+   * completely separate magic-link mechanism, see auth.ts's
+   * validateMagicToken). Same posture as createReview/generateMagicTokenSelf.
+   *
+   * Purchases are explicitly NOT duplicated here — purchase history is read
+   * directly from the existing `orders` table (by_user index) by the future
+   * per-customer activity-summary function. One source of truth per concern.
+   */
+  customer_activity_events: defineTable({
+    customer_id: v.id("users"),
+    action: v.union(
+      v.literal("cart_add"),
+      v.literal("like"),
+      v.literal("lookbook_view"),
+      v.literal("event_link_click"),
+    ),
+    catalogue_item_id: v.optional(v.id("catalogue_items")), // cart_add / like
+    lookbook_id: v.optional(v.id("lookbooks")),              // lookbook_view
+    event_id: v.optional(v.id("events")),                    // event_link_click
+    created_at: v.number(), // epoch ms
+  })
+    // Primary read pattern: "this customer's activity in [start, now]" for
+    // the future daily summary + weekly most-active scan. Equality prefix on
+    // customer_id, then a range on created_at — same "equality field first"
+    // index style as by_role_birthday_md / by_customer_occasion_date above.
+    .index("by_customer_created_at", ["customer_id", "created_at"])
+    // Secondary read pattern: a future weekly cron needs "all activity in
+    // the last 7 days across all customers" to find who's active — a
+    // range-only index on created_at (mirrors orders' by_created_at,
+    // schema.ts:184) avoids a full-table scan for that global scan.
+    .index("by_created_at", ["created_at"]),
 });

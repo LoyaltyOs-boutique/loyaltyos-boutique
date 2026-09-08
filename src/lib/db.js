@@ -1066,6 +1066,9 @@ export function likeItem(userId, itemId) {
   if (alreadyLiked) {
     // Unlike: remove this customer, decrement counter. No new feed event —
     // removing a like is not something the merchant needs to be notified of.
+    // Customer Activity Intelligence (Part 1): matching that same "unlike is
+    // a state change, not an activity" reasoning, no trackActivity row is
+    // written on this branch either — see design doc §b.1.
     item.likedBy = item.likedBy.filter((id) => id !== userId);
     item.likes = Math.max(0, (item.likes || 0) - 1);
   } else {
@@ -1075,6 +1078,70 @@ export function likeItem(userId, itemId) {
     pushEvent(userId, 'like', `${user.name} liked ${item.title} ♥`);
   }
   emit();
+
+  // Customer Activity Intelligence (Part 1, design doc §b.1): fire a
+  // fire-and-forget Convex tracking write on the genuine first-like branch
+  // ONLY — never blocks/delays the local toggle above (already committed via
+  // emit()), and any failure is fully swallowed so it can never surface to
+  // the customer. Requires a real Convex customer id (the customer's own
+  // browser has no merchant session — see activity.ts's auth note).
+  if (!alreadyLiked) {
+    const client = getConvex();
+    const customerConvexId = user.convexId || (user._isConvex ? user.id : null);
+    const itemConvexId = item.convexId || (item._isConvex ? item.id : null);
+    if (client && customerConvexId) {
+      try {
+        client.mutation(api.activity.trackActivity, {
+          customerId: customerConvexId,
+          action: 'like',
+          ...(itemConvexId ? { catalogueItemId: itemConvexId } : {}),
+        }).catch(() => { /* tracking failure must never surface to the customer */ });
+      } catch { /* same */ }
+    }
+  }
+}
+
+/**
+ * Customer Activity Intelligence (Part 1, design doc §b.1) — fire-and-forget
+ * cart_add tracking, called from Lookbook.jsx's existing addToCart handler
+ * alongside (never instead of, never gating) its own setCart(...) call. The
+ * cart itself stays a plain useState — this is strictly an additive tracking
+ * side-effect, matching the design doc's explicit "not Option A" decision.
+ */
+export function trackCartAdd(userId, itemId) {
+  const client = getConvex();
+  const user = state.users.find((u) => u.id === userId);
+  const item = state.catalogueItems.find((i) => i.id === itemId);
+  const customerConvexId = user && (user.convexId || (user._isConvex ? user.id : null));
+  const itemConvexId = item && (item.convexId || (item._isConvex ? item.id : null));
+  if (!client || !customerConvexId) return;
+  try {
+    client.mutation(api.activity.trackActivity, {
+      customerId: customerConvexId,
+      action: 'cart_add',
+      ...(itemConvexId ? { catalogueItemId: itemConvexId } : {}),
+    }).catch(() => { /* tracking failure must never surface to the customer */ });
+  } catch { /* same */ }
+}
+
+/**
+ * Customer Activity Intelligence (Part 1, design doc §b.2) — fire-and-forget
+ * lookbook_view tracking, called once from a mount-only effect on the
+ * customer's personal lookbook page (Lookbook.jsx). `lookbookId` is optional
+ * (a whole-catalogue view has no single lookbook to attribute to).
+ */
+export function trackLookbookView(userId, lookbookId) {
+  const client = getConvex();
+  const user = state.users.find((u) => u.id === userId);
+  const customerConvexId = user && (user.convexId || (user._isConvex ? user.id : null));
+  if (!client || !customerConvexId) return;
+  try {
+    client.mutation(api.activity.trackActivity, {
+      customerId: customerConvexId,
+      action: 'lookbook_view',
+      ...(lookbookId ? { lookbookId } : {}),
+    }).catch(() => { /* tracking failure must never surface to the customer */ });
+  } catch { /* same */ }
 }
 export function adjustPoints(userId, delta, reason) {
   const user = state.users.find((u) => u.id === userId);

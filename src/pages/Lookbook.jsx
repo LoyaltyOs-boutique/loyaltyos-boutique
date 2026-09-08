@@ -7,6 +7,7 @@ import {
   allCatalogue, likeItem, checkout, submitGmbReview, submitProductReview,
   getData, subscribe, customerLedger,
   validateMagicToken, syncMagicLinkCustomer,
+  trackCartAdd, trackLookbookView,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import AccessDenied from './AccessDenied.jsx';
@@ -110,6 +111,20 @@ export default function Lookbook() {
     setDenied(true);
   }, [params, navigate]);
 
+  // Customer Activity Intelligence (Part 1): fire exactly one lookbook_view
+  // per real visit, once `customer` first resolves (auth is async — magic
+  // link / session validation both resolve later than mount). The ref guard
+  // ensures this fires once per page load even though `customer` may be
+  // re-set by the background Convex refresh (lines ~99-104) or by unrelated
+  // re-renders — NOT once per re-render.
+  const viewTrackedRef = useState(() => ({ done: false }))[0];
+  useEffect(() => {
+    if (customer && !viewTrackedRef.done) {
+      viewTrackedRef.done = true;
+      trackLookbookView(customer.id);
+    }
+  }, [customer]);
+
   const catalogue = useMemo(() => allCatalogue(), [db]);
   const reviewedItemIds = useMemo(
     () => customer ? db.reviews.filter((r) => r.userId === customer.id && r.platform === 'in-app').map((r) => r.catalogueItemId) : [],
@@ -136,6 +151,10 @@ export default function Lookbook() {
       const ex = c.find((i) => i.id === item.id);
       return ex ? c.map((i) => (i.id === item.id ? { ...i, qty: i.qty + 1 } : i)) : [...c, { id: item.id, title: item.title, price: item.price, image_url: item.image_url, qty: 1 }];
     });
+    // Customer Activity Intelligence (Part 1): fire-and-forget tracking
+    // side-effect, sequential but independent of setCart above — never
+    // awaited, never gates or rolls back the actual cart add.
+    trackCartAdd(customer.id, item.id);
   };
   const setQty = (id, q) => setCart((c) => c.map((i) => (i.id === id ? { ...i, qty: Math.max(0, q) } : i)).filter((i) => i.qty > 0));
   const doCheckout = (method) => {
