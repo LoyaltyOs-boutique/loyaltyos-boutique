@@ -280,7 +280,12 @@ const NOTIFICATION_THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 export const hasExistingNotification = internalQuery({
   args: {
     customerId: v.id("users"),
-    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    // Widened additively (Customer Activity Intelligence Part 2/3) to also
+    // cover "weekly_activity" — generateDailyNotifications itself is
+    // unmodified and only ever passes "birthday"/"anniversary" here, exactly
+    // as before; generateWeeklyActivityNotifications (SECTION 5B below) is
+    // the sole new caller that passes "weekly_activity".
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary"), v.literal("weekly_activity")),
     occasionDate: v.string(),
   },
   handler: async (ctx, { customerId, occasion, occasionDate }) => {
@@ -302,7 +307,9 @@ export const hasExistingNotification = internalQuery({
 export const insertNotification = internalMutation({
   args: {
     customerId: v.id("users"),
-    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    // Widened additively (Customer Activity Intelligence Part 2/3) — same
+    // reasoning as hasExistingNotification's args above.
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary"), v.literal("weekly_activity")),
     occasionDate: v.string(),
     message: v.string(),
   },
@@ -402,6 +409,179 @@ export const generateDailyNotifications = internalAction({
 });
 
 // ============================================================================
+// SECTION 5B — Weekly "most active customers" bell notification
+// Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md §b.5
+//
+// SIBLING to generateDailyNotifications above — that function (and
+// generateDailyDrafts in SECTION 3) is NOT modified anywhere in this
+// addition. Reuses the SAME `notifications` table and the SAME
+// hasExistingNotification/insertNotification dedup+insert shape, now that
+// schema.ts additively widens `notifications.occasion` to include
+// "weekly_activity" (see schema.ts's own comment on that table). Reads the
+// NEW customer_activity_events table (Part 1, commit 6abc85f) via its
+// by_created_at index — a global, indexed, 7-day-bounded range read, no
+// full-table .collect(). No Gemini call (plain templated string, matching
+// generateDailyNotifications' "no AI, no consent gate" posture).
+// ============================================================================
+
+/**
+ * Hard cap on how many "most active" customers get a notification row in a
+ * single run.
+ *
+ * JUDGMENT CALL: mirrors MAX_DRAFTS_PER_RUN's reasoning (SECTION 1 above) —
+ * a fixed ceiling keeps this weekly job's worst-case latency/write-volume
+ * flat and predictable as the customer base grows, instead of looping over
+ * an unbounded "everyone who did anything this week" list. 10 is chosen
+ * over 50 (the daily-drafts cap) because this is a "most active" TOP-N
+ * digest by design (design doc §b.5: "caps the 'most active' list at a
+ * fixed N (e.g. top 10)") — it is not meant to notify about every active
+ * customer, only highlight the most engaged ones, so a small top-N is the
+ * correct shape here, not just a scalability ceiling. Any customer beyond
+ * the top 10 by activity count simply doesn't get a notification that week;
+ * the dedup check makes re-running this job safe regardless of the cap.
+ */
+const MAX_WEEKLY_ACTIVE_NOTIFICATIONS = 10;
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * getRecentActivityCustomerIdsInternal — indexed, 7-day-bounded global scan
+ * of customer_activity_events via the by_created_at index (Part 1's second
+ * index, purpose-built for exactly this "all activity in the last N days
+ * across all customers" read pattern — see schema.ts's own comment on that
+ * index). Returns raw rows (customer_id + created_at); grouping/counting by
+ * customer happens in the calling action, not here, matching
+ * getActiveCustomers' documented shape in the design doc (§b.4).
+ *
+ * "Active" threshold judgment call (stated explicitly per task instructions):
+ * ANY of the three currently-tracked action types (like / cart_add /
+ * lookbook_view) qualifies — at least ONE event in the last 7 days is enough
+ * to count as "active this week". No minimum count, no requirement to hit
+ * all three types. This matches the design doc's own framing ("who's
+ * active") as a presence signal, not an engagement-depth threshold — the
+ * activityCount surfaced to the merchant (via getActiveCustomers, a
+ * separate query, not built in this task) is what conveys depth, not this
+ * cron's inclusion criterion. event_link_click is included in the index
+ * scan too (no action-type filter applied) since nothing currently writes
+ * that action (Part 1's known, documented gap) — this is forward-compatible
+ * with zero extra code once that tracking is wired up.
+ */
+export const getRecentActivityCustomerIdsInternal = internalQuery({
+  args: { sinceMs: v.number() },
+  handler: async (ctx, { sinceMs }) => {
+    const rows = await ctx.db
+      .query("customer_activity_events")
+      .withIndex("by_created_at", (q) => q.gte("created_at", sinceMs))
+      .collect();
+    return rows.map((r) => r.customer_id);
+  },
+});
+
+/**
+ * getCustomerNameInternal — tiny by-_id lookup used only to build the
+ * per-customer notification message text below (`"<name> was highly active
+ * this week!"`, per the design doc's message convention already used by
+ * generateDailyNotifications' `${hit.name}'s ${occasion} is tomorrow!`).
+ * A single-document `ctx.db.get` by primary key, not a scan — safe to call
+ * once per (already top-N-capped) active customer.
+ */
+export const getCustomerNameInternal = internalQuery({
+  args: { customerId: v.id("users") },
+  handler: async (ctx, { customerId }) => {
+    const doc = await ctx.db.get(customerId);
+    return doc?.name ?? "This customer";
+  },
+});
+
+/**
+ * generateWeeklyActivityNotifications — the weekly cron's body (SECTION 6
+ * registers it, Mondays 00:10 IST). Runs independently of, and does not
+ * call or modify, generateDailyDrafts / generateDailyNotifications.
+ *
+ * Steps:
+ *   1. Read the last-7-days customer_activity_events rows (indexed,
+ *      by_created_at) and reduce to a distinct list of active customer_ids
+ *      with their event counts, sorted most-active-first.
+ *   2. Cap to the top MAX_WEEKLY_ACTIVE_NOTIFICATIONS customers.
+ *   3. Compute this week's Monday date in "M-D" format (same convention
+ *      birthday/anniversary occasion_date already uses).
+ *   4. Skip any customer who already has a "weekly_activity" notification
+ *      for this exact (customer_id, "weekly_activity", mondayDate) tuple —
+ *      via hasExistingNotification, now covering this occasion type too —
+ *      so re-running this cron never duplicates a row.
+ *   5. Insert a new notification row per remaining customer — a generic,
+ *      non-AI message string, same insertNotification mutation
+ *      generateDailyNotifications already uses.
+ *   6. No separate expiry sweep here — deleteExpiredNotifications already
+ *      runs daily via generateDailyNotifications and covers all occasion
+ *      types uniformly (it ranges on created_at, not occasion), so a
+ *      second sweep in this weekly job would be redundant.
+ */
+export const generateWeeklyActivityNotifications = internalAction({
+  args: {},
+  handler: async (ctx): Promise<{ activeCustomers: number; notified: number }> => {
+    // Step 1 — indexed 7-day global read, then group+count in memory (bounded
+    // by one week's event volume, not the full table).
+    const customerIds = await ctx.runQuery(internal.crons.getRecentActivityCustomerIdsInternal, {
+      sinceMs: Date.now() - SEVEN_DAYS_MS,
+    });
+
+    const countByCustomer = new Map<string, number>();
+    for (const id of customerIds) {
+      countByCustomer.set(id, (countByCustomer.get(id) ?? 0) + 1);
+    }
+
+    // Step 2 — sort most-active-first, cap to the top N.
+    const topActive = Array.from(countByCustomer.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_WEEKLY_ACTIVE_NOTIFICATIONS);
+
+    // Step 3 — this week's Monday, "M-D" format (matches parseMD's format
+    // used by birthday/anniversary occasion_date elsewhere in this file).
+    const now = new Date();
+    const dayOfWeek = now.getUTCDay(); // 0=Sunday..6=Saturday
+    const diffToMonday = (dayOfWeek + 6) % 7; // days since most recent Monday
+    const monday = new Date(now.getTime() - diffToMonday * 24 * 60 * 60 * 1000);
+    const mondayDate = `${monday.getUTCMonth() + 1}-${monday.getUTCDate()}`;
+
+    let notifiedCount = 0;
+
+    for (const [customerIdStr] of topActive) {
+      const customerId = customerIdStr as import("./_generated/dataModel").Id<"users">;
+
+      // Step 4 — duplicate-prevention via the by_customer_occasion_date
+      // index, same hasExistingNotification helper generateDailyNotifications
+      // uses, now covering "weekly_activity" too.
+      const alreadyExists = await ctx.runQuery(internal.crons.hasExistingNotification, {
+        customerId,
+        occasion: "weekly_activity",
+        occasionDate: mondayDate,
+      });
+      if (alreadyExists) continue;
+
+      // Step 5 — generic, non-AI message string with the real customer name
+      // (single-document by-_id lookup, not a scan), matching
+      // generateDailyNotifications' `${hit.name}'s ${occasion} is tomorrow!`
+      // naming convention. `count` intentionally not included in the message
+      // text (design doc keeps this a plain templated string); the
+      // per-customer activityCount is surfaced elsewhere (getActiveCustomers,
+      // not built in this task) for merchants who want the numeric detail.
+      const name = await ctx.runQuery(internal.crons.getCustomerNameInternal, { customerId });
+
+      await ctx.runMutation(internal.crons.insertNotification, {
+        customerId,
+        occasion: "weekly_activity",
+        occasionDate: mondayDate,
+        message: `${name} was highly active this week!`,
+      });
+      notifiedCount += 1;
+    }
+
+    return { activeCustomers: countByCustomer.size, notified: notifiedCount };
+  },
+});
+
+// ============================================================================
 // SECTION 6 — Cron registration
 // ============================================================================
 
@@ -417,5 +597,37 @@ crons.cron("generate whatsapp ai drafts", "35 18 * * *", internal.crons.generate
 // New, separate registration — added alongside (not replacing/merging into)
 // the drafts cron above. Same fixed 18:35 UTC (00:05 IST) daily schedule.
 crons.cron("generate dashboard notifications", "35 18 * * *", internal.crons.generateDailyNotifications, {});
+
+// Weekly "most active customers" notification (Customer Activity
+// Intelligence Part 2/3, SECTION 5B above) — runs every Monday at a FIXED
+// wall-clock time, 00:10 AM IST.
+//
+// IST -> UTC arithmetic (double-checked both directions, same method as the
+// file-header comment's daily-cron derivation above):
+//   IST = UTC + 5:30  =>  UTC = IST - 5:30
+//   00:10 - 5:30  =>  borrow a day: 24:10 - 5:30 = 18:40, on the PREVIOUS
+//   UTC calendar day. So 00:10 IST = 18:40 UTC (the day before).
+//   Forward check: 18:40 UTC + 5:30 = 24:10 = 00:10 IST the NEXT day. Matches.
+//
+// Since the LOCAL (IST) trigger day is Monday, the UTC day one clock-step
+// earlier is Sunday — so the cron expression's day-of-week field must select
+// Sunday, not Monday. Confirmed Convex's actual day-of-week numbering by
+// reading crons.cron()'s own doc comment in this project's installed
+// package, node_modules/convex/src/server/cron.ts:522-531:
+//   "Like the unix command `cron`, Sunday is 0, Monday is 1, etc."
+//   "┌─ day of the week (0 - 6) (Sunday to Saturday)"
+// So day-of-week = 0 (Sunday) is correct here — NOT 1. (The design doc's own
+// illustrative snippet, §b.5, used "* * 1"/Monday for this field — this
+// registration deliberately does NOT copy that number, since re-deriving
+// and re-checking it against the installed package's own doc comment, per
+// this task's explicit instruction, shows Sunday/0 is the arithmetically
+// correct value for a Monday-00:10-IST trigger.)
+// => cron expression "40 18 * * 0" (minute=40, hour=18 UTC, day-of-week=0/Sunday).
+crons.cron(
+  "generate weekly activity notifications",
+  "40 18 * * 0",
+  internal.crons.generateWeeklyActivityNotifications,
+  {},
+);
 
 export default crons;
