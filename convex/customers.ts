@@ -121,10 +121,26 @@ function toMD(s: string | null | undefined): string | undefined {
  */
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
-/** Build the set of "M-D" keys for the next `days` days (inclusive of today, IST calendar), with day offset. */
+/**
+ * Build the set of "M-D" keys for the next `days` days (inclusive of today,
+ * IST calendar), with day offset AND the real matched calendar Date object
+ * per key.
+ *
+ * P0-1 fix (2026-09-09, dedup-never-expires bug): `dateByKey` is new here —
+ * it hands back the actual `Date` object used to derive each "M-D" key, so
+ * callers (findUpcoming, below) can read off the REAL matched year for that
+ * occurrence instead of assuming "this year". This is the single source of
+ * truth for the year component: reusing THIS Date object (not constructing a
+ * fresh `new Date()` elsewhere) is what makes the Dec 31 -> Jan 1 wraparound
+ * correct — day i in this loop already carries the correct following year
+ * once the loop crosses a Dec 31 boundary (Date.UTC's month/day rollover
+ * handles that arithmetic natively), so there is no separate "is this a
+ * wraparound" branch to get wrong.
+ */
 function upcomingWindow(days: number, now = new Date()) {
   const keys = new Set<string>();
   const offset = new Map<string, number>();
+  const dateByKey = new Map<string, Date>();
   // Shift the UTC instant into IST before reading Y/M/D, so "today" reflects
   // the boutique's real local calendar day (see IST fix note above).
   const istNow = new Date(now.getTime() + IST_OFFSET_MS);
@@ -135,8 +151,9 @@ function upcomingWindow(days: number, now = new Date()) {
     const key = `${m}-${day}`;
     keys.add(key);
     if (!offset.has(key)) offset.set(key, i);
+    if (!dateByKey.has(key)) dateByKey.set(key, d);
   }
-  return { keys, offset };
+  return { keys, offset, dateByKey };
 }
 
 /**
@@ -175,6 +192,17 @@ function upcomingMDRanges(days: number, now = new Date()): Array<[string, string
 interface QueueHit {
   doc: UserDoc;
   daysUntil: number;
+  /**
+   * P0-1 fix (2026-09-09) — canonical "YYYY-M-D" dedup key for this exact
+   * matched occurrence (real calendar year + unpadded month + unpadded day),
+   * e.g. "2026-8-27". Derived from upcomingWindow()'s dateByKey Date object —
+   * the SAME Date already used to find this hit, so the year is always the
+   * REAL matched year (correctly the following year across a Dec 31 -> Jan 1
+   * wraparound), never a blind `new Date().getFullYear()`. This is now the
+   * single source of truth for message_actions/ai_message_drafts occasion_date
+   * keys — see hasDecidedAction below and findUpcomingInternal's projection.
+   */
+  occasionDate: string;
 }
 
 /**
@@ -185,6 +213,14 @@ interface QueueHit {
  * reappear in the Delight Queue tomorrow-tabs.
  *
  * Uses the by_customer_occasion_date index (no full-table scan).
+ *
+ * P0-1 fix (2026-09-09): `occasionDate` is now the canonical "YYYY-M-D" key
+ * (see QueueHit.occasionDate above) — a full calendar year is included, so a
+ * decision recorded for THIS year's occurrence no longer falsely matches
+ * NEXT year's occurrence of the same month-day (the old "M-D"-only key never
+ * changed across years, so dedup never expired — this is the actual bug
+ * fix). This function's own logic is unchanged; only the shape of the string
+ * callers pass in has changed.
  */
 async function hasDecidedAction(
   ctx: QueryCtx,
@@ -226,7 +262,7 @@ async function findUpcoming(
   field: "birthday" | "anniversary",
 ): Promise<QueueHit[]> {
   const clampedDays = Math.max(0, Math.floor(days));
-  const { keys, offset } = upcomingWindow(clampedDays);
+  const { keys, offset, dateByKey } = upcomingWindow(clampedDays);
   const ranges = upcomingMDRanges(clampedDays);
 
   // Fetch one page of candidate customers per MD range (1 range in the
@@ -266,8 +302,20 @@ async function findUpcoming(
     if (!parsed) continue;
     const key = `${parsed[0]}-${parsed[1]}`;
     if (!keys.has(key)) continue; // index range can include the same MM-DD across two years' worth of edge dates; keys is the exact-match filter
-    if (await hasDecidedAction(ctx, c._id, field, key)) continue; // already sent/cancelled this year
-    hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
+
+    // P0-1 fix — canonical "YYYY-M-D" dedup key, real matched year reused
+    // from the SAME Date object upcomingWindow() used to build this "M-D"
+    // key (dateByKey), not a freshly-constructed `new Date()`. This is what
+    // makes the Dec 31 -> Jan 1 wraparound produce the FOLLOWING year.
+    const matchedDate = dateByKey.get(key);
+    // Defensive — matchedDate is guaranteed present whenever `key` passed the
+    // keys.has(key) check just above, since both maps are built from the
+    // same upcomingWindow() loop over the same key set. Should never be hit.
+    if (!matchedDate) continue;
+    const occasionDate = `${matchedDate.getUTCFullYear()}-${parsed[0]}-${parsed[1]}`;
+
+    if (await hasDecidedAction(ctx, c._id, field, occasionDate)) continue; // already sent/cancelled this specific occurrence
+    hits.push({ doc: c, daysUntil: offset.get(key) ?? 0, occasionDate });
   }
   hits.sort((a, b) => a.daysUntil - b.daysUntil);
   return hits;
@@ -535,35 +583,61 @@ export const findUpcomingInternal = internalQuery({
   },
   handler: async (ctx, { days, field }) => {
     const hits = await findUpcoming(ctx, days ?? 7, field);
-    return hits.map(({ doc, daysUntil }) => {
-      // Same parseMD() call findUpcoming() itself already used internally to
-      // match this hit — re-derive the exact "M-D" key (unpadded, matching
-      // message_actions'/ai_message_drafts' occasion_date convention, e.g.
-      // "8-27") here so callers (the drafts cron) get a ready-to-use
-      // occasion_date string without duplicating date-parsing logic.
-      const raw = field === "birthday" ? doc.birthday : doc.anniversary;
-      const parsed = parseMD(raw);
-      const occasionDate = parsed ? `${parsed[0]}-${parsed[1]}` : null;
-      return {
-        _id: doc._id,
-        name: doc.name,
-        birthday: doc.birthday ?? null,
-        anniversary: doc.anniversary ?? null,
-        mobile: doc.mobile,
-        tier: doc.tier ?? "silver",
-        points: doc.points ?? 0,
-        // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it) —
-        // and, for the AI drafts cron, the gate on whether Gemini is ever called at all.
-        whatsapp_consent: doc.whatsapp_consent ?? false,
-        days_until: daysUntil,
-        // "M-D" string, e.g. "8-27" — see comment above. Should never be null
-        // in practice (findUpcoming already required a valid parseMD to
-        // produce this hit), but typed nullable defensively.
-        occasion_date: occasionDate,
-      };
-    });
+    // P0-1 fix (2026-09-09): occasion_date now comes straight from
+    // findUpcoming()'s own QueueHit.occasionDate — the canonical "YYYY-M-D"
+    // key (real matched year + unpadded month/day) computed ONCE, at the
+    // exact point findUpcoming() already has the matched Date object on
+    // hand. No re-derivation here (previously this handler re-ran parseMD()
+    // itself, throwing away the year) — single source of truth.
+    return hits.map(({ doc, daysUntil, occasionDate }) => ({
+      _id: doc._id,
+      name: doc.name,
+      birthday: doc.birthday ?? null,
+      anniversary: doc.anniversary ?? null,
+      mobile: doc.mobile,
+      tier: doc.tier ?? "silver",
+      points: doc.points ?? 0,
+      // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it) —
+      // and, for the AI drafts cron, the gate on whether Gemini is ever called at all.
+      whatsapp_consent: doc.whatsapp_consent ?? false,
+      days_until: daysUntil,
+      // Canonical "YYYY-M-D" string, e.g. "2026-8-27" — see QueueHit.occasionDate.
+      occasion_date: occasionDate,
+    }));
   },
 });
+
+/**
+ * Validate the canonical dedup-key shape: "YYYY-M-D" — a real numeric year
+ * (4 digits, sane range), then unpadded month 1-12, then unpadded day 1-31.
+ *
+ * P1-3 fix (2026-09-09): occasion_date used to be validated (and stored) as
+ * bare "M-D" (see the old parseMD-only check this replaces). That format has
+ * NO year, which is the root cause of P0-1 (dedup never expires). Callers
+ * (findUpcoming via getUpcomingBirthdays/getUpcomingAnniversaries/
+ * findUpcomingInternal, and Customers.jsx's own IST "tomorrow" computation)
+ * now always compute a full "YYYY-M-D" string BEFORE calling this mutation —
+ * this function stays a pure validate-and-store step, it does NOT compute the
+ * year itself (see design note above: "This function should NOT compute the
+ * year itself").
+ *
+ * Deliberately does not reuse the M-D-only parseMD() above (that regex has no
+ * year group and would accept a bare "8-27" as valid, which is exactly the
+ * bug this fixes) — a small dedicated check instead.
+ */
+function parseYMD(s: string): [number, number, number] | null {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s.trim());
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  // Sane year bound — not a strict calendar check (no need to validate
+  // month-length/leap-year here, callers only ever produce real Date-derived
+  // values), just a guard against garbage input reaching storage.
+  if (year < 2000 || year > 2100) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return [year, month, day];
+}
 
 /**
  * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
@@ -581,7 +655,8 @@ export const findUpcomingInternal = internalQuery({
  *
  * Out of scope (per spec): no cron, no change to the Cloud-API-then-fallback
  * send mechanism itself, no "cancel forever" — this only ever records ONE
- * decision per occasion_date, and next year's differing M-D naturally resets it.
+ * decision per occasion_date, and next year's differing YYYY-M-D naturally
+ * resets it (P0-1 fix, 2026-09-09 — see parseYMD above).
  */
 export const recordMessageAction = mutation({
   args: {
@@ -599,8 +674,8 @@ export const recordMessageAction = mutation({
     if (!doc) throw new Error("Customer not found.");
 
     const trimmedDate = occasion_date.trim();
-    if (!parseMD(trimmedDate)) {
-      throw new Error(`occasion_date must be an "M-D" string (e.g. "8-27"), got "${occasion_date}".`);
+    if (!parseYMD(trimmedDate)) {
+      throw new Error(`occasion_date must be a "YYYY-M-D" string (e.g. "2026-8-27"), got "${occasion_date}".`);
     }
 
     // IDEMPOTENCY — same tuple already decided → reject, don't insert a duplicate.

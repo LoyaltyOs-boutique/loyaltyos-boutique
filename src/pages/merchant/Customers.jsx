@@ -151,7 +151,13 @@ export default function Customers() {
 
   const handleCancel = async (c, occasion) => {
     const key = decisionKey(c.id, occasion);
-    const occasionDate = occasion === 'birthday' ? c.birthday : c.anniversary;
+    // P0-1/P1-3 fix (2026-09-09): canonical "YYYY-M-D" key (tomorrow's real
+    // IST calendar date, with year) — this Cancel button only ever fires
+    // from the Birthdays/Anniversaries tomorrow tabs, so "tomorrow in IST" is
+    // always the correct occurrence, computed independently of the
+    // customer's raw (year-less) birthday/anniversary string. Same helper
+    // ApprovalModal's onSent path uses below, for key-format consistency.
+    const occasionDate = canonicalTomorrowOccasionDate();
     setCancelErrors((prev) => { const next = { ...prev }; delete next[key]; return next; });
     try {
       await recordMessageAction(c.id, occasion, occasionDate, 'cancelled');
@@ -515,10 +521,13 @@ export default function Customers() {
           templateConfig={templateConfig}
           waTemplates={waTemplates}
           onClose={() => setApproveTarget(null)}
-          onSent={(customerId, occasion, channel) => {
-            const occasionDate = occasion === 'birthday'
-              ? approveTarget.customer.birthday
-              : approveTarget.customer.anniversary;
+          onSent={(customerId, occasion, channel, occasionDate) => {
+            // P0-1/P1-3 fix (2026-09-09): occasionDate now arrives already
+            // computed as the canonical "YYYY-M-D" key (ApprovalModal's
+            // canonicalOccasionDate, passed through as the 4th onSent arg) —
+            // no longer re-derived here from approveTarget.customer's raw
+            // (year-less) birthday/anniversary string, which was the P1-3
+            // inconsistent-format bug's exact source on this call site.
             recordMessageAction(customerId, occasion, occasionDate, 'sent', channel)
               .then(() => markDecided(customerId, occasion, 'sent'))
               .catch((err) => {
@@ -541,6 +550,54 @@ export default function Customers() {
 }
 
 function todayMD() { const d = new Date(); return `${d.getMonth() + 1}-${d.getDate()}`; }
+
+/**
+ * IST_OFFSET_MS — same fixed +5:30 (India Standard Time, no daylight-saving)
+ * offset convex/customers.ts's own IST_OFFSET_MS constant uses for its
+ * birthday/anniversary "today"/"tomorrow" window arithmetic. Duplicated here
+ * (not imported — this is a browser bundle, convex/ is a separate server
+ * module) rather than reusing Dashboard.jsx's todayList(), which reads the
+ * BROWSER's local clock with no IST shift at all — fine for that helper's
+ * own use (a same-device search marker), but wrong for a canonical dedup key,
+ * since a merchant opening this page from outside IST would silently compute
+ * a different calendar day than the boutique's actual "tomorrow".
+ */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * canonicalTomorrowOccasionDate — P0-1/P1-3 fix (2026-09-09, same-day dedup
+ * audit). Returns tomorrow's REAL calendar date in IST, as a canonical
+ * "YYYY-M-D" string (full year + unpadded month + unpadded day) — e.g.
+ * "2026-8-28". This is the single source of truth for the occasion_date key
+ * both recordMessageAction (Approve & Send / Cancel) and
+ * generateMessageDraftRemote (AI draft cache) now use for a given
+ * ApprovalModal instance, so a cached draft and its corresponding sent/
+ * cancelled decision for the same real occurrence always agree on the exact
+ * same key string (see ApprovalModal below — computed ONCE per modal
+ * instance, not separately at each call site).
+ *
+ * Deliberately does NOT read the customer's raw birthday/anniversary string
+ * at all — that field only ever has month-day (no year), which is exactly
+ * the un-canonicalized source of the old bug (dedup never expired, since the
+ * key never changed across years). Both tabs this modal opens from
+ * ("Birthdays tomorrow" / "Anniversaries tomorrow", confirmed via
+ * setApproveTarget's only call site further down this file) only ever mean
+ * ONE specific real calendar day — tomorrow, in IST — so that's computed
+ * directly instead.
+ *
+ * Same IST-shift-then-read-UTC-calendar-fields technique as
+ * convex/customers.ts's upcomingWindow() (add the fixed IST offset to the
+ * UTC instant, then read Y/M/D back off the shifted Date's UTC accessors) —
+ * this is what correctly rolls the year forward on a Dec 31 -> Jan 1
+ * boundary, since Date.UTC's own day-rollover arithmetic handles month/year
+ * carries natively (no separate wraparound branch needed).
+ */
+function canonicalTomorrowOccasionDate() {
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const istTomorrow = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + 1));
+  return `${istTomorrow.getUTCFullYear()}-${istTomorrow.getUTCMonth() + 1}-${istTomorrow.getUTCDate()}`;
+}
+
 function Info({ label, value }) {
   return (
     <div>
@@ -587,11 +644,27 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
   const waTemplate = waTemplates[occasion];
   const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
-  // Raw "M-D" occasion date (e.g. "8-27") — same field/format the existing
-  // onSent handler already sends to recordMessageAction (Customers.jsx:519-521),
-  // NOT the human-readable parseMD() display string below.
+  // Human-readable display string only (e.g. "Aug 27") — shown in the Info
+  // box below. NOT the dedup/cache key — see canonicalOccasionDate below for
+  // that (P0-1/P1-3 fix, 2026-09-09).
   const rawOccasionDate = occasion === 'birthday' ? customer.birthday : customer.anniversary;
   const occasionDate = parseMD(rawOccasionDate);
+
+  // P0-1/P1-3 fix (2026-09-09) — canonical "YYYY-M-D" dedup/cache key,
+  // computed ONCE per modal instance (this component only ever mounts fresh
+  // per approveTarget — see the `{approveTarget && <ApprovalModal .../>}`
+  // conditional render in the parent, which unmounts/remounts on target
+  // change) and reused for BOTH the AI-draft cache call below AND the
+  // recordMessageAction call the parent's onSent handler makes, so a cached
+  // draft and its corresponding sent/cancelled decision for the same real
+  // occurrence always agree on the exact same key string. This modal only
+  // ever opens from the Birthdays/Anniversaries "tomorrow" tabs (confirmed:
+  // setApproveTarget's only call site is gated on
+  // filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow'), so
+  // "tomorrow's real IST calendar date" is always the correct occurrence —
+  // computed independently of the customer's raw (year-less) birthday/
+  // anniversary string, same reasoning as handleCancel's identical fix above.
+  const canonicalOccasionDate = useMemo(() => canonicalTomorrowOccasionDate(), []);
 
   // On open (or if the target customer/occasion changes) AND the customer has
   // given WhatsApp consent, ask the backend for a real AI draft — a cache hit
@@ -612,13 +685,17 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     }
     let live = true;
     setAiDraftLoading(true);
-    generateMessageDraftRemote(customer.id, customer.name, customer.tier, occasion, rawOccasionDate)
+    // P0-1/P1-3 fix (2026-09-09): canonical key (see canonicalOccasionDate
+    // above), not the raw year-less birthday/anniversary string — this is
+    // what keeps the AI-draft cache tuple aligned with recordMessageAction's
+    // tuple for the exact same real occurrence.
+    generateMessageDraftRemote(customer.id, customer.name, customer.tier, occasion, canonicalOccasionDate)
       .then((draftText) => {
         if (live && draftText) setAiDraftText(draftText);
       })
       .finally(() => { if (live) setAiDraftLoading(false); });
     return () => { live = false; };
-  }, [customer.id, customer.name, customer.tier, customer.whatsapp_consent, occasion, rawOccasionDate]);
+  }, [customer.id, customer.name, customer.tier, customer.whatsapp_consent, occasion, canonicalOccasionDate]);
 
   // Preview text — reference-only for the merchant, assembled from the
   // customer's name plus the configured discount/coupon/valid-days for this
@@ -647,7 +724,11 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     if (!customer.whatsapp_consent) return;
     openWaLinkFallback();
     setSendMsg('Sent via WhatsApp link');
-    onSent?.(customer.id, occasion, 'wa_fallback');
+    // 4th arg (canonicalOccasionDate) added 2026-09-09 — see the P0-1/P1-3
+    // fix note on canonicalOccasionDate above; the parent's onSent handler
+    // now uses this instead of re-deriving from approveTarget.customer's raw
+    // birthday/anniversary string.
+    onSent?.(customer.id, occasion, 'wa_fallback', canonicalOccasionDate);
     onClose();
   };
 
@@ -671,7 +752,9 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
       channel = 'wa_fallback';
     } finally {
       setSending(false);
-      onSent?.(customer.id, occasion, channel);
+      // 4th arg (canonicalOccasionDate) added 2026-09-09 — same as
+      // sendViaWaLink above.
+      onSent?.(customer.id, occasion, channel, canonicalOccasionDate);
       onClose();
     }
   };
