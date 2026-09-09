@@ -52,11 +52,20 @@ export default function Dashboard() {
   // exists and merges fresh rows into state, calling emit() when anything
   // changed, which useDb()'s subscribe() picks up to re-render.
   useEffect(() => { hydrateCustomers(); hydrateCatalogue(); hydrateReviews(); }, []);
-  // Customer Activity Intelligence Part 3b — same one-shot mount-fetch
-  // pattern as the line above: fires the Convex query once, emit() on
-  // success re-renders this page via useDb()'s subscribe(). Not a polling
-  // loop or a live subscription.
-  useEffect(() => { hydrateActiveCustomers(); }, []);
+  // Customer Activity Intelligence Part 3b — fires the Convex query
+  // immediately on mount (merchant sees data on first load, no wait), then
+  // polls every 30s while this Dashboard stays mounted so "Active this week"
+  // reflects real activity without a manual page refresh. This data layer is
+  // fetch-once + cache (no live Convex subscription), so polling is the
+  // correct, low-risk refresh mechanism here — not a broader architecture
+  // change. emit() on success re-renders this page via useDb()'s subscribe().
+  // Cleanup clears the interval on unmount so polling never continues after
+  // the merchant navigates away from this page.
+  useEffect(() => {
+    hydrateActiveCustomers();
+    const intervalId = setInterval(hydrateActiveCustomers, 30000);
+    return () => clearInterval(intervalId);
+  }, []);
 
   const m = derivedMetrics();
   const pending = pendingGmbReviews();
