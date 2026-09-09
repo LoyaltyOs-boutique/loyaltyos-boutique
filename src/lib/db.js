@@ -1937,6 +1937,42 @@ export function deleteNotificationRemote(notificationId) {
     .catch((err) => { hydrateNotifications(); return { ok: false, error: err?.message || 'Delete failed.' }; });
 }
 
+/* ---------- Customer Activity Intelligence Part 3b (Dashboard section) → Convex bridge ---------- */
+// Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md
+// Part 3a (commit 8e0323a) built the merchant-guarded convex/ai.ts:getActiveCustomers
+// query. This bridge wires it into the app the same local-first hydrate-then-subscribe
+// shape as hydrateNotifications()/notifications() above: a module-scoped cache array,
+// a background hydrate function that fires the Convex query and emit()s on success, and
+// a synchronous reader Dashboard.jsx can call on every render via useDb()'s subscribe().
+let activeCustomersCache = [];
+let activeCustomersHydrating = false;
+
+/**
+ * Background hydrate: pull the last-7-days active-customer rows (name +
+ * activity count + latestSummary, already sorted most-active-first by the
+ * query itself) from Convex and replace the local cache, then emit() so
+ * Dashboard's useDb()-style subscribe() re-renders. Self-guards against
+ * overlapping concurrent calls, same as hydrateNotifications() above.
+ */
+export function hydrateActiveCustomers() {
+  if (activeCustomersHydrating) return;
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  activeCustomersHydrating = true;
+  client.query(api.ai.getActiveCustomers, session)
+    .then((rows) => {
+      activeCustomersHydrating = false;
+      if (!Array.isArray(rows)) return;
+      activeCustomersCache = rows;
+      emit();
+    })
+    .catch(() => { activeCustomersHydrating = false; /* offline — keep last-known cache */ });
+}
+
+/** Synchronous reader for the cached active-customer rows (most-active-first, as returned by Convex). */
+export function activeCustomers() { return activeCustomersCache; }
+
 /* ---------- Client onboarding & magic links ---------- */
 const mdFromDate = (iso) => {
   if (!iso) return null;

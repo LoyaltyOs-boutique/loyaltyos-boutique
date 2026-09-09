@@ -4,6 +4,7 @@ import {
   getData, subscribe, derivedMetrics, pendingGmbReviews, recentActivityByCustomer,
   getMerchantSession, setReviewStatus,
   hydrateCustomers, hydrateCatalogue, hydrateReviews,
+  hydrateActiveCustomers, activeCustomers,
 } from '../../lib/db.js';
 import { inr, greeting, first, fmtDate, timeAgo, cls } from '../../lib/util.js';
 import { Stat, Stars, Modal } from '../../components/ui.jsx';
@@ -37,6 +38,10 @@ export default function Dashboard() {
   // full-history modal — null when closed, matching Customers.jsx's own
   // `selected` (customer id) / Modal-open-when-truthy pattern.
   const [activityUserId, setActivityUserId] = useState(null);
+  // Customer Activity Intelligence Part 3b — which active customer's row was
+  // clicked to open the AI-summary modal — null when closed, same
+  // truthy-id-opens-a-Modal convention as activityUserId immediately above.
+  const [summaryCustomerId, setSummaryCustomerId] = useState(null);
 
   // hydrateCustomers()/hydrateCatalogue()/hydrateReviews() normally run once
   // at module load — but on a genuinely fresh browser session that one-shot
@@ -47,6 +52,11 @@ export default function Dashboard() {
   // exists and merges fresh rows into state, calling emit() when anything
   // changed, which useDb()'s subscribe() picks up to re-render.
   useEffect(() => { hydrateCustomers(); hydrateCatalogue(); hydrateReviews(); }, []);
+  // Customer Activity Intelligence Part 3b — same one-shot mount-fetch
+  // pattern as the line above: fires the Convex query once, emit() on
+  // success re-renders this page via useDb()'s subscribe(). Not a polling
+  // loop or a live subscription.
+  useEffect(() => { hydrateActiveCustomers(); }, []);
 
   const m = derivedMetrics();
   const pending = pendingGmbReviews();
@@ -56,6 +66,12 @@ export default function Dashboard() {
   // (name, id) for the modal title + Ledger's userId prop.
   const feed = recentActivityByCustomer();
   const activityUser = activityUserId ? db.users.find((u) => u.id === activityUserId) : null;
+  // Customer Activity Intelligence Part 3b — already sorted most-active-first
+  // by convex/ai.ts:getActiveCustomers itself; not re-sorted here.
+  const active = activeCustomers();
+  const summaryCustomer = summaryCustomerId
+    ? active.find((c) => c.customerId === summaryCustomerId)
+    : null;
 
   return (
     <div className="space-y-10">
@@ -169,12 +185,57 @@ export default function Dashboard() {
         </div>
       </section>
 
+      {/* Customer Activity Intelligence Part 3b — customers active in the last
+          7 days (like/cart-add/lookbook-view), most-active-first, each row's
+          AI-written engagement summary opens in a modal on click — same
+          card/table/eyebrow/heading styling and row-click-opens-Modal
+          convention as the "Recent activity" section immediately above. */}
+      <section>
+        <div className="eyebrow mb-1">Live from your boutique</div>
+        <h2 className="luxe-title text-2xl mb-4">Active this week</h2>
+        <div className="card overflow-x-auto">
+          <table className="tbl min-w-[560px]">
+            <thead>
+              <tr><th>Client</th><th>Activity (7 days)</th></tr>
+            </thead>
+            <tbody>
+              {active.map((c) => (
+                <tr
+                  key={c.customerId}
+                  onClick={() => setSummaryCustomerId(c.customerId)}
+                  className="cursor-pointer hover:bg-mist"
+                >
+                  <td className="font-medium text-sm">{c.name}</td>
+                  <td className="text-sm text-ink/75">{c.activityCount}</td>
+                </tr>
+              ))}
+              {active.length === 0 && (
+                <tr><td colSpan={2} className="text-sm text-steel text-center py-6">No activity yet.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       {/* Per-customer full activity history modal — SAME Ledger component/data
           source (customerLedger() + hydratePointsHistory()) as Customer CRM's
           own "Activity ledger" tab; that existing tab is untouched. */}
       {activityUser && (
         <Modal open onClose={() => setActivityUserId(null)} title={`${activityUser.name} — activity history`} wide>
           <Ledger userId={activityUser.id} db={db} />
+        </Modal>
+      )}
+
+      {/* Customer Activity Intelligence Part 3b — AI-summary modal for the
+          "Active this week" section above. Shows the cached summary_text from
+          convex/ai.ts:getActiveCustomers's latestSummary field, or a calm
+          fallback message when no summary has been generated for this
+          customer yet (the daily cron hasn't reached them yet). */}
+      {summaryCustomer && (
+        <Modal open onClose={() => setSummaryCustomerId(null)} title={`${summaryCustomer.name} — engagement summary`}>
+          <p className="text-sm text-ink/75 leading-relaxed">
+            {summaryCustomer.latestSummary || 'No summary generated yet — check back tomorrow.'}
+          </p>
         </Modal>
       )}
     </div>
