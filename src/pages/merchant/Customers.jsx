@@ -32,7 +32,14 @@ export default function Customers() {
     : 'all'
   );
   const [page, setPage] = useState(0);
-  const [selected, setSelected] = useState(null);
+  // Weekly-activity AI-summary popup's "View Full Profile" button
+  // (Shell.jsx's NotificationBell) navigates here with
+  // `location.state.selectedCustomerId` set — additively checked in this
+  // one-time-mount initializer, same pattern `filter` above already uses for
+  // `location.state?.tab`. Falls back to plain `null` (the original
+  // behavior) when that key isn't present, so a normal navigation to this
+  // page is completely unaffected.
+  const [selected, setSelected] = useState(location.state?.selectedCustomerId || null);
   const [tab, setTab] = useState('basic');
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState({});

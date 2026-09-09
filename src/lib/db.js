@@ -596,6 +596,32 @@ export async function generateMessageDraftRemote(customerId, customerName, tier,
 }
 
 /**
+ * generateActivitySummaryRemote — 2026-09-09 addition, bridge for on-demand
+ * per-customer AI activity-summary generation (24h server-side cache) —
+ * triggered from Shell.jsx's NotificationBell when the merchant clicks a
+ * "weekly activity" bell notification. EXACT same bridge shape as
+ * generateMessageDraftRemote above (resolve-to-null on ANY failure — offline,
+ * missing session, or a genuine Gemini failure — never throws, since this
+ * only ever feeds a popup with an established "no summary yet" fallback, not
+ * a user-initiated send action that needs a surfaced error).
+ */
+export async function generateActivitySummaryRemote(customerId, customerName, tier) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.ai.generateActivitySummaryPublic, {
+      customerId: convexUserId(customerId),
+      customerName,
+      tier,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Record an admin decision (Approve & Send → "sent", Cancel → "cancelled")
  * for one customer's birthday/anniversary occasion on a specific occasion_date
  * ("M-D" string, e.g. "8-27") — see docs/superpowers/specs/2026-08-26-message-action-tracking-design.md.

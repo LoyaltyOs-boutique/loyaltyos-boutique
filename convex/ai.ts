@@ -796,3 +796,115 @@ export const getActiveCustomers = query({
     return results;
   },
 });
+
+// ============================================================================
+// SECTION 6 — Weekly-activity bell notification click: on-demand summary
+// popup, with 24-hour cache (2026-09-09 addition)
+//
+// Mirrors generateMessageDraftPublic's (SECTION 3) exact session-guard-then-
+// cache-check-then-generate-then-cache shape. The one structural difference:
+// ai_message_drafts is keyed by a 3-part tuple (customer_id/occasion/
+// occasion_date), so its cache check is pure existence-of-a-"pending"-row.
+// customer_activity_summaries (schema.ts) has only ONE row per customer
+// (customer_id alone, upserted) with no tuple/date component at all — so
+// "is the cache still good" here cannot reuse tuple identity and instead
+// needs an explicit 24-hour TTL check against generated_at, done in THIS
+// action (getCachedActivitySummaryInternal below stays a pure read, no
+// freshness opinion of its own — same separation of concerns
+// getCachedDraftTextInternal/generateMessageDraftPublic already have).
+// ============================================================================
+
+/** 24-hour cache freshness window for a customer_activity_summaries row. */
+const ACTIVITY_SUMMARY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * getCachedActivitySummaryInternal — reads the single upserted row (if any)
+ * for one customer via the existing by_customer index (same index
+ * upsertActivitySummary already uses to find-and-patch). Returns the raw
+ * cached text + its generation timestamp, or null if no row exists yet.
+ * Deliberately does NOT decide freshness itself (no TTL logic here) — that
+ * judgment belongs to the caller (generateActivitySummaryPublic below), same
+ * separation getCachedDraftTextInternal/generateMessageDraftPublic already
+ * established for the sibling draft-cache feature.
+ */
+export const getCachedActivitySummaryInternal = internalQuery({
+  args: { customerId: v.id("users") },
+  handler: async (ctx, { customerId }): Promise<{ summaryText: string; generatedAt: number } | null> => {
+    const row = await ctx.db
+      .query("customer_activity_summaries")
+      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .first();
+    if (!row) return null;
+    return { summaryText: row.summary_text, generatedAt: row.generated_at };
+  },
+});
+
+/**
+ * generateActivitySummaryPublic — public, merchant-guarded entry point for
+ * ON-DEMAND per-customer activity-summary generation with 24-hour caching,
+ * triggered from a "weekly activity" bell-notification click (Shell.jsx's
+ * NotificationBell) instead of only ever waiting for the next 00:15 IST
+ * generateDailyActivitySummaries cron run.
+ *
+ * Flow (mirrors generateMessageDraftPublic, SECTION 3, exactly except for the
+ * freshness check described above):
+ *   1. checkMerchantSession first — same internalQuery every other
+ *      merchant-facing action in this file already runs first.
+ *   2. Cache check via getCachedActivitySummaryInternal. If a row exists AND
+ *      `Date.now() - generatedAt < ACTIVITY_SUMMARY_CACHE_TTL_MS`, return its
+ *      summaryText IMMEDIATELY — zero Gemini calls on a fresh-cache hit.
+ *   3. Otherwise (no row at all, OR a real STALE row — genuinely older than
+ *      24h, not just "doesn't exist"): call the existing, unmodified
+ *      generateCustomerActivitySummary internal action.
+ *   4. On a non-null result: cache it via the existing upsertActivitySummary
+ *      mutation (already an upsert, so it correctly overwrites a stale row
+ *      exactly like a missing one) BEFORE returning the text.
+ *   5. On null (a genuine Gemini failure — generateCustomerActivitySummary's
+ *      own fail-gracefully contract): return null WITHOUT caching anything,
+ *      so the very next attempt is a clean retry rather than being
+ *      permanently stuck on a cached "nothing" — identical reasoning to
+ *      generateMessageDraftPublic's own step 4.
+ *
+ * CONFIDENTIALITY: no new read path — this action's only DB access is the two
+ * calls above (getCachedActivitySummaryInternal, upsertActivitySummary) plus
+ * whatever generateCustomerActivitySummary itself already reads (see that
+ * function's own doc comment — structurally cannot reach measurements/
+ * staff_notes). customerName/tier are passed straight through from the
+ * caller, exactly like generateMessageDraftPublic's own args shape.
+ */
+export const generateActivitySummaryPublic = action({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+    customerId: v.id("users"),
+    customerName: v.string(),
+    tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+  },
+  handler: async (ctx, { userId, token, customerId, customerName, tier }): Promise<string | null> => {
+    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+
+    // Step 2 — cache check FIRST, with an explicit 24h staleness check (no
+    // tuple identity to lean on here, unlike the draft cache).
+    const cached = await ctx.runQuery(internal.ai.getCachedActivitySummaryInternal, { customerId });
+    if (cached && Date.now() - cached.generatedAt < ACTIVITY_SUMMARY_CACHE_TTL_MS) {
+      return cached.summaryText;
+    }
+
+    // Step 3 — cache miss OR stale row: generate fresh via the existing,
+    // unmodified action.
+    const summaryText: string | null = await ctx.runAction(internal.ai.generateCustomerActivitySummary, {
+      customerId,
+      customerName,
+      tier,
+    });
+
+    // Step 5 — a real Gemini failure must NOT be cached (see doc comment above).
+    if (!summaryText) return null;
+
+    // Step 4 — cache the fresh summary (upsert correctly overwrites any
+    // existing stale row) before returning it.
+    await ctx.runMutation(internal.ai.upsertActivitySummary, { customerId, summaryText });
+
+    return summaryText;
+  },
+});

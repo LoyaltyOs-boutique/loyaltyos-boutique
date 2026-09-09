@@ -2,11 +2,12 @@ import { NavLink, useNavigate } from 'react-router-dom';
 import {
   clearMerchantSession, getMerchantSession,
   hydrateNotifications, notifications, markAllSeenRemote, deleteNotificationRemote,
-  subscribe,
+  subscribe, generateActivitySummaryRemote, getData,
 } from '../../lib/db.js';
 import { useEffect, useState } from 'react';
 import { cls, timeAgo } from '../../lib/util.js';
 import { BRAND } from '../../data/seed.js';
+import { Modal } from '../ui.jsx';
 
 const NAV = [
   { to: '/merchant/dashboard', label: 'Delight Desk', icon: '◈' },
@@ -66,6 +67,20 @@ function NotificationBell() {
   const [open, setOpen] = useState(false);
   const [menuFor, setMenuFor] = useState(null); // notification _id whose kebab menu is open, or null
 
+  // Weekly-activity AI summary popup state (2026-09-09 addition) — separate
+  // from the existing `open` (notification panel) state so the panel and the
+  // summary popup can be independently open/closed. `summaryCustomer` holds
+  // { id, name } for the customer the popup is currently showing (or null
+  // when closed); `summaryText` is the resolved AI text, `null` while
+  // loading is handled via `summaryLoading` and `null` after a genuine
+  // Gemini failure is handled via the fallback copy at render time (see
+  // FALLBACK_SUMMARY_TEXT below) — `summaryText === null` is ambiguous
+  // between "still loading" and "resolved to no summary", which is why a
+  // separate summaryLoading boolean exists rather than overloading null.
+  const [summaryCustomer, setSummaryCustomer] = useState(null);
+  const [summaryText, setSummaryText] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+
   const rows = notifications();
   const unseenCount = rows.filter((n) => !n.seen).length;
 
@@ -85,6 +100,16 @@ function NotificationBell() {
   };
 
   const goToCustomer = (n) => {
+    // Weekly-activity notifications (Customer Activity Intelligence Part 2/3,
+    // occasion: 'weekly_activity') get their own real behavior — an on-demand
+    // AI-summary popup, NOT the birthday/anniversary tab-jump below. Early
+    // return so the existing ternary/navigate call for birthday/anniversary
+    // is reached ONLY for those two occasion types, completely unchanged.
+    if (n.occasion === 'weekly_activity') {
+      openActivitySummary(n);
+      return;
+    }
+
     // Part A finding: the "Birthdays tomorrow" / "Anniversaries tomorrow" TAB
     // BUTTONS themselves (Customers.jsx's filter-tab array, `setFilter(k)`)
     // use the real filter values 'birthday_tomorrow' / 'anniversary_tomorrow'
@@ -101,6 +126,64 @@ function NotificationBell() {
     // directly regardless of how old the notification was.
     setOpen(false);
     navigate('/merchant/customers', { state: { tab: n.occasion === 'birthday' ? 'birthday_tomorrow' : 'anniversary_tomorrow' } });
+  };
+
+  // Fallback copy shown in the summary popup when generation genuinely
+  // resolves to null (a real Gemini failure, not a loading state) — calm,
+  // non-alarming wording matching this bell panel's existing plain-string
+  // tone (e.g. "No notifications yet.").
+  const FALLBACK_SUMMARY_TEXT = 'No summary yet — check back later.';
+
+  /**
+   * Opens the AI-summary popup for a weekly_activity notification's customer
+   * and kicks off the on-demand fetch (24h-cached server-side, see
+   * convex/ai.ts's generateActivitySummaryPublic). The popup's customer name
+   * uses the real stored name from the hydrated db.users dataset (getData(),
+   * looked up by customer_id — same "full dataset, not a paginated/filtered
+   * subset" pattern Customers.jsx's own `active` lookup already relies on),
+   * NOT splitName(n.message): splitName only correctly extracts a name from
+   * birthday/anniversary-shaped messages ("X's birthday is tomorrow!"), but
+   * weekly_activity messages are shaped "X was highly active this week!" —
+   * no "'s " substring — so splitName would return the whole message text.
+   * splitName's result is kept only as a defensive fallback for the rare case
+   * customerDoc isn't found (e.g. hydration timing).
+   */
+  const openActivitySummary = (n) => {
+    const db = getData();
+    const customerDoc = db?.users?.find((u) => u.id === n.customer_id);
+    const name = customerDoc?.name || splitName(n.message)[0];
+    const tier = customerDoc?.tier || 'silver';
+
+    setSummaryCustomer({ id: n.customer_id, name });
+    setSummaryText(null);
+    setSummaryLoading(true);
+
+    generateActivitySummaryRemote(n.customer_id, name, tier).then((text) => {
+      setSummaryLoading(false);
+      setSummaryText(text); // null on a genuine failure — rendered via FALLBACK_SUMMARY_TEXT
+    });
+  };
+
+  const closeActivitySummary = () => {
+    setSummaryCustomer(null);
+    setSummaryText(null);
+    setSummaryLoading(false);
+  };
+
+  /**
+   * "View Full Profile" button inside the summary popup — navigates to
+   * Customer CRM with `location.state.selectedCustomerId` set (the new,
+   * additive state key Customers.jsx's `selected` initializer now also
+   * checks), then closes BOTH the summary popup and the notification panel
+   * so the merchant isn't left with two things open after navigating away.
+   */
+  const viewFullProfile = () => {
+    const customerId = summaryCustomer?.id;
+    closeActivitySummary();
+    setOpen(false);
+    if (customerId) {
+      navigate('/merchant/customers', { state: { selectedCustomerId: customerId } });
+    }
   };
 
   const handleDelete = (n) => {
@@ -183,6 +266,26 @@ function NotificationBell() {
             )}
           </div>
         </>
+      )}
+      {/* Weekly-activity AI-summary popup (2026-09-09 addition) — reuses the
+          EXISTING Modal primitive from ui.jsx (same open/onClose/title/children
+          props already used elsewhere in this codebase), not a new popup
+          component. Rendered as a sibling here so it can be open independently
+          of the notification panel above (`open` state). */}
+      {summaryCustomer && (
+        <Modal open onClose={closeActivitySummary} title={summaryCustomer.name}>
+          <div className="space-y-4">
+            <p className="text-sm text-ink leading-relaxed">
+              {summaryLoading ? 'Generating summary…' : (summaryText || FALLBACK_SUMMARY_TEXT)}
+            </p>
+            <button
+              onClick={viewFullProfile}
+              className="btn-ink w-full justify-center !py-2"
+            >
+              View Full Profile
+            </button>
+          </div>
+        </Modal>
       )}
     </div>
   );
