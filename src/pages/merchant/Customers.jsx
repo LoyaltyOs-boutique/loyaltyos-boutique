@@ -348,7 +348,12 @@ export default function Customers() {
                     <td className="text-center whitespace-nowrap">
                       {decided ? (
                         <span className="text-[10px] tracking-wide2 uppercase text-steel">
-                          {decided === 'sent' ? '✓ Sent' : '✗ Cancelled'}
+                          {/* P2-4 fix (2026-09-09): 3rd badge for 'link_opened' —
+                              a wa.me link-open only confirms the merchant was
+                              handed a pre-filled draft, not a real Cloud API
+                              send confirmation, so it gets its own label
+                              instead of falling into the "Cancelled" branch. */}
+                          {decided === 'sent' ? '✓ Sent' : decided === 'link_opened' ? '✓ Link Opened' : '✗ Cancelled'}
                         </span>
                       ) : (
                         <div className="inline-flex gap-1.5 items-center">
@@ -528,15 +533,24 @@ export default function Customers() {
           templateConfig={templateConfig}
           waTemplates={waTemplates}
           onClose={() => setApproveTarget(null)}
-          onSent={(customerId, occasion, channel, occasionDate) => {
+          onSent={(customerId, occasion, channel, occasionDate, action) => {
             // P0-1/P1-3 fix (2026-09-09): occasionDate now arrives already
             // computed as the canonical "YYYY-M-D" key (ApprovalModal's
             // canonicalOccasionDate, passed through as the 4th onSent arg) —
             // no longer re-derived here from approveTarget.customer's raw
             // (year-less) birthday/anniversary string, which was the P1-3
             // inconsistent-format bug's exact source on this call site.
-            recordMessageAction(customerId, occasion, occasionDate, 'sent', channel)
-              .then(() => markDecided(customerId, occasion, 'sent'))
+            //
+            // P2-4 fix (2026-09-09): 5th onSent arg (action) — mirrors how
+            // canonicalOccasionDate was added as a 4th arg above. ApprovalModal
+            // now tells the parent the REAL confirmation level of this send:
+            // 'sent' only for a genuinely-confirmed Cloud API success,
+            // 'link_opened' for a wa.me link-open (primary path, or the
+            // Cloud-API-fails-and-falls-back-to-wa.me branch) — opening wa.me
+            // only proves the merchant was handed a pre-filled draft, not that
+            // they actually pressed Send inside WhatsApp.
+            recordMessageAction(customerId, occasion, occasionDate, action, channel)
+              .then(() => markDecided(customerId, occasion, action))
               .catch((err) => {
                 // Idempotency rejection (already decided) or offline — the
                 // send itself already happened/attempted; just surface the
@@ -735,7 +749,12 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     // fix note on canonicalOccasionDate above; the parent's onSent handler
     // now uses this instead of re-deriving from approveTarget.customer's raw
     // birthday/anniversary string.
-    onSent?.(customer.id, occasion, 'wa_fallback', canonicalOccasionDate);
+    //
+    // 5th arg 'link_opened' (P2-4 fix, 2026-09-09) — this path only opens
+    // wa.me with a pre-filled draft; it does NOT confirm the merchant actually
+    // pressed Send inside WhatsApp, so it must not be logged as 'sent' (that
+    // value is now reserved for a genuinely-confirmed Cloud API success).
+    onSent?.(customer.id, occasion, 'wa_fallback', canonicalOccasionDate, 'link_opened');
     onClose();
   };
 
@@ -748,6 +767,12 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     setSending(true);
     setSendMsg('Sending…');
     let channel = 'cloud_api';
+    // P2-4 fix (2026-09-09) — action confirmation level, independent of
+    // channel: 'sent' only when Meta's Cloud API genuinely acknowledged the
+    // send (try block below); if it fails and we fall back to opening wa.me,
+    // that's the SAME unconfirmed situation as sendViaWaLink's primary path,
+    // so it must log 'link_opened', not 'sent'.
+    let action = 'sent';
     try {
       await sendWhatsAppTemplateMessage(customer.mobile, waTemplate.name, waTemplate.language, undefined, [customer.name.trim() || '{name}']);
       setSendMsg('Sent via WhatsApp');
@@ -757,11 +782,12 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
       openWaLinkFallback();
       setSendMsg('Sent via WhatsApp link');
       channel = 'wa_fallback';
+      action = 'link_opened';
     } finally {
       setSending(false);
       // 4th arg (canonicalOccasionDate) added 2026-09-09 — same as
-      // sendViaWaLink above.
-      onSent?.(customer.id, occasion, channel, canonicalOccasionDate);
+      // sendViaWaLink above. 5th arg (action) — see P2-4 fix note above.
+      onSent?.(customer.id, occasion, channel, canonicalOccasionDate, action);
       onClose();
     }
   };

@@ -644,8 +644,15 @@ function parseYMD(s: string): [number, number, number] | null {
  *
  * recordMessageAction — admin decision-log write for the Delight Queue's
  * tomorrow-tabs. Called by:
- *   - Approve & Send button (existing) — after a successful/attempted send,
- *     action:"sent" (+ channel: "cloud_api" | "wa_fallback")
+ *   - Approve & Send button (existing) — after a send:
+ *       action:"sent" ONLY for a genuinely-confirmed Cloud API success
+ *         (channel: "cloud_api")
+ *       action:"link_opened" for a wa.me link-open — primary path, or the
+ *         Cloud-API-fails-and-falls-back-to-wa.me branch (channel: "wa_fallback")
+ *         — P2-4 fix (2026-09-09): opening wa.me only proves the merchant was
+ *         handed a pre-filled draft, not that they actually pressed Send
+ *         inside WhatsApp, so it must not be recorded as the same "sent"
+ *         confirmation level as a real Cloud API success.
  *   - Cancel button (new, Customers.jsx follow-up) — action:"cancelled",
  *     no send attempted
  *
@@ -663,7 +670,7 @@ export const recordMessageAction = mutation({
     customer_id: v.id("users"),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasion_date: v.string(),
-    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    action: v.union(v.literal("sent"), v.literal("link_opened"), v.literal("cancelled")),
     channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))),
     userId: v.id("users"),
     token: v.string(),

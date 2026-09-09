@@ -231,22 +231,37 @@ export default defineSchema({
    * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
    *
    * message_actions — admin decision-log for birthday/anniversary WhatsApp
-   * reminders. Recording a "sent" or "cancelled" row here for a given
-   * (customer_id, occasion, occasion_date) hides that customer from the
+   * reminders. Recording a "sent"/"link_opened"/"cancelled" row here for a
+   * given (customer_id, occasion, occasion_date) hides that customer from the
    * "Birthdays tomorrow" / "Anniversaries tomorrow" Delight Queue lists
    * (see customers.ts getUpcomingBirthdays / getUpcomingAnniversaries).
    *
    * `occasion_date` is an "M-D" string (e.g. "8-27") — not a full date — so
    * the row naturally stops matching once the year rolls over and the
    * customer reappears in next year's queue. No cleanup/cron job needed.
+   *
+   * P2-4 fix (2026-09-09) — `action` additively widened with a third literal,
+   * "link_opened": a wa.me link-open only proves "we handed the merchant a
+   * pre-filled draft" (the merchant still has to tap Send inside WhatsApp
+   * themselves) — NOT the same confirmation level as a genuinely-succeeded
+   * Cloud API send, which Meta's API actually acknowledged. Recording both
+   * cases as "sent" was misleading: the merchant could close WhatsApp without
+   * sending and the system would have no way to know. "link_opened" now
+   * covers BOTH the primary wa.me path (Customers.jsx sendViaWaLink) AND the
+   * Cloud-API-fails-and-falls-back-to-wa.me branch (sendViaCloudApi's catch
+   * block); "sent" is now reserved exclusively for a genuinely-confirmed
+   * Cloud API success (sendViaCloudApi's try block). Purely additive — the
+   * existing "sent"/"cancelled" literals and every existing row are
+   * unaffected. Safe for dedup: hasDecidedAction (customers.ts) only checks
+   * row EXISTENCE for this tuple, never inspects `action`'s value.
    */
   message_actions: defineTable({
     customer_id: v.id("users"),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasion_date: v.string(), // "M-D" e.g. "8-27" — matches parseMD's format in customers.ts
-    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    action: v.union(v.literal("sent"), v.literal("link_opened"), v.literal("cancelled")),
     decided_at: v.number(), // epoch ms
-    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"
+    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"/"link_opened"
   })
     // Exclusion lookup used by getUpcomingBirthdays/getUpcomingAnniversaries —
     // named after the exact field tuple, matching this file's by_<field(s)> convention.
