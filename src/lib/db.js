@@ -523,6 +523,31 @@ export function getUpcomingAnniversaries(days) {
 }
 
 /**
+ * Fetch a customer's current pending AI-generated WhatsApp draft for one
+ * occasion (birthday/anniversary), if the daily drafts cron has already
+ * produced one for today's occasion_date — see convex/customers.ts's
+ * getDraftForCustomer (requireMerchantSession-gated, read-path-only).
+ * Best-effort preview lookup, same resolve-to-null-on-any-failure shape as
+ * getUpcomingBirthdays/getUpcomingAnniversaries above (never throws into the
+ * caller) — a missing/failed draft lookup must fall back to the existing
+ * fixed-text preview, not surface as an error.
+ * occasionDate must be the raw "M-D" string (e.g. "8-27"), matching the
+ * customer.birthday/customer.anniversary field convention already used by
+ * recordMessageAction's callers — not the human-readable parseMD() display format.
+ */
+export function fetchCustomerDraft(customerId, occasion, occasionDate) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session || !occasionDate) return Promise.resolve(null);
+  return client.query(api.customers.getDraftForCustomer, {
+    customerId: convexUserId(customerId),
+    occasion,
+    occasionDate,
+    ...session,
+  }).catch(() => null);
+}
+
+/**
  * Record an admin decision (Approve & Send → "sent", Cancel → "cancelled")
  * for one customer's birthday/anniversary occasion on a specific occasion_date
  * ("M-D" string, e.g. "8-27") — see docs/superpowers/specs/2026-08-26-message-action-tracking-design.md.

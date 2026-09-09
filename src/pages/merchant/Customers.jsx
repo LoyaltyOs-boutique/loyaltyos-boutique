@@ -6,7 +6,7 @@ import {
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
-  recordMessageAction, awardPoints,
+  recordMessageAction, awardPoints, fetchCustomerDraft,
   hydrateCustomers, hydrateReviews, hydratePointsHistory,
   hydrateCustomersPage, customersPage, resetCustomersPageCache,
   clearMerchantSession,
@@ -552,23 +552,45 @@ function Info({ label, value }) {
 
 /**
  * "Approve & Send" modal for the Birthdays tomorrow / Anniversaries tomorrow
- * tabs. Mirrors Templates.jsx's MomentCard.send() guard/try/catch/fallback
- * shape exactly: no template configured for this occasion type → skip
- * straight to the wa.me fallback; template configured → try the Cloud API
- * send, and on ANY failure fall back to the same wa.me link-open, never a
- * silent dead end. The preview block shown here is for the merchant's own
- * reference only — the real outgoing Cloud API bodyParams stay `[name]`
- * only per the locked design decision, since discount/coupon/valid-days
- * position in the real approved template text isn't finalized yet.
+ * tabs. Per docs/superpowers/specs/2026-09-09-whatsapp-ai-draft-wame-design.md
+ * Option B: the wa.me link-open is now the PRIMARY action (one merchant tap
+ * pre-fills WhatsApp with the message; the merchant still has to tap send
+ * themselves inside WhatsApp — an extra manual-approval step, not fewer).
+ * The Cloud API template send stays fully live as an explicit SECONDARY
+ * option, only enabled when a template is configured for this occasion —
+ * identical sendWhatsAppTemplateMessage call/args as before this change.
+ * The preview box shows the customer's real AI-generated draft
+ * (ai_message_drafts, via getDraftForCustomer) when the daily drafts cron
+ * has already produced one for today's occasion_date; otherwise it falls
+ * back to the exact same fixed-text preview this modal always used —
+ * unchanged fallback branch, not a replacement.
  */
 function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent }) {
   const { customer, occasion } = target;
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
+  const [aiDraftText, setAiDraftText] = useState(null);
   const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
   const waTemplate = waTemplates[occasion];
   const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
-  const occasionDate = parseMD(occasion === 'birthday' ? customer.birthday : customer.anniversary);
+  // Raw "M-D" occasion date (e.g. "8-27") — same field/format the existing
+  // onSent handler already sends to recordMessageAction (Customers.jsx:519-521),
+  // NOT the human-readable parseMD() display string below.
+  const rawOccasionDate = occasion === 'birthday' ? customer.birthday : customer.anniversary;
+  const occasionDate = parseMD(rawOccasionDate);
+
+  // On open (or if the target customer/occasion changes), look up today's AI
+  // draft for this customer+occasion. Best-effort — fetchCustomerDraft never
+  // throws, resolves to null on any failure/absence, so the fixed-text
+  // preview below always has a good fallback.
+  useEffect(() => {
+    let live = true;
+    setAiDraftText(null);
+    fetchCustomerDraft(customer.id, occasion, rawOccasionDate).then((draft) => {
+      if (live && draft && draft.draft_text) setAiDraftText(draft.draft_text);
+    });
+    return () => { live = false; };
+  }, [customer.id, occasion, rawOccasionDate]);
 
   // Preview text — reference-only for the merchant, assembled from the
   // customer's name plus the configured discount/coupon/valid-days for this
@@ -581,30 +603,32 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     cfg.discountPercent ? `Enjoy ${cfg.discountPercent}% off` + (cfg.couponCode ? ` with code ${cfg.couponCode}` : '') + (cfg.validDays ? `, valid for ${cfg.validDays} days.` : '.') : null,
   ].filter(Boolean);
 
-  const previewText = previewLines.join('\n');
+  const fallbackPreviewText = previewLines.join('\n');
+  // Real AI draft when one exists for today's occasion_date, else the exact
+  // same fixed-text fallback this modal always showed.
+  const previewText = aiDraftText || fallbackPreviewText;
 
   const openWaLinkFallback = () => {
     window.open(`https://wa.me/${waDigits(customer.whatsapp || customer.mobile)}?text=${encodeURIComponent(previewText)}`, '_blank');
   };
 
-  const approve = async () => {
-    // Consent gate — never send to a customer who hasn't given WhatsApp
-    // consent, even if the button is somehow triggered while disabled.
+  // Primary action (Option B): open wa.me pre-filled with the preview text
+  // (AI draft if available, else the fixed fallback). Never calls the Cloud
+  // API — that is now the explicit secondary action below.
+  const sendViaWaLink = () => {
     if (!customer.whatsapp_consent) return;
+    openWaLinkFallback();
+    setSendMsg('Sent via WhatsApp link');
+    onSent?.(customer.id, occasion, 'wa_fallback');
+    onClose();
+  };
 
-    // No template configured for this occasion type yet → skip the Cloud
-    // API attempt entirely, go straight to wa.me — same guard MomentCard.send()
-    // uses, not an error state.
-    if (!waTemplate) {
-      openWaLinkFallback();
-      setSendMsg('Sent via WhatsApp link');
-      onSent?.(customer.id, occasion, 'wa_fallback');
-      onClose();
-      return;
-    }
-
-    // Template IS configured → try the Cloud API send first. bodyParams:
-    // [name] only, no card image URL — identical shape to MomentCard.send().
+  // Secondary action: the original Cloud API template send, unchanged in
+  // behavior — same args, same template-configured check, same on-failure
+  // fallback to the wa.me link-open (still logs 'wa_fallback' if it falls
+  // through, exactly as before this change).
+  const sendViaCloudApi = async () => {
+    if (!customer.whatsapp_consent || !waTemplate) return;
     setSending(true);
     setSendMsg('Sending…');
     let channel = 'cloud_api';
@@ -612,7 +636,7 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
       await sendWhatsAppTemplateMessage(customer.mobile, waTemplate.name, waTemplate.language, undefined, [customer.name.trim() || '{name}']);
       setSendMsg('Sent via WhatsApp');
     } catch (err) {
-      // Any failure (Meta rejection, network error, etc.) → fall back to the
+      // Any failure (Meta rejection, network error, etc.) — fall back to the
       // same wa.me link-open, using the preview text shown above.
       openWaLinkFallback();
       setSendMsg('Sent via WhatsApp link');
@@ -639,7 +663,10 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
         </div>
         <div className="flex gap-2">
           <button onClick={onClose} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Cancel</button>
-          <button onClick={approve} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
+          <button onClick={sendViaWaLink} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={sendViaCloudApi} disabled={sending || !customer.whatsapp_consent || !waTemplate} title={waTemplate ? 'Send via WhatsApp Cloud API template instead' : 'No WhatsApp template configured for this occasion'} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Send via Cloud API instead</button>
         </div>
         {!customer.whatsapp_consent && (
           <div className="text-red-600 text-xs">This customer hasn't given WhatsApp consent yet — can't send.</div>
