@@ -6,7 +6,7 @@ import {
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
-  recordMessageAction, awardPoints, fetchCustomerDraft,
+  recordMessageAction, awardPoints, generateMessageDraftRemote,
   hydrateCustomers, hydrateReviews, hydratePointsHistory,
   hydrateCustomersPage, customersPage, resetCustomersPageCache,
   clearMerchantSession,
@@ -559,10 +559,23 @@ function Info({ label, value }) {
  * The Cloud API template send stays fully live as an explicit SECONDARY
  * option, only enabled when a template is configured for this occasion —
  * identical sendWhatsAppTemplateMessage call/args as before this change.
- * The preview box shows the customer's real AI-generated draft
- * (ai_message_drafts, via getDraftForCustomer) when the daily drafts cron
- * has already produced one for today's occasion_date; otherwise it falls
- * back to the exact same fixed-text preview this modal always used —
+ * The preview box shows the customer's real AI-generated draft via
+ * generateMessageDraftRemote (2026-09-09 — on-demand generation + caching,
+ * see convex/ai.ts's generateMessageDraftPublic), gated on
+ * customer.whatsapp_consent === true. That backend call checks its own cache
+ * first (a draft the nightly cron OR a prior on-demand call already produced
+ * for today's occasion_date) and only calls Gemini fresh on a genuine miss —
+ * the modal doesn't know or care which happened, it just shows a brief
+ * "Generating AI draft…" loading state while the call is in flight. This
+ * REPLACES the old read-only fetchCustomerDraft/getDraftForCustomer call this
+ * modal used to make (2026-09-04) — that old call only ever read whatever the
+ * nightly cron had already produced and is now fully subsumed by
+ * generateMessageDraftPublic's own internal cache check, so keeping both
+ * would just be two backend round-trips doing overlapping work.
+ * fetchCustomerDraft/getDraftForCustomer themselves are NOT removed from
+ * db.js/customers.ts — only this call site. If whatsapp_consent is false, or
+ * the call resolves to null for any reason (network/Gemini failure), this
+ * falls back to the exact same fixed-text preview this modal always used —
  * unchanged fallback branch, not a replacement.
  */
 function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent }) {
@@ -570,6 +583,7 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
   const [aiDraftText, setAiDraftText] = useState(null);
+  const [aiDraftLoading, setAiDraftLoading] = useState(false);
   const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
   const waTemplate = waTemplates[occasion];
   const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
@@ -579,18 +593,32 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   const rawOccasionDate = occasion === 'birthday' ? customer.birthday : customer.anniversary;
   const occasionDate = parseMD(rawOccasionDate);
 
-  // On open (or if the target customer/occasion changes), look up today's AI
-  // draft for this customer+occasion. Best-effort — fetchCustomerDraft never
-  // throws, resolves to null on any failure/absence, so the fixed-text
-  // preview below always has a good fallback.
+  // On open (or if the target customer/occasion changes) AND the customer has
+  // given WhatsApp consent, ask the backend for a real AI draft — a cache hit
+  // (nightly cron already ran, or a prior on-demand call already generated
+  // one for this exact tuple) resolves near-instantly; a cache miss takes a
+  // moment longer while Gemini generates fresh. Either way the modal shows a
+  // brief "Generating AI draft…" loading state for the duration.
+  //
+  // If whatsapp_consent is false, this effect deliberately does NOTHING —
+  // no backend call of any kind, no loading state — the fixed-template
+  // preview below renders immediately, since a non-consented customer can't
+  // be sent to anyway (no point spending a Gemini-adjacent backend call).
   useEffect(() => {
-    let live = true;
     setAiDraftText(null);
-    fetchCustomerDraft(customer.id, occasion, rawOccasionDate).then((draft) => {
-      if (live && draft && draft.draft_text) setAiDraftText(draft.draft_text);
-    });
+    if (!customer.whatsapp_consent) {
+      setAiDraftLoading(false);
+      return;
+    }
+    let live = true;
+    setAiDraftLoading(true);
+    generateMessageDraftRemote(customer.id, customer.name, customer.tier, occasion, rawOccasionDate)
+      .then((draftText) => {
+        if (live && draftText) setAiDraftText(draftText);
+      })
+      .finally(() => { if (live) setAiDraftLoading(false); });
     return () => { live = false; };
-  }, [customer.id, occasion, rawOccasionDate]);
+  }, [customer.id, customer.name, customer.tier, customer.whatsapp_consent, occasion, rawOccasionDate]);
 
   // Preview text — reference-only for the merchant, assembled from the
   // customer's name plus the configured discount/coupon/valid-days for this
@@ -659,6 +687,7 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
         </div>
         <div>
           <div className="label">Preview (merchant reference only)</div>
+          {aiDraftLoading && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
           <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{previewText}</div>
         </div>
         <div className="flex gap-2">

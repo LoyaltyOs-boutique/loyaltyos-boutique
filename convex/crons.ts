@@ -133,7 +133,58 @@ export const hasExistingDraft = internalQuery({
   },
 });
 
-/** Insert a new pending draft row — the cron's only write to ai_message_drafts. */
+/**
+ * getCachedDraftTextInternal — 2026-09-09 addition for on-demand draft
+ * generation + caching (see ai.ts's generateMessageDraftPublic, the new
+ * caller). Reads the SAME by_customer_occasion_date index hasExistingDraft
+ * already uses (above) for the SAME (customer, occasion, occasion_date)
+ * tuple shape, but returns the actual cached `draft_text` string instead of
+ * just a boolean — this is the read side of the cache; hasExistingDraft
+ * remains the cron's own existence-only dedup check and is NOT modified or
+ * reused here, per this task's STRICT scope (no logic changes to
+ * hasExistingDraft/insertDraft themselves).
+ *
+ * "Cached" = the newest "pending"-status row for the tuple, same
+ * newest-pending-wins semantics customers.ts's getDraftForCustomer already
+ * uses for its own read of this table — kept consistent rather than
+ * inventing a different selection rule for what is conceptually the same
+ * "current draft for this tuple" read. Returns null when no such row exists,
+ * which the caller (generateMessageDraftPublic) treats as a genuine cache
+ * miss requiring a fresh Gemini call.
+ */
+export const getCachedDraftTextInternal = internalQuery({
+  args: {
+    customerId: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+  },
+  handler: async (ctx, { customerId, occasion, occasionDate }): Promise<string | null> => {
+    const rows = await ctx.db
+      .query("ai_message_drafts")
+      .withIndex("by_customer_occasion_date", (q) =>
+        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      )
+      .collect();
+
+    const pending = rows.filter((r) => r.status === "pending");
+    if (pending.length === 0) return null;
+    pending.sort((a, b) => b.generated_at - a.generated_at);
+    return pending[0].draft_text;
+  },
+});
+
+/**
+ * Insert a new pending draft row into ai_message_drafts.
+ *
+ * DUAL USE (2026-09-09 — on-demand draft generation + caching): originally
+ * "the cron's only write to ai_message_drafts" (generateDailyDrafts, SECTION
+ * 3 below). Now ALSO called from ai.ts's generateMessageDraftPublic, the new
+ * on-demand path triggered from the Approve & Send modal the moment a
+ * merchant actually needs a draft that doesn't exist yet (rather than only
+ * ever waiting for the next nightly cron run). Both callers write the exact
+ * same shape/status ("pending") into the exact same table — this mutation's
+ * own logic is unchanged, only its set of callers has grown.
+ */
 export const insertDraft = internalMutation({
   args: {
     customerId: v.id("users"),
@@ -707,12 +758,21 @@ export const generateDailyActivitySummaries = internalAction({
 
 const crons = cronJobs();
 
-// Runs daily at a FIXED wall-clock time — 00:05 AM IST == 18:35 UTC the
-// previous day (see the file-header comment above for the full IST<->UTC
-// arithmetic). Uses crons.cron() with a standard 5-field cron expression,
-// per this project's pinned guidelines (never crons.daily()/.hourly()/.weekly()).
-// "35 18 * * *" = minute 35, hour 18 UTC, every day/month/day-of-week.
-crons.cron("generate whatsapp ai drafts", "35 18 * * *", internal.crons.generateDailyDrafts, {});
+// REMOVED 2026-09-09 — generateDailyDrafts' automatic cron.cron(...)
+// registration line used to live here ("generate whatsapp ai drafts",
+// "35 18 * * *", internal.crons.generateDailyDrafts, {}).
+//
+// Superseded 2026-09-09 by on-demand generation + caching in the Approve &
+// Send modal — see convex/ai.ts's generateMessageDraftPublic.
+// generateDailyDrafts itself is left fully intact below (SECTION 3) and
+// remains manually invokable (e.g. `npx convex run crons:generateDailyDrafts
+// '{}'`) — only its automatic schedule is removed. The nightly batch run had
+// a real gap this closes: a customer created/updated AFTER the nightly cron
+// already ran would never get a draft until the NEXT night, even though
+// Gemini could generate one on demand right now. On-demand generation (first
+// real need per (customer, occasion, occasion_date) tuple triggers ONE
+// Gemini call, cached into this same ai_message_drafts table thereafter)
+// makes the nightly batch redundant without removing any of its own code.
 
 // New, separate registration — added alongside (not replacing/merging into)
 // the drafts cron above. Same fixed 18:35 UTC (00:05 IST) daily schedule.

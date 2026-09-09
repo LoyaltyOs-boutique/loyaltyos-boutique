@@ -409,6 +409,95 @@ export const generateMessageDraft = internalAction({
   },
 });
 
+/**
+ * generateMessageDraftPublic — 2026-09-09 addition. Public, merchant-guarded
+ * entry point for ON-DEMAND draft generation with caching, called directly
+ * from the Approve & Send modal (Customers.jsx's ApprovalModal) instead of
+ * only ever waiting for the next nightly generateDailyDrafts cron run.
+ *
+ * Mirrors events.ts's generateEventDraftPublic session-guard-then-delegate
+ * shape exactly: checkMerchantSession (this file's own internalQuery, above)
+ * runs first, then the real work happens. Unlike generateEventDraftPublic
+ * (which just forwards straight into its one internal action),this function
+ * ALSO owns the cache-check-then-generate-then-cache orchestration described
+ * below — generateMessageDraft itself is not changed at all and has no
+ * awareness that a cache now sits in front of it.
+ *
+ * Cache-first flow, reusing the EXACT SAME ai_message_drafts table +
+ * by_customer_occasion_date tuple shape the nightly cron already established
+ * (crons.ts) — no new table, no new tuple convention:
+ *   1. ctx.runQuery(internal.crons.getCachedDraftTextInternal, ...) — if a
+ *      cached "pending" row already exists for this exact
+ *      (customerId, occasion, occasionDate) tuple, return its draft_text
+ *      IMMEDIATELY. Zero Gemini calls on a cache hit — this is the single
+ *      most important behavior this function exists to guarantee.
+ *   2. On a cache miss (null): call ctx.runAction(internal.ai.generateMessageDraft,
+ *      ...) — the existing, unmodified Gemini-calling action.
+ *   3. If that returns real (non-null) text: cache it via
+ *      ctx.runMutation(internal.crons.insertDraft, ...) BEFORE returning it
+ *      to the caller, so every future call for this exact tuple is a cache
+ *      hit from here on.
+ *   4. If generateMessageDraft returns null (a genuine Gemini failure — its
+ *      own fail-gracefully contract, see that function's doc comment): return
+ *      null WITHOUT caching anything. This is deliberate — caching a failure
+ *      as if it were a valid (empty) draft would permanently strand every
+ *      future attempt for this tuple on a cached "nothing", with no way to
+ *      retry. Leaving no row behind means the very next call for this tuple
+ *      is correctly treated as a fresh cache-miss retry, not stuck.
+ *
+ * CONFIDENTIALITY: this function reads/writes nothing beyond what
+ * generateMessageDraft and the crons.ts helpers it delegates to already
+ * touch (customer_id/occasion/occasion_date/draft_text on ai_message_drafts,
+ * plus name/tier/occasion passed straight through to generateMessageDraft) —
+ * no new confidential-field read path is introduced here.
+ */
+export const generateMessageDraftPublic = action({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+    customerId: v.id("users"),
+    customerName: v.string(),
+    tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+  },
+  handler: async (
+    ctx,
+    { userId, token, customerId, customerName, tier, occasion, occasionDate },
+  ): Promise<string | null> => {
+    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+
+    // Step 1 — cache check FIRST, no Gemini call on a hit.
+    const cached: string | null = await ctx.runQuery(internal.crons.getCachedDraftTextInternal, {
+      customerId,
+      occasion,
+      occasionDate,
+    });
+    if (cached) return cached;
+
+    // Step 2 — cache miss: generate fresh via the existing, unmodified action.
+    const draftText: string | null = await ctx.runAction(internal.ai.generateMessageDraft, {
+      customerName,
+      tier,
+      occasion,
+    });
+
+    // Step 4 — a real Gemini failure must NOT be cached (see doc comment above).
+    if (!draftText) return null;
+
+    // Step 3 — cache the fresh draft before returning it, so every future
+    // call for this exact tuple becomes a cache hit.
+    await ctx.runMutation(internal.crons.insertDraft, {
+      customerId,
+      occasion,
+      occasionDate,
+      draftText,
+    });
+
+    return draftText;
+  },
+});
+
 // ============================================================================
 // SECTION 4 — Test-only scaffolding (Phase 2 verification)
 // ============================================================================

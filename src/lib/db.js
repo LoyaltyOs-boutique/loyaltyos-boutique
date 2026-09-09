@@ -548,6 +548,54 @@ export function fetchCustomerDraft(customerId, occasion, occasionDate) {
 }
 
 /**
+ * On-demand AI WhatsApp draft generation, WITH server-side caching (async).
+ * MERCHANT-ONLY. See convex/ai.ts's generateMessageDraftPublic — the first
+ * call for a given (customerId, occasion, occasionDate) tuple triggers one
+ * real Gemini call and caches the result into the SAME ai_message_drafts
+ * table the old nightly cron wrote to; every subsequent call for that exact
+ * tuple returns the cached row instantly with zero Gemini calls. This fixes
+ * the real gap in fetchCustomerDraft above (a read-only lookup of whatever
+ * the nightly cron already produced): a customer created/updated AFTER the
+ * cron already ran would never get a draft until the next night — this call
+ * generates one immediately instead.
+ *
+ * occasionDate must be the raw "M-D" string (e.g. "8-27"), same convention
+ * fetchCustomerDraft/recordMessageAction already use — not the
+ * human-readable parseMD() display format.
+ *
+ * ERROR-HANDLING SHAPE — resolves to null on ANY failure (network error,
+ * missing session, Gemini failure, etc.), deliberately matching
+ * fetchCustomerDraft's resolve-to-null shape above rather than propagating a
+ * real error like sendWhatsAppTemplateMessage does. Reasoning: unlike a send
+ * action (where a swallowed error would hide a real failed WhatsApp send from
+ * the merchant), this call only ever feeds the ApprovalModal's PREVIEW text —
+ * the modal already has a well-established, always-correct fallback (today's
+ * fixed-template text) for exactly this "no AI draft available" case. Every
+ * other AI-drafting path in this codebase (fetchCustomerDraft here,
+ * generateEventDraftRemote below) already resolves to null on failure for
+ * the same reason — staying consistent with that established fail-gracefully
+ * posture is more valuable here than surfacing a raw error the modal has no
+ * specific UI for anyway.
+ */
+export async function generateMessageDraftRemote(customerId, customerName, tier, occasion, occasionDate) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session || !occasionDate) return null;
+  try {
+    return await client.action(api.ai.generateMessageDraftPublic, {
+      customerId: convexUserId(customerId),
+      customerName,
+      tier,
+      occasion,
+      occasionDate,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Record an admin decision (Approve & Send → "sent", Cancel → "cancelled")
  * for one customer's birthday/anniversary occasion on a specific occasion_date
  * ("M-D" string, e.g. "8-27") — see docs/superpowers/specs/2026-08-26-message-action-tracking-design.md.
