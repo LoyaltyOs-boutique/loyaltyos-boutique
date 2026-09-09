@@ -60,6 +60,47 @@ function NavList({ onNavigate }) {
  * the same text-[10px]/btn-ghost convention already used for small icon
  * buttons elsewhere in this file (e.g. the ☰ Menu button).
  */
+/**
+ * IST fixed offset — same fixed +5:30 assumption already established
+ * elsewhere in this codebase today (convex/customers.ts's IST_OFFSET_MS,
+ * Customers.jsx's IST_OFFSET_MS/canonicalTomorrowOccasionDate) for 85
+ * Lansdowne's real local calendar day. IST has no daylight-saving, so this
+ * fixed offset is always correct.
+ */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * parseOccasionDate — parses a notification's stored `occasion_date` string
+ * into a real Date (UTC midnight of that calendar day), so it can be
+ * compared against "today" numerically rather than lexicographically.
+ *
+ * P2-3 fix (2026-09-09): birthday/anniversary notification rows store
+ * `occasion_date` as the canonical "YYYY-M-D" key established by yesterday's
+ * P0-1 fix (convex/crons.ts's generateDailyNotifications writes
+ * findUpcomingInternal's `hit.occasion_date` straight through — confirmed by
+ * reading both files, not assumed). NOTE: weekly_activity rows use a
+ * DIFFERENT, year-less "M-D" format (crons.ts's generateWeeklyActivityNotifications
+ * mondayDate) — this helper is only ever called from the birthday/anniversary
+ * branch below (after the weekly_activity early-return), so that format is
+ * never passed here.
+ *
+ * Returns null on anything unparseable (defensive — old-format pre-P0-1 rows
+ * may still exist per that fix's own "no migration" note) so the caller can
+ * fall back to today's existing tomorrow-tab behavior rather than crash.
+ */
+function parseOccasionDate(s) {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec((s || '').trim());
+  if (!m) return null;
+  const [, y, mo, d] = m;
+  return new Date(Date.UTC(Number(y), Number(mo) - 1, Number(d)));
+}
+
+/** Today's real IST calendar date, at UTC midnight (for date-only comparison). */
+function istTodayDateOnly() {
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  return new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+}
+
 function NotificationBell() {
   const [, setV] = useState(0);
   useEffect(() => subscribe(() => setV((v) => v + 1)), []);
@@ -119,13 +160,34 @@ function NotificationBell() {
     // filter-initialization line reads `location.state?.tab`), same pattern
     // already used for the Reviews tab-jump.
     //
-    // Trade-off (accepted): the target tab is computed from TODAY's date, not
-    // this notification's stored occasion_date, so this only shows the
-    // customer if their occasion is STILL literally tomorrow at click-time —
-    // unlike the old `q`-marker approach, which matched the stored date
-    // directly regardless of how old the notification was.
+    // P2-3 fix (2026-09-09): the OLD code below always computed the target
+    // tab from TODAY's date via `n.occasion`'s TYPE alone (birthday vs
+    // anniversary), never looking at the notification's own stored
+    // occasion_date — so clicking an OLD notification after its occasion had
+    // already passed landed on the tomorrow-tab as it stands TODAY (now
+    // describing a DIFFERENT customer/occasion, or empty), not the one this
+    // notification was originally about.
+    //
+    // Audited (Customers.jsx): the birthday_tomorrow/anniversary_tomorrow
+    // tabs are strictly `days_until === 1` against a LIVE getUpcomingBirthdays/
+    // getUpcomingAnniversaries(days:1) fetch — structurally "exactly
+    // tomorrow, nothing else"; they cannot display a past occasion. So a
+    // STALE notification (occasion_date already before today) can never be
+    // shown correctly by that tab regardless of which occasion type it
+    // encodes — the only correct fallback is to open the customer's CRM
+    // record directly, reusing the SAME location.state.selectedCustomerId
+    // mechanism the weekly-activity "View Full Profile" button already uses
+    // (commit 6c4024b) rather than inventing a new path.
     setOpen(false);
-    navigate('/merchant/customers', { state: { tab: n.occasion === 'birthday' ? 'birthday_tomorrow' : 'anniversary_tomorrow' } });
+    const occasionDate = parseOccasionDate(n.occasion_date);
+    const isStale = occasionDate !== null && occasionDate.getTime() < istTodayDateOnly().getTime();
+    if (isStale) {
+      navigate('/merchant/customers', { state: { selectedCustomerId: n.customer_id } });
+    } else {
+      // Fresh notification (occasion still today/upcoming) — or occasion_date
+      // was unparseable (defensive fallback) — unchanged existing behavior.
+      navigate('/merchant/customers', { state: { tab: n.occasion === 'birthday' ? 'birthday_tomorrow' : 'anniversary_tomorrow' } });
+    }
   };
 
   // Fallback copy shown in the summary popup when generation genuinely
