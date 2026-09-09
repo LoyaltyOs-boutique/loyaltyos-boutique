@@ -242,9 +242,26 @@ export default function Dashboard() {
           customer yet (the daily cron hasn't reached them yet). */}
       {summaryCustomer && (
         <Modal open onClose={() => setSummaryCustomerId(null)} title={`${summaryCustomer.name} — engagement summary`}>
-          <p className="text-sm text-ink/75 leading-relaxed">
-            {summaryCustomer.latestSummary || 'No summary generated yet — check back tomorrow.'}
-          </p>
+          <div className="space-y-4">
+            <p className="text-sm text-ink/75 leading-relaxed">
+              {summaryCustomer.latestSummary || 'No summary generated yet — check back tomorrow.'}
+            </p>
+            {/* "View Full Profile" — same navigate('/merchant/customers',
+                { state: { selectedCustomerId } }) mechanism + same btn-ink
+                popup-action styling as Shell.jsx's NotificationBell
+                "View Full Profile" button (commit 6c4024b). Close this
+                Dashboard popup first, then navigate. */}
+            <button
+              onClick={() => {
+                const customerId = summaryCustomer.customerId;
+                setSummaryCustomerId(null);
+                navigate('/merchant/customers', { state: { selectedCustomerId: customerId } });
+              }}
+              className="btn-ink w-full justify-center !py-2"
+            >
+              View Full Profile
+            </button>
+          </div>
         </Modal>
       )}
     </div>
