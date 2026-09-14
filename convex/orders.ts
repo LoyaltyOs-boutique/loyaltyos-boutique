@@ -46,6 +46,10 @@ export const createOrder = mutation({
     // 1. Verify User
     const user = await ctx.db.get(customerId);
     if (!user) return { ok: false, error: "User not found" };
+    // Soft-delete rejection (2026-09-14 design, section c.6) — a merchant
+    // must not be able to create new orders/points for a deleted customer.
+    // Same {ok:false, error} shape as the other validation failures below.
+    if (user.is_deleted === true) return { ok: false, error: "Customer not found." };
 
     // 2. Validate Inputs
     if (subtotal_paise <= 0) return { ok: false, error: "Invalid subtotal" };

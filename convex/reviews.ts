@@ -122,6 +122,12 @@ export const approveReview = mutation({
     // Fetch user
     const user = await ctx.db.get(review.user_id);
     if (!user) throw new Error("User not found");
+    // Soft-delete rejection (2026-09-14 design, section c.6) — a merchant
+    // must not be able to approve a review (and mint points) for a deleted
+    // customer. Same throw-based error shape this function already uses for
+    // its other validation failures above (approveReview/declineReview throw
+    // rather than return {ok:false} — unlike orders.ts's createOrder).
+    if (user.is_deleted === true) throw new Error("Customer not found.");
 
     // Get current loyalty rules (fallback to defaults if empty)
     const settingsDoc = await ctx.db

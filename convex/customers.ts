@@ -70,8 +70,38 @@ function toMerchantCustomer(doc: UserDoc) {
   };
 }
 
-/** Fetch a single customer doc by _id, or null if missing / not a customer. */
+/**
+ * Fetch a single customer doc by _id, or null if missing / not a customer /
+ * soft-deleted.
+ *
+ * Soft-delete design (docs/superpowers/specs/2026-09-14-customer-soft-delete-design.md
+ * section c.3): this is the SHARED existence-check helper used by
+ * getCustomerById, getCustomerIntelligenceProfile, updateMeasurements,
+ * addStaffNote, updateCustomTags, updateCustomerProfile, and awardPoints —
+ * adding the is_deleted filter ONCE here fixes all of those call sites at
+ * once (single source of truth), rather than patching each one individually.
+ *
+ * NOTE — deleteCustomer does NOT call this filtered version to look up the
+ * customer it is about to delete. It needs to distinguish "not found" from
+ * "found but already deleted" (to return a clear idempotency error), which
+ * this helper can't do once it hides is_deleted:true rows. deleteCustomer
+ * uses getCustomerDocIncludingDeleted (below) instead.
+ */
 async function getCustomerDoc(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
+  const doc = await ctx.db.get(id);
+  if (!doc || doc.role !== "customer" || doc.is_deleted === true) return null;
+  return doc;
+}
+
+/**
+ * Unfiltered variant of getCustomerDoc — returns the doc regardless of its
+ * is_deleted flag (still requires role==="customer"). Used ONLY by
+ * deleteCustomer, which needs to see an already-deleted row in order to
+ * return its "already deleted" idempotency error instead of the generic
+ * "Customer not found." that the filtered getCustomerDoc would otherwise
+ * produce (since it hides is_deleted:true rows from every other caller).
+ */
+async function getCustomerDocIncludingDeleted(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
   const doc = await ctx.db.get(id);
   if (!doc || doc.role !== "customer") return null;
   return doc;
@@ -349,6 +379,9 @@ export const getCustomers = query({
     const customers = await ctx.db
       .query("users")
       .filter((q) => q.eq(q.field("role"), "customer"))
+      // Soft-delete exclusion (2026-09-14 design, section c.1) — a deleted
+      // customer must not show in the CRM full list.
+      .filter((q) => q.neq(q.field("is_deleted"), true))
       .collect();
     return customers
       .map(toMerchantCustomer)
@@ -387,6 +420,17 @@ export const getCustomersPaginated = query({
       .query("users")
       .withIndex("by_role_name_lower", (q) => q.eq("role", "customer"))
       .order("asc")
+      // Soft-delete exclusion (2026-09-14 design, section c.2) — a post-index
+      // .filter() here (rather than a second index) is the deliberate,
+      // non-over-engineered fix: it means a page can legitimately return
+      // FEWER than the requested page size when it contains deleted rows
+      // (Convex's own documented behavior for a filtered/paginated query —
+      // isDone/continueCursor still work correctly, the frontend just may see
+      // a short page). Junk-data volume here (~46 rows total, per the audit)
+      // is small enough that this is a fine trade for not introducing a
+      // second compound index just for this. If deleted-row volume grows
+      // much larger, revisit with a dedicated index instead.
+      .filter((q) => q.neq(q.field("is_deleted"), true))
       .paginate(paginationOpts);
     return {
       ...result,
@@ -845,6 +889,9 @@ export const findCustomerByMobile = query({
       .query("users")
       .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
       .filter((q) => q.eq(q.field("role"), "customer"))
+      // Soft-delete exclusion (2026-09-14 design, section c.4) — doesn't go
+      // through getCustomerDoc, so needs its own explicit filter.
+      .filter((q) => q.neq(q.field("is_deleted"), true))
       .first();
     return doc ? toMerchantCustomer(doc) : null;
   },
@@ -907,9 +954,22 @@ export const createCustomer = mutation({
       // customer who consented on a prior visit — clearing consent is a
       // separate, more sensitive action outside this flow's scope.
       let record = existing;
+
+      // Decision 2 (2026-09-14 soft-delete design) — re-onboarding a
+      // soft-deleted customer's mobile number REACTIVATES the same row
+      // (clears is_deleted) instead of blocking the signup or creating a
+      // second row for the same phone number. This deliberately fires
+      // BEFORE the consent/vvip upgrade patches below so a reactivated
+      // customer also picks up any new consent/vvip flag from this same
+      // re-onboarding submission, all as one logical "welcome back" patch.
+      if (existing.is_deleted === true) {
+        await ctx.db.patch(existing._id, { is_deleted: false });
+        record = { ...existing, is_deleted: false };
+      }
+
       if (whatsapp_consent === true && existing.whatsapp_consent !== true) {
         await ctx.db.patch(existing._id, { whatsapp_consent: true });
-        record = { ...existing, whatsapp_consent: true };
+        record = { ...record, whatsapp_consent: true };
       }
       // Same upgrade-only shape as whatsapp_consent above — re-onboarding a
       // customer can mark them VVIP, but a resubmission without the flag
@@ -949,6 +1009,102 @@ export const createCustomer = mutation({
       ok: true,
       id,
       customer: created ? toMerchantCustomer(created) : null,
+    };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-14-customer-soft-delete-design.md
+ * section (a).
+ *
+ * deleteCustomer — single-customer soft delete. Sets is_deleted:true rather
+ * than removing the row, so points/order/review history stays intact (Gate 8
+ * DPDP "right to erasure" groundwork — see design doc "Known gap" note:
+ * magic-link access is intentionally NOT revoked by this, per Decision 1).
+ *
+ * Merchant-session-guarded via requireMerchantSession, same pattern as every
+ * other merchant-only mutation in this file. Reuses the unfiltered
+ * getCustomerDocIncludingDeleted helper (not the is_deleted-filtered
+ * getCustomerDoc) so an already-deleted customer is still found here and
+ * reported as a clear "already deleted" error, instead of a misleading
+ * "not found".
+ */
+export const deleteCustomer = mutation({
+  args: {
+    customerId: v.id("users"),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { customerId, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const doc = await getCustomerDocIncludingDeleted(ctx, customerId);
+    if (!doc) return { ok: false, error: "Customer not found." };
+    if (doc.is_deleted === true) {
+      return { ok: false, error: "Customer is already deleted." };
+    }
+
+    await ctx.db.patch(customerId, { is_deleted: true });
+    return { ok: true, id: customerId };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-14-customer-soft-delete-design.md
+ * section (b).
+ *
+ * bulkDeleteCustomers — batch soft delete for an explicit, human-reviewed
+ * list of customer ids (e.g. the 46-record legacy junk-data cleanup found in
+ * the 2026-09-14 audit). Deliberately has NO "looks like test data"
+ * heuristic — it only ever acts on ids the caller supplies; a human decides
+ * what's junk, this mutation just safely applies that decision.
+ *
+ * Same fetch-and-verify-before-mutate safety pattern as bulkCreateCustomers's
+ * skip-list (above): every id is checked (exists, role==="customer", not
+ * already deleted) before being patched, and a bad id is skipped with a
+ * reason rather than aborting or crashing the whole batch.
+ *
+ * NOTE: this reads via ctx.db.get directly (not getCustomerDoc), because it
+ * needs to distinguish "not found" / "not a customer" / "already deleted" as
+ * three separate skip reasons — the is_deleted-filtered getCustomerDoc would
+ * collapse the last two into one indistinguishable "not found".
+ */
+export const bulkDeleteCustomers = mutation({
+  args: {
+    customerIds: v.array(v.id("users")),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { customerIds, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const deleted: Array<{ id: string; name: string }> = [];
+    const skipped: Array<{ id: string; reason: string }> = [];
+
+    for (const id of customerIds) {
+      const doc = await ctx.db.get(id);
+      if (!doc) {
+        skipped.push({ id: String(id), reason: "not_found" });
+        continue;
+      }
+      if (doc.role !== "customer") {
+        skipped.push({ id: String(id), reason: "not_a_customer" });
+        continue;
+      }
+      if (doc.is_deleted === true) {
+        skipped.push({ id: String(id), reason: "already_deleted" });
+        continue;
+      }
+      await ctx.db.patch(id, { is_deleted: true });
+      deleted.push({ id: String(id), name: doc.name });
+    }
+
+    return {
+      ok: true,
+      deleted,
+      skipped,
+      deletedCount: deleted.length,
+      skippedCount: skipped.length,
     };
   },
 });
