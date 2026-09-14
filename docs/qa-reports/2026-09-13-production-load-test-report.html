@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LoyaltyOS Boutique — Production Load Test Report · 2026-09-13</title>
+<style>
+  :root {
+    --ink: #161616; --charcoal: #292929; --steel: #68645e;
+    --gold: #b79768; --gold-dark: #886a42; --gold-pale: #f5efe6;
+    --paper: #faf9f6; --white: #ffffff; --line: #ded8ce;
+    --green: #2d6a4f; --green-pale: #eaf4ee;
+    --blue: #3c647d; --blue-pale: #eaf2f7;
+    --amber: #8d5c18; --amber-pale: #fbf1df;
+    --red: #914343; --red-pale: #f8eaea;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: #efede9; color: var(--ink); font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 15px; line-height: 1.65; }
+  .document { max-width: 1000px; margin: 34px auto; background: var(--white); box-shadow: 0 20px 60px rgba(25,21,15,.10); }
+  header { position: relative; overflow: hidden; padding: 50px 58px 42px; color: var(--white); background: var(--ink); border-bottom: 5px solid var(--gold); }
+  header::after { content: ""; position: absolute; right: -120px; top: -175px; width: 370px; height: 370px; border: 1px solid rgba(183,151,104,.28); border-radius: 50%; }
+  .brand-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 36px; }
+  .brand { display: flex; align-items: center; gap: 13px; color: #e5ded3; font-size: 11px; letter-spacing: .2em; text-transform: uppercase; }
+  .mark { width: 36px; height: 36px; display: grid; place-items: center; color: var(--gold); border: 1px solid var(--gold); font-family: Georgia, serif; font-size: 18px; }
+  .version { padding: 6px 10px; color: #dfd6ca; border: 1px solid rgba(255,255,255,.25); font-size: 9px; letter-spacing: .15em; text-transform: uppercase; }
+  h1, h2, h3, h4 { margin-top: 0; color: var(--ink); font-family: Georgia, "Times New Roman", serif; font-weight: 500; line-height: 1.2; }
+  header h1 { max-width: 780px; margin: 0 0 14px; color: var(--white); font-size: clamp(29px, 4.2vw, 44px); letter-spacing: -.025em; }
+  header p { max-width: 770px; margin: 0; color: #cbc3b8; font-size: 16.5px; }
+  .meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 30px; background: #45413b; border: 1px solid #45413b; }
+  .meta-item { padding: 13px 15px; background: #232323; }
+  .meta-label { display: block; color: var(--gold); font-size: 9px; letter-spacing: .15em; text-transform: uppercase; }
+  .meta-value { color: #f4f0e9; font-size: 13px; }
+  main { padding: 44px 58px 60px; }
+  section { margin-top: 50px; }
+  section:first-child { margin-top: 0; }
+  .kicker { margin-bottom: 6px; color: var(--gold-dark); font-size: 10px; font-weight: 800; letter-spacing: .17em; text-transform: uppercase; }
+  section > h2 { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); font-size: 27px; }
+  h3 { font-size: 19px; margin: 30px 0 8px; }
+  h3:first-of-type { margin-top: 0; }
+  .lead { margin: 0 0 20px; color: var(--steel); font-size: 15.5px; }
+
+  .note { margin: 14px 0; padding: 13px 16px; border-left: 3px solid var(--blue); background: var(--blue-pale); color: #35596f; font-size: 13.5px; }
+  .note.green { border-left-color: var(--green); background: var(--green-pale); color: #2d5a44; }
+  .note.gold { border-left-color: var(--gold); background: var(--gold-pale); color: #6f5a35; }
+  .note.red { border-left-color: var(--red); background: var(--red-pale); color: #7a3535; }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13px; }
+  th, td { padding: 9px 12px; text-align: left; border: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--ink); color: #f4f0e9; font-family: Georgia, serif; font-weight: 500; font-size: 13.5px; letter-spacing: .02em; }
+  tr:nth-child(even) td { background: var(--paper); }
+  td .field { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: var(--blue); font-weight: 600; }
+  td .why { display: block; color: var(--steel); font-size: 12px; margin-top: 2px; }
+
+  .box { margin-top: 16px; padding: 22px 26px; border: 1px solid var(--line); border-top: 3px solid var(--gold); background: linear-gradient(180deg,#fff 0%, #fbf9f5 100%); }
+  .box h4 { margin: 0 0 6px; font-size: 19px; }
+  .box .what { margin: 0 0 8px; color: var(--charcoal); font-size: 14px; }
+
+  .pill { display: inline-block; margin: 1px 2px; padding: 2px 8px; border: 1px solid #e3d5bd; background: var(--gold-pale); color: var(--gold-dark); font-size: 9px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
+  .pill.blue { border-color: #c3d7e4; background: var(--blue-pale); color: var(--blue); }
+  .pill.green { border-color: #bcd8c7; background: var(--green-pale); color: var(--green); }
+  .pill.red { border-color: #e3c3c3; background: var(--red-pale); color: var(--red); }
+
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; background: var(--paper); border: 1px solid var(--line); padding: 1px 5px; }
+  footer { padding: 22px 58px; border-top: 1px solid var(--line); color: var(--steel); font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="document">
+  <header>
+    <div class="brand-row">
+      <div class="brand"><span class="mark">L</span> LoyaltyOS Boutique</div>
+      <div class="version">Internal QA · Not for client distribution</div>
+    </div>
+    <h1>Production Backend Load Test — Concurrency Ceiling</h1>
+    <p>A ramped, mixed-usage load test run directly against the live production Convex deployment to find the real concurrency ceiling — not a single-endpoint hammer test — with hard safety guards against causing an actual outage.</p>
+    <div class="meta">
+      <div class="meta-item"><span class="meta-label">Date run</span><span class="meta-value">2026-09-13 / 2026-09-14</span></div>
+      <div class="meta-item"><span class="meta-label">Target</span><span class="meta-value">pleasant-cobra-560.eu-west-1.convex.cloud (production)</span></div>
+      <div class="meta-item"><span class="meta-label">Branch</span><span class="meta-value">feat/ai-automation-gemini-phase</span></div>
+    </div>
+  </header>
+  <main>
+
+    <section>
+      <div class="kicker">Method</div>
+      <h2>What was run</h2>
+      <p class="lead">A standalone Node.js script (<code>load-tests/mixed-load-test.mjs</code>, since discarded — findings preserved here) used <code>ConvexHttpClient</code> pointed at the production deployment. It ramped through five concurrency levels — 50, 100, 250, 500, 1000 — each running virtual users for a fixed window. Each virtual user randomly picked one action, weighted ~85% read / ~15% write:</p>
+      <ul>
+        <li><strong>Reads (~85%):</strong> <code>getLookbookById</code>, <code>getCatalogueItemById</code>, <code>getSettings</code>, <code>getCustomers</code> (via one reused merchant session token, not re-logging-in per call)</li>
+        <li><strong>Writes (~15%):</strong> <code>createOrder</code>, <code>createReview</code> — every write tied to one of 3 customer records tagged <code>LOADTEST_2026_</code>, so results were fully traceable and cleanly removable afterward</li>
+      </ul>
+      <div class="note gold">Safety design: a <strong>soft-stop</strong> rule halted the ramp after any level with &gt;10% failures or p95 latency &gt;5s; a <strong>hard-stop</strong> rule would have aborted the entire script immediately if 100% of requests — including safe read-only calls — failed for 5+ consecutive seconds, signalling a possible full outage rather than normal load. Neither rate limiters nor any other safety mechanism was bypassed to make the test "pass."</div>
+    </section>
+
+    <section>
+      <div class="kicker">Results</div>
+      <h2>Per-level results</h2>
+      <table>
+        <thead><tr><th>Concurrency</th><th>Attempted</th><th>Success</th><th>Fail</th><th>Rate-limited</th><th>Timeout</th><th>Other</th><th>p50 (ms)</th><th>p95 (ms)</th><th>p99 (ms)</th></tr></thead>
+        <tbody>
+          <tr><td>50</td><td>50</td><td>50</td><td>0</td><td>0</td><td>0</td><td>0</td><td>818</td><td>1620</td><td>2147</td></tr>
+          <tr><td>100</td><td>100</td><td>100</td><td>0</td><td>0</td><td>0</td><td>0</td><td>958</td><td>2474</td><td>3502</td></tr>
+          <tr><td>250</td><td>250</td><td>238</td><td>12</td><td>12</td><td>0</td><td>0</td><td>1850</td><td><strong>8833</strong></td><td>11338</td></tr>
+          <tr><td>500</td><td colspan="9" style="color:var(--steel);font-style:italic;">Not run — ramp stopped after level 250 (soft-stop, see below)</td></tr>
+          <tr><td>1000</td><td colspan="9" style="color:var(--steel);font-style:italic;">Not run</td></tr>
+        </tbody>
+      </table>
+      <div class="note">
+        <strong>Stop reason: soft-stop, not hard-stop.</strong> After level 250 completed, failure rate was 4.8% — under the 10% threshold — but p95 latency (8833 ms) exceeded the 5000 ms threshold. The ramp correctly refused to escalate to 500/1000. <strong>No hard-stop / possible-outage condition ever triggered</strong> at any point during the run.
+      </div>
+    </section>
+
+    <section>
+      <div class="kicker">Analysis</div>
+      <h2>Honest read: genuine capacity, or rate-limiter artifact?</h2>
+      <p>Mostly genuine saturation, with one real caveat about the test harness itself:</p>
+      <ul>
+        <li>Only 12 of level 250's failures were rate-limited, all from <code>createReview</code>'s documented 20/hour-per-customer limiter — exactly matching the tagged test customers' review counts. <code>createCustomer</code>'s limiter never fired. Rate-limited calls fail fast, so they don't explain the latency spike either.</li>
+        <li>The p95/p99 jump at level 250 (8.8s / 11.3s, up from ~1.6s / 2.5s at 50/100) affected the unthrottled 85% read traffic too — <code>getSettings</code>, <code>getLookbookById</code>, <code>getCatalogueItemById</code>, <code>getCustomers</code> all degraded together. That points at real saturation, not a limiter.</li>
+        <li><strong>Caveat:</strong> <code>ConvexHttpClient</code> opens a fresh HTTPS connection per call rather than reusing a persistent socket. Part of the observed ceiling may reflect this single Node process's own connection fan-out rather than Convex's true backend limit. A more conclusive number would need <code>ConvexClient</code> (WebSocket) or multiple worker processes to isolate "Convex is the bottleneck" from "the test harness is the bottleneck."</li>
+      </ul>
+      <div class="box">
+        <h4>Practical takeaway</h4>
+        <p class="what">The production backend held up cleanly through 100 concurrent mixed-usage virtual users with no failures and sub-2.5s p95 latency. At 250 concurrent, latency degraded sharply (p95 nearly 9 seconds) even though the failure rate stayed low — this is the practical ceiling observed today, not a confirmed hard limit, and not yet separated from the test client's own connection behavior.</p>
+      </div>
+    </section>
+
+    <section>
+      <div class="kicker">Data hygiene</div>
+      <h2>Test data — created and fully removed</h2>
+      <p>3 customers (<code>LOADTEST_2026_Customer_1/2/3</code>), 34 orders, and 15 reviews were created during the run, all tagged and logged to <code>load-tests/created-ids.json</code> as they were created. A follow-up cleanup task deleted all 52 records via a temporary, identity-verified Convex mutation (fetched and tag-matched each record before deleting, zero skipped/mismatched), then confirmed zero remained via direct <code>ctx.db.get</code> lookups on every id. The temporary cleanup mutation and <code>created-ids.json</code> were both removed afterward. <strong>No pre-existing customer, order, or review data was touched.</strong></p>
+    </section>
+
+    <section>
+      <div class="kicker">Disposition</div>
+      <h2>Script discarded</h2>
+      <p>The script (<code>load-tests/mixed-load-test.mjs</code>) has been deleted from the working tree now that its findings are captured in this report. It was never committed to git. If a repeat load test is needed in future, this report documents the method well enough to rebuild it — or a future version should use <code>ConvexClient</code> (WebSocket) instead of <code>ConvexHttpClient</code> to remove the connection-fan-out caveat noted above.</p>
+    </section>
+
+  </main>
+  <footer>LoyaltyOS Boutique · Internal QA record · Generated 2026-09-14</footer>
+</div>
+</body>
+</html>
