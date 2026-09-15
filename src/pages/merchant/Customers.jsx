@@ -216,7 +216,10 @@ export default function Customers() {
     const query = q.trim().toLowerCase();
     if (query.startsWith('b:')) { const md = query.slice(2); l = l.filter((c) => c.birthday === md); }
     else if (query.startsWith('a:')) { const md = query.slice(2); l = l.filter((c) => c.anniversary === md); }
-    else if (query) l = l.filter((c) => (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query));
+    else if (query) l = l.filter((c) =>
+      (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query)
+      || (c.tier || '').toLowerCase().includes(query)
+    );
     return l;
   }, [db, q, filter, tomorrowBirthdays, tomorrowAnniversaries, isDefaultView]);
 
