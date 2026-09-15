@@ -2,9 +2,9 @@ import { NavLink, useNavigate } from 'react-router-dom';
 import {
   clearMerchantSession, getMerchantSession,
   hydrateNotifications, notifications, markAllSeenRemote, deleteNotificationRemote,
-  subscribe, generateActivitySummaryRemote, getData,
+  subscribe, generateActivitySummaryRemote, getData, hydrateAllMerchantData,
 } from '../../lib/db.js';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { cls, timeAgo } from '../../lib/util.js';
 import { BRAND } from '../../data/seed.js';
 import { Modal } from '../ui.jsx';
@@ -359,6 +359,23 @@ export default function Shell({ children }) {
   const [open, setOpen] = useState(false);
   const close = () => setOpen(false);
   const signOut = () => { clearMerchantSession(); navigate('/login'); };
+
+  // Hydrate-on-mount gate (2026-09-15, merchant-hydration-fix spec). Every
+  // merchant page routes through Shell, so firing the full data warm here — once
+  // per valid session token — closes the reload / new-tab gap that merchantLogin()'s
+  // login-only trigger and the module-load calls both miss. Guarded by a ref so
+  // it fires ONCE per token (not per re-render), and re-fires if the token
+  // changes (e.g. a fresh login after logout). hydrateAllMerchantData() self-
+  // skips when no valid session exists, and each underlying hydrate self-guards,
+  // so this is safe alongside the existing login-time trigger.
+  const hydratedTokenRef = useRef(null);
+  useEffect(() => {
+    const token = getMerchantSession()?.token || null;
+    if (!token) return;
+    if (hydratedTokenRef.current === token) return;
+    hydratedTokenRef.current = token;
+    hydrateAllMerchantData();
+  });
 
   return (
     <div className="min-h-screen bg-mist">

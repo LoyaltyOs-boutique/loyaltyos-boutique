@@ -325,6 +325,13 @@ function refreshFromConvexSheet(doc) {
  * starts back at page 0, same as the existing `page` useState in Customers.jsx
  * already resets on remount.
  */
+// Shared page size for the paginated Customers.jsx default view. Kept EQUAL to
+// `const PAGE = 6` in src/pages/merchant/Customers.jsx:22 — the two must stay in
+// sync (they page the same cursor cache). Defined here (an allowed data-layer
+// file) rather than imported from the protected page so hydrateAllMerchantData()
+// can warm page 0 without editing Customers.jsx.
+const CUSTOMERS_PAGE_SIZE = 6;
+
 const paginatedCustomers = {
   cursors: [null], // cursors[i] = the Convex cursor that fetches page i; index 0 always starts fresh
   rowsByPage: new Map(), // pageIndex -> merchant-shaped customer rows (already run through toLocalCustomer via mergeConvexCustomer)
@@ -415,12 +422,36 @@ export function resetCustomersPageCache() {
   paginatedCustomers.fetchingPage = null;
 }
 
+/**
+ * Shared, session-warmed cache for the two dropdown bridges that fetch fresh
+ * per call into component-local useState and read no other shared state
+ * (Templates.jsx's getCustomers(), Campaigns.jsx's getLookbooksForSelector()).
+ *
+ * Root cause of the reload/new-tab "empty dropdown" bug: those two pages' mount
+ * effects run BEFORE the persisted session is resolvable, so their one-shot
+ * fetch returns [] and never retries. hydrateAllMerchantData() (fired from
+ * Shell.jsx once a valid session exists) populates this cache; the two bridges
+ * below then return the warmed array instead of a cold []. Falls back to a
+ * fresh fetch whenever the cache is still empty, so behavior is unchanged when
+ * the warm-up hasn't run yet (e.g. direct call before Shell mounts).
+ */
+const selectorCache = {
+  customers: null, // last successful getCustomers() result (array) or null = not yet warmed
+  lookbooksSelector: null, // last successful getLookbooksForSelector() result (array) or null
+};
+
 /** Full customer list from Convex (async). Falls back to [] when offline/error/no session. */
 export function getCustomers() {
+  if (Array.isArray(selectorCache.customers)) return Promise.resolve(selectorCache.customers);
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session) return Promise.resolve([]);
-  return client.query(api.customers.getCustomers, session).catch(() => []);
+  return client.query(api.customers.getCustomers, session)
+    .then((rows) => {
+      if (Array.isArray(rows)) selectorCache.customers = rows;
+      return Array.isArray(rows) ? rows : [];
+    })
+    .catch(() => []);
 }
 
 /** Full customer profile by Convex id (async). Falls back to null when offline/error/no session. */
@@ -837,10 +868,16 @@ export function getLookbookById(id) {
 
 /** Lookbook list for the Catalogue selector dropdown (async). Returns [{_id, name, kind}]. MERCHANT-ONLY. */
 export function getLookbooksForSelector() {
+  if (Array.isArray(selectorCache.lookbooksSelector)) return Promise.resolve(selectorCache.lookbooksSelector);
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session) return Promise.resolve([]);
-  return client.query(api.lookbooks.getLookbooksForSelector, session).catch(() => []);
+  return client.query(api.lookbooks.getLookbooksForSelector, session)
+    .then((rows) => {
+      if (Array.isArray(rows)) selectorCache.lookbooksSelector = rows;
+      return Array.isArray(rows) ? rows : [];
+    })
+    .catch(() => []);
 }
 
 /**
@@ -2297,6 +2334,57 @@ export function syncMagicLinkCustomer(publicUser, token, cvxId, fallback) {
 }
 export const waMessage = (user, magicLink) =>
   `Namaste ${(user.name || '').split(' ')[0]}, welcome to 85 Lansdowne 🖤 Your personal boutique link is ready — tap it when you're ready to browse:\n${location.origin}${magicLink}`;
+
+/**
+ * Merchant hydrate-on-mount bundle (2026-09-15, merchant-hydration-fix spec).
+ *
+ * The one convenience call Shell.jsx fires once per valid session token (on
+ * fresh login, reload, AND new tab) to close the persisted-session reload gap:
+ * hydration previously fired only from merchantLogin()'s success handler
+ * (never on a reload that restores the session from localStorage) and from
+ * module import (which runs BEFORE the session is resolvable → silent no-op).
+ *
+ * Bundles the full warm set:
+ *   1. hydrateCustomers()          → full A-Z list → drives the `Showing X of Y` count
+ *   2. hydrateCatalogue()          → Lookbook Manager items
+ *   3. hydrateReviews()            → Dashboard + CRM reviews
+ *   4. hydrateCustomersPage(0, …)  → the PAGINATED page-0 cache Customers.jsx
+ *                                    actually renders — the missing warm that
+ *                                    caused "56 of … but 0 rows" on reload
+ *   5. hydrateSettings()           → loyalty tier rules (public query, always safe)
+ *   6. selectorCache warm          → Templates' customer dropdown + Campaigns'
+ *                                    designer dropdown, which fetch fresh per
+ *                                    call and read only selectorCache (see
+ *                                    getCustomers/getLookbooksForSelector) — so
+ *                                    warming the cache here reaches both pages
+ *                                    WITHOUT editing Templates.jsx/Campaigns.jsx
+ *
+ * Every hydrate callee self-guards via its own `xHydrating` flag, so this is
+ * idempotent and race-safe alongside merchantLogin()'s existing trigger and the
+ * module-load calls below. Skips entirely when no valid merchant session exists.
+ */
+export function hydrateAllMerchantData() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return; // no valid merchant session — nothing to warm
+
+  hydrateCustomers();
+  hydrateCatalogue();
+  hydrateReviews();
+  hydrateCustomersPage(0, CUSTOMERS_PAGE_SIZE);
+  hydrateSettings();
+
+  // Warm the selector cache the two dropdown bridges read from FIRST. Fetched
+  // directly (not via getCustomers()/getLookbooksForSelector()) so a stale empty
+  // cache can't short-circuit the warm; success overwrites the cache, failure
+  // leaves it as-is so the next real call falls back to a fresh fetch.
+  client.query(api.customers.getCustomers, session)
+    .then((rows) => { if (Array.isArray(rows)) selectorCache.customers = rows; })
+    .catch(() => { /* offline — bridge falls back to fresh fetch */ });
+  client.query(api.lookbooks.getLookbooksForSelector, session)
+    .then((rows) => { if (Array.isArray(rows)) selectorCache.lookbooksSelector = rows; })
+    .catch(() => { /* offline — bridge falls back to fresh fetch */ });
+}
 
 // Eagerly load on module import so a fresh page load (e.g. straight to /login)
 // can read `state` without a prior getData() call. Placed here — after `state` is
