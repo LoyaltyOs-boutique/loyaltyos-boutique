@@ -577,7 +577,7 @@ export function fetchCustomerDraft(customerId, occasion, occasionDate) {
  * posture is more valuable here than surfacing a raw error the modal has no
  * specific UI for anyway.
  */
-export async function generateMessageDraftRemote(customerId, customerName, tier, occasion, occasionDate) {
+export async function generateMessageDraftRemote(customerId, customerName, tier, occasion, occasionDate, forceRegenerate = false) {
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session || !occasionDate) return null;
@@ -588,6 +588,34 @@ export async function generateMessageDraftRemote(customerId, customerName, tier,
       tier,
       occasion,
       occasionDate,
+      // Default false keeps every existing caller (e.g. Customers.jsx's
+      // ApprovalModal) cache-first and behaviorally unchanged. Templates.jsx's
+      // Regenerate control passes true to force a fresh, cache-overwriting draft.
+      forceRegenerate,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * generateMessageDraftManualRemote — 2026-09-14 bridge for Templates.jsx's
+ * MANUAL customer-entry path (a typed-in name with no users row, so no
+ * customerId/tier/occasionDate). Forwards to api.ai.generateMessageDraftManual,
+ * which runs a live, uncached Gemini call each time (tier hardcoded "silver"
+ * server-side). EXACT same fail-gracefully shape as generateMessageDraftRemote
+ * above: resolves null on missing client/session or any thrown error, so the
+ * caller falls back to the static template text — never throws.
+ */
+export async function generateMessageDraftManualRemote(customerName, occasion) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.ai.generateMessageDraftManual, {
+      customerName,
+      occasion,
       ...session,
     });
   } catch {

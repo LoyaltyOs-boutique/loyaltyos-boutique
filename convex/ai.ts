@@ -460,22 +460,31 @@ export const generateMessageDraftPublic = action({
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasionDate: v.string(),
+    // 2026-09-14 (Templates.jsx Regenerate control) — when true, SKIP the
+    // cache-read step and generate a fresh Gemini draft, then OVERWRITE the
+    // existing cached row for this exact tuple (never insert a duplicate).
+    // When absent/false, behavior is exactly as before: cache-first.
+    forceRegenerate: v.optional(v.boolean()),
   },
   handler: async (
     ctx,
-    { userId, token, customerId, customerName, tier, occasion, occasionDate },
+    { userId, token, customerId, customerName, tier, occasion, occasionDate, forceRegenerate },
   ): Promise<string | null> => {
     await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
 
-    // Step 1 — cache check FIRST, no Gemini call on a hit.
-    const cached: string | null = await ctx.runQuery(internal.crons.getCachedDraftTextInternal, {
-      customerId,
-      occasion,
-      occasionDate,
-    });
-    if (cached) return cached;
+    // Step 1 — cache check FIRST, no Gemini call on a hit. Skipped entirely
+    // when forceRegenerate is set (the Regenerate control wants a fresh draft).
+    if (!forceRegenerate) {
+      const cached: string | null = await ctx.runQuery(internal.crons.getCachedDraftTextInternal, {
+        customerId,
+        occasion,
+        occasionDate,
+      });
+      if (cached) return cached;
+    }
 
-    // Step 2 — cache miss: generate fresh via the existing, unmodified action.
+    // Step 2 — cache miss (or forced regenerate): generate fresh via the
+    // existing, unmodified action.
     const draftText: string | null = await ctx.runAction(internal.ai.generateMessageDraft, {
       customerName,
       tier,
@@ -485,16 +494,114 @@ export const generateMessageDraftPublic = action({
     // Step 4 — a real Gemini failure must NOT be cached (see doc comment above).
     if (!draftText) return null;
 
-    // Step 3 — cache the fresh draft before returning it, so every future
+    // Step 3 — persist the fresh draft before returning it, so every future
     // call for this exact tuple becomes a cache hit.
-    await ctx.runMutation(internal.crons.insertDraft, {
-      customerId,
-      occasion,
-      occasionDate,
-      draftText,
-    });
+    //   - forceRegenerate: overwrite the existing row in place (or insert if
+    //     none exists yet), keeping exactly ONE current row per tuple — never
+    //     a second row that would leave a stale draft alongside the new one.
+    //   - normal cache-miss: insert a fresh pending row (unchanged behavior).
+    if (forceRegenerate) {
+      await ctx.runMutation(internal.ai.overwriteCachedDraft, {
+        customerId,
+        occasion,
+        occasionDate,
+        draftText,
+      });
+    } else {
+      await ctx.runMutation(internal.crons.insertDraft, {
+        customerId,
+        occasion,
+        occasionDate,
+        draftText,
+      });
+    }
 
     return draftText;
+  },
+});
+
+/**
+ * overwriteCachedDraft — internal mutation backing the Templates.jsx
+ * Regenerate control's force-regenerate path (2026-09-14). Patches the newest
+ * "pending" row for the exact (customer_id, occasion, occasion_date) tuple
+ * with fresh draft_text + generated_at, so a regenerate never strands the old
+ * draft behind a newer one and never grows the row count for the tuple. If no
+ * pending row exists yet (e.g. a regenerate that races ahead of any prior
+ * cache write), it inserts one — identical end-state to insertDraft, so the
+ * next normal open is still a clean cache hit.
+ *
+ * Kept here in ai.ts (not crons.ts) to stay within this task's STRICT scope
+ * (ai.ts + db.js only). It reads/writes the SAME ai_message_drafts table +
+ * by_customer_occasion_date index + "pending"-status convention that
+ * crons.ts's getCachedDraftTextInternal/insertDraft already established — no
+ * new table, tuple, or status value is introduced.
+ */
+export const overwriteCachedDraft = internalMutation({
+  args: {
+    customerId: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+    draftText: v.string(),
+  },
+  handler: async (ctx, { customerId, occasion, occasionDate, draftText }) => {
+    const rows = await ctx.db
+      .query("ai_message_drafts")
+      .withIndex("by_customer_occasion_date", (q) =>
+        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      )
+      .collect();
+
+    // Newest-pending-wins, matching getCachedDraftTextInternal's read rule —
+    // overwrite that same row so the cache serves the regenerated draft.
+    const pending = rows.filter((r) => r.status === "pending");
+    if (pending.length > 0) {
+      pending.sort((a, b) => b.generated_at - a.generated_at);
+      await ctx.db.patch(pending[0]._id, {
+        draft_text: draftText,
+        generated_at: Date.now(),
+      });
+    } else {
+      await ctx.db.insert("ai_message_drafts", {
+        customer_id: customerId,
+        occasion,
+        occasion_date: occasionDate,
+        draft_text: draftText,
+        generated_at: Date.now(),
+        status: "pending",
+      });
+    }
+    return null;
+  },
+});
+
+/**
+ * generateMessageDraftManual — 2026-09-14 (Templates.jsx manual-entry path).
+ * Public, merchant-guarded on-demand draft generation for a TYPED-IN customer
+ * name that has no `users` row (CustomerSelect's 'manual' mode). Because there
+ * is no customer_id to key a cache by, this is a LIVE, UNCACHED Gemini call
+ * every time — it deliberately neither reads nor writes ai_message_drafts.
+ *
+ * tier is hardcoded "silver" (lowest/safest default) purely for prompt tone —
+ * a manual entry has no real tier. The session guard and the core
+ * generateMessageDraft delegation are identical to generateMessageDraftPublic;
+ * only the cache orchestration is dropped. Returns string | null, same
+ * fail-gracefully contract (null → the frontend falls back to static text).
+ */
+export const generateMessageDraftManual = action({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+    customerName: v.string(),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+  },
+  handler: async (ctx, { userId, token, customerName, occasion }): Promise<string | null> => {
+    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+
+    return ctx.runAction(internal.ai.generateMessageDraft, {
+      customerName,
+      tier: "silver",
+      occasion,
+    });
   },
 });
 
