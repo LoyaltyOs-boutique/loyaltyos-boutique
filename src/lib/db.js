@@ -1083,6 +1083,18 @@ export function deleteLookbook(id) {
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
 export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id }) {
+  // 0. Guard the missing-session case BEFORE the optimistic write. When a Convex
+  // client exists but there is no merchant session, the item would otherwise be
+  // added to the local UI and silently never persist — it vanishes on the next
+  // hydrate with no error. Surface a clear error instead so nothing is lost.
+  // (When client is null — pure offline/demo — we intentionally fall through to
+  // local-only, same as every other bridge in this file.)
+  const client = getConvex();
+  const addSession = merchantSessionArgs();
+  if (client && !addSession) {
+    return { ok: false, error: 'Your session has expired — please refresh and log in again to add items.' };
+  }
+
   // 1. Optimistic update (INR price for local UI)
   const item = {
     id: uid('it'),
@@ -1105,8 +1117,7 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
   // merchant's session; skip the write-through entirely (keep the local
   // optimistic item) when no merchant is logged in, same as every other
   // "no session → stay on local/offline state" bridge in this file.
-  const client = getConvex();
-  const addSession = merchantSessionArgs();
+  // (client/addSession resolved above, before the optimistic write.)
   if (client && addSession) {
     // If no lookbook_id provided, we try to find one or ignore (PRD says item must have lookbook)
     // For the demo / standalone catalogue, we expect the caller to provide it or the first lookbook.
