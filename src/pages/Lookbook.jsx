@@ -47,6 +47,12 @@ export default function Lookbook() {
   const [points, setPoints] = useState(0);
   const [payMethod, setPayMethod] = useState('online');
   const [likeAnim, setLikeAnim] = useState(null);
+  // Race-condition fix (2026-09-17): true once hydrateCustomerCatalogue's
+  // fetch attempt has settled (success or failure) — see catalogueHydratedRef
+  // below and hydrateCustomerCatalogue's onSettled param in db.js. Gates ONLY
+  // the product grid so a click can never capture a seed-data id that then
+  // vanishes when the real Convex catalogue swaps in mid-session.
+  const [catalogueReady, setCatalogueReady] = useState(false);
 
   const navigate = useNavigate();
 
@@ -75,7 +81,7 @@ export default function Lookbook() {
         setCustomer(u);
         if (!catalogueHydratedRef.done) {
           catalogueHydratedRef.done = true;
-          hydrateCustomerCatalogue(id, token);
+          hydrateCustomerCatalogue(id, token, () => setCatalogueReady(true));
         }
         return;
       }
@@ -93,7 +99,7 @@ export default function Lookbook() {
           setCustomer(synced || res.user);
           if (!catalogueHydratedRef.done) {
             catalogueHydratedRef.done = true;
-            hydrateCustomerCatalogue(id, token);
+            hydrateCustomerCatalogue(id, token, () => setCatalogueReady(true));
           }
         } else {
           // Truly invalid token (id doesn't exist in Convex OR local) → join form
@@ -241,35 +247,47 @@ export default function Lookbook() {
               <span className="btn-gold !py-2">Write review</span>
             </button>
 
-            {/* Lookbook grid */}
-            <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-10">
-              {catalogue.map((item) => (
-                <article key={item.id} className="animate-fadeUp group">
-                  <div className="relative bg-mist overflow-hidden border border-line">
-                    <img src={item.image_url} alt={item.title} loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
-                    <button
-                      onClick={() => { likeItem(customer.id, item.id); setLikeAnim(item.id); setTimeout(() => setLikeAnim(null), 400); }}
-                      className={cls('absolute top-3 right-3 h-9 w-9 bg-white/90 border border-line flex items-center justify-center text-lg transition-transform cursor-pointer hover:scale-110', likeAnim === item.id && 'animate-pop')}
-                      aria-label="Like"
-                    >
-                      <span className={cls('text-gold', item.likes > 0 && 'drop-shadow')}>♥</span>
-                    </button>
-                    {item.likes > 0 && <div className="absolute bottom-3 left-3 bg-white/90 border border-line px-2 py-0.5 text-[10px] tracking-wide2 uppercase text-steel">{item.likes} loved</div>}
-                  </div>
-                  <div className="pt-4">
-                    <div className="eyebrow text-[9px] mb-1">85 Lansdowne Atelier</div>
-                    <h3 className="luxe-title text-lg leading-snug">{item.title}</h3>
-                    <div className="flex items-center justify-between mt-2">
-                      <span className="text-sm font-medium">{inr(item.price)}</span>
-                      <button onClick={() => addToCart(item)} className="btn-outline !py-1.5 !px-3 text-[9px]">Add to bag</button>
+            {/* Lookbook grid — gated on catalogueReady (race-condition fix,
+                2026-09-17) so a like/add-to-bag click can never target a
+                seed-data id right before hydrateCustomerCatalogue swaps the
+                real Convex catalogue in mid-session. Only this grid waits;
+                the membership card, Google review banner, and everything
+                else above/below render unconditionally once customer resolves. */}
+            {!catalogueReady ? (
+              <div className="py-16 text-center">
+                <div className="eyebrow mb-3">Loading your lookbook…</div>
+                <div className="luxe-title text-2xl text-gold animate-pulse">85 Lansdowne</div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-10">
+                {catalogue.map((item) => (
+                  <article key={item.id} className="animate-fadeUp group">
+                    <div className="relative bg-mist overflow-hidden border border-line">
+                      <img src={item.image_url} alt={item.title} loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
+                      <button
+                        onClick={() => { likeItem(customer.id, item.id); setLikeAnim(item.id); setTimeout(() => setLikeAnim(null), 400); }}
+                        className={cls('absolute top-3 right-3 h-9 w-9 bg-white/90 border border-line flex items-center justify-center text-lg transition-transform cursor-pointer hover:scale-110', likeAnim === item.id && 'animate-pop')}
+                        aria-label="Like"
+                      >
+                        <span className={cls('text-gold', item.likes > 0 && 'drop-shadow')}>♥</span>
+                      </button>
+                      {item.likes > 0 && <div className="absolute bottom-3 left-3 bg-white/90 border border-line px-2 py-0.5 text-[10px] tracking-wide2 uppercase text-steel">{item.likes} loved</div>}
                     </div>
-                    <a href={waLink(item)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
-                      Inquire via WhatsApp ✆
-                    </a>
-                  </div>
-                </article>
-              ))}
-            </div>
+                    <div className="pt-4">
+                      <div className="eyebrow text-[9px] mb-1">85 Lansdowne Atelier</div>
+                      <h3 className="luxe-title text-lg leading-snug">{item.title}</h3>
+                      <div className="flex items-center justify-between mt-2">
+                        <span className="text-sm font-medium">{inr(item.price)}</span>
+                        <button onClick={() => addToCart(item)} className="btn-outline !py-1.5 !px-3 text-[9px]">Add to bag</button>
+                      </div>
+                      <a href={waLink(item)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
+                        Inquire via WhatsApp ✆
+                      </a>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
 
             {/* Product review block */}
             <section className="mt-16">

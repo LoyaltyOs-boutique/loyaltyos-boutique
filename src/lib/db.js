@@ -1226,15 +1226,20 @@ export function hydrateCatalogue() {
 // expects (handle/likes/likedBy are client-only derived fields, matching the
 // hydrateCatalogue() convention above).
 let customerCatalogueHydrating = false;
-export function hydrateCustomerCatalogue(id, token) {
+// `onSettled` (optional, added for the seed/real-catalogue race fix — see
+// Lookbook.jsx `catalogueReady`): fires exactly once when this fetch ATTEMPT
+// is done, success or failure, so the caller knows the pre-swap seed
+// snapshot is no longer at risk of being swapped out from under a click.
+// Purely a "done trying" signal — it does not change what gets hydrated.
+export function hydrateCustomerCatalogue(id, token, onSettled) {
   if (customerCatalogueHydrating) return;
   const client = getConvex();
-  if (!client) return;
+  if (!client) { if (onSettled) onSettled(); return; }
   customerCatalogueHydrating = true;
 
   client.query(api.lookbooks.getCustomerCatalogue, { id, token })
     .then((items) => {
-      if (!Array.isArray(items)) { customerCatalogueHydrating = false; return; }
+      if (!Array.isArray(items)) { customerCatalogueHydrating = false; if (onSettled) onSettled(); return; }
       const mappedItems = items.map((i) => ({
         ...i,
         handle: i.id.toLowerCase(),
@@ -1246,8 +1251,9 @@ export function hydrateCustomerCatalogue(id, token) {
         emit();
       }
       customerCatalogueHydrating = false;
+      if (onSettled) onSettled();
     })
-    .catch(() => { customerCatalogueHydrating = false; });
+    .catch(() => { customerCatalogueHydrating = false; if (onSettled) onSettled(); });
 }
 
 /* ---------- Customer actions ---------- */
