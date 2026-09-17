@@ -135,17 +135,42 @@ export const approveReview = mutation({
       .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
       .first();
 
-    const rules = settingsDoc?.value?.tiers || DEFAULT_SETTINGS.tiers;
+    // settingsDoc.value is stored FLAT as { global, silver, gold, platinum }
+    // (see settings.ts updateSettings -> upsertSettings) — there is no
+    // `.tiers` wrapper on the raw doc; that wrapper only exists in the
+    // read-side getSettings merge output. Reading `.tiers` here was always
+    // undefined, silently falling back to DEFAULT_SETTINGS on every call.
+    const rules = settingsDoc?.value || DEFAULT_SETTINGS.tiers;
     const globalRules = rules.global;
+
+    // Tier-aware rule resolution (fix 2026-09-17): the Points Ledger UI lets
+    // the merchant configure a PER-TIER override (silver/gold/platinum) for
+    // each bonus type, gated by that tier's own "on" toggle. Previously this
+    // function ignored the customer's tier entirely and always used
+    // rules.global — e.g. a Silver customer got the Global gmbPoints (500)
+    // instead of their configured Silver rate (400). Resolve per point type:
+    // use the customer's tier override ONLY when it exists AND is toggled on
+    // (tierRules.on === true), otherwise fall back to rules.global.
+    const customerTier = user.tier as "silver" | "gold" | "platinum" | undefined;
+    const tierRules = customerTier ? rules[customerTier] : undefined;
+    const tierOverrideActive = Boolean(tierRules && tierRules.on === true);
+
+    /** Resolve one bonus field: tier override (if active) else global. */
+    function resolveRuleValue(field: "testimonialBonus" | "gmbPoints" | "productReviewPoints"): number {
+      if (tierOverrideActive && typeof tierRules?.[field] === "number") {
+        return tierRules[field] as number;
+      }
+      return globalRules[field];
+    }
 
     // Calculate points
     let points = 0;
     if (review.type === "testimonial") {
-      points = globalRules.testimonialBonus;
+      points = resolveRuleValue("testimonialBonus");
     } else if (review.type === "gmb") {
-      points = globalRules.gmbPoints;
+      points = resolveRuleValue("gmbPoints");
     } else if (review.type === "product") {
-      points = globalRules.productReviewPoints;
+      points = resolveRuleValue("productReviewPoints");
     }
 
     // Atomic Update: Review Status + User Points
