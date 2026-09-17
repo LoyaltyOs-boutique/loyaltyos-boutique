@@ -7,7 +7,7 @@ import {
   allCatalogue, likeItem, checkout, submitGmbReview, submitProductReview,
   getData, subscribe, customerLedger,
   validateMagicToken, syncMagicLinkCustomer,
-  trackCartAdd, trackLookbookView,
+  trackCartAdd, trackLookbookView, hydrateCustomerCatalogue,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import AccessDenied from './AccessDenied.jsx';
@@ -50,6 +50,14 @@ export default function Lookbook() {
 
   const navigate = useNavigate();
 
+  // Customer catalogue hydration (parallel to Customer Activity Intelligence's
+  // viewTrackedRef below): guards hydrateCustomerCatalogue() to fire exactly
+  // once per real page load, even though it's reachable from two different
+  // auth-resolution branches below (local-success and Convex-success) and
+  // regardless of unrelated re-renders. A separate ref from viewTrackedRef
+  // since it tracks a different concern (catalogue fetch vs view tracking).
+  const catalogueHydratedRef = useState(() => ({ done: false }))[0];
+
   // Authenticate via magic link (query) or 180-day session
   useEffect(() => {
     const id = params.get('id');
@@ -62,12 +70,16 @@ export default function Lookbook() {
     }
     if (id && token) {
       const u = validateLookbook(id, token);
-      if (u) { 
-        saveCustomerSession(id, token); 
-        setCustomer(u); 
-        return; 
+      if (u) {
+        saveCustomerSession(id, token);
+        setCustomer(u);
+        if (!catalogueHydratedRef.done) {
+          catalogueHydratedRef.done = true;
+          hydrateCustomerCatalogue(id, token);
+        }
+        return;
       }
-      
+
       // Fallback: Validate against Convex for merchant-created clients (local-only
       // check above may fail because the client exists in the Convex users table,
       // not in this browser's localStorage). Convex validateMagicToken checks the
@@ -79,6 +91,10 @@ export default function Lookbook() {
           const synced = syncMagicLinkCustomer(res.user, token, res.user.id);
           saveCustomerSession(id, token);
           setCustomer(synced || res.user);
+          if (!catalogueHydratedRef.done) {
+            catalogueHydratedRef.done = true;
+            hydrateCustomerCatalogue(id, token);
+          }
         } else {
           // Truly invalid token (id doesn't exist in Convex OR local) → join form
           navigate(`/join?id=${id}&token=${token}`, { replace: true });

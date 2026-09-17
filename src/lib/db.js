@@ -1217,6 +1217,39 @@ export function hydrateCatalogue() {
     .catch(() => { catalogueHydrating = false; });
 }
 
+// Customer-side catalogue hydration (parallel/additive to hydrateCatalogue()
+// above, which is merchant-session-gated and can never succeed in a real
+// customer's browser). A customer authenticates via magic link (id + token),
+// not a merchant session, so this bridge calls the dedicated
+// getCustomerCatalogue query (already validates the magic link server-side)
+// and maps the result onto the same catalogue-item shape the rest of the app
+// expects (handle/likes/likedBy are client-only derived fields, matching the
+// hydrateCatalogue() convention above).
+let customerCatalogueHydrating = false;
+export function hydrateCustomerCatalogue(id, token) {
+  if (customerCatalogueHydrating) return;
+  const client = getConvex();
+  if (!client) return;
+  customerCatalogueHydrating = true;
+
+  client.query(api.lookbooks.getCustomerCatalogue, { id, token })
+    .then((items) => {
+      if (!Array.isArray(items)) { customerCatalogueHydrating = false; return; }
+      const mappedItems = items.map((i) => ({
+        ...i,
+        handle: i.id.toLowerCase(),
+        likes: 0,
+        likedBy: [], // per-customer like toggle state (see likeItem())
+      }));
+      if (mappedItems.length > 0) {
+        state.catalogueItems = mappedItems;
+        emit();
+      }
+      customerCatalogueHydrating = false;
+    })
+    .catch(() => { customerCatalogueHydrating = false; });
+}
+
 /* ---------- Customer actions ---------- */
 // Like/unlike TOGGLE (bug fix — 2026-09-02): previously this was a bare
 // counter increment with no per-customer uniqueness, so N clicks by the SAME
