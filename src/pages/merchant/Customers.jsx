@@ -25,10 +25,17 @@ export default function Customers() {
   const db = useDb();
   const location = useLocation();
   const [q, setQ] = useState(location.state?.q || '');
+  // Today View — Approve & Send (2026-09-18 spec, point 6): 'birthday_today'/
+  // 'anniversary_today' added as two more recognized location.state.tab values,
+  // same additive-checked mechanism the 'reviews'/'*_tomorrow' keys already
+  // use above — Dashboard.jsx's two stat-card arrows now pass these instead of
+  // the old todayList()-based search marker.
   const [filter, setFilter] = useState(
     location.state?.tab === 'reviews' ? 'reviews'
     : location.state?.tab === 'birthday_tomorrow' ? 'birthday_tomorrow'
     : location.state?.tab === 'anniversary_tomorrow' ? 'anniversary_tomorrow'
+    : location.state?.tab === 'birthday_today' ? 'birthday_today'
+    : location.state?.tab === 'anniversary_today' ? 'anniversary_today'
     : 'all'
   );
   const [page, setPage] = useState(0);
@@ -156,7 +163,13 @@ export default function Customers() {
   // updates (backend rejects the second with an idempotency error).
   const [cancelErrors, setCancelErrors] = useState({});
 
-  const handleCancel = async (c, occasion) => {
+  // isToday (2026-09-18 Today View spec, point 5): handleCancel now fires
+  // from FOUR tabs, not just the two "tomorrow" ones — the new
+  // 'birthday_today'/'anniversary_today' tabs need canonicalTodayOccasionDate()
+  // instead, since "tomorrow" would be the wrong calendar day for a same-day
+  // occasion's dedup key. Defaults to false so any other/future call site
+  // keeps today's tomorrow-only behavior unless it opts in explicitly.
+  const handleCancel = async (c, occasion, isToday = false) => {
     const key = decisionKey(c.id, occasion);
     // P0-1/P1-3 fix (2026-09-09): canonical "YYYY-M-D" key (tomorrow's real
     // IST calendar date, with year) — this Cancel button only ever fires
@@ -164,7 +177,7 @@ export default function Customers() {
     // always the correct occurrence, computed independently of the
     // customer's raw (year-less) birthday/anniversary string. Same helper
     // ApprovalModal's onSent path uses below, for key-format consistency.
-    const occasionDate = canonicalTomorrowOccasionDate();
+    const occasionDate = isToday ? canonicalTodayOccasionDate() : canonicalTomorrowOccasionDate();
     setCancelErrors((prev) => { const next = { ...prev }; delete next[key]; return next; });
     try {
       await recordMessageAction(c.id, occasion, occasionDate, 'cancelled');
@@ -211,6 +224,14 @@ export default function Customers() {
     // above. All other tabs are completely unchanged below.
     if (filter === 'birthday_tomorrow') return tomorrowBirthdays.filter((c) => c.days_until === 1).map(withLocalShape);
     if (filter === 'anniversary_tomorrow') return tomorrowAnniversaries.filter((c) => c.days_until === 1).map(withLocalShape);
+
+    // "Today" tabs (2026-09-18 Today View spec) — SAME already-fetched
+    // tomorrowBirthdays/tomorrowAnniversaries arrays (both queried with
+    // days:1, which per convex/customers.ts's upcomingWindow() loops i=0..1
+    // inclusive — i=0 is today, i=1 is tomorrow), just filtered on
+    // days_until === 0 instead of === 1. No new backend query needed.
+    if (filter === 'birthday_today') return tomorrowBirthdays.filter((c) => c.days_until === 0).map(withLocalShape);
+    if (filter === 'anniversary_today') return tomorrowAnniversaries.filter((c) => c.days_until === 0).map(withLocalShape);
 
     let l = customers();
     const query = q.trim().toLowerCase();
@@ -315,7 +336,7 @@ export default function Customers() {
       <div className="card overflow-x-auto">
         <table className="tbl min-w-[680px]">
           <thead>
-            <tr><th>Client</th><th>Mobile</th><th>Points</th><th>Tier</th><th>Birthday</th><th>Anniversary</th><th>Magic link</th>{(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && <th>WhatsApp wish</th>}<th></th></tr>
+            <tr><th>Client</th><th>Mobile</th><th>Points</th><th>Tier</th><th>Birthday</th><th>Anniversary</th><th>Magic link</th>{(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow' || filter === 'birthday_today' || filter === 'anniversary_today') && <th>WhatsApp wish</th>}<th></th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -343,13 +364,66 @@ export default function Customers() {
                     </button>
                   </div>
                 </td>
-                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (() => {
-                  const occasion = filter === 'birthday_tomorrow' ? 'birthday' : 'anniversary';
+                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow' || filter === 'birthday_today' || filter === 'anniversary_today') && (() => {
+                  const isToday = filter === 'birthday_today' || filter === 'anniversary_today';
+                  const occasion = (filter === 'birthday_tomorrow' || filter === 'birthday_today') ? 'birthday' : 'anniversary';
+                  // Combined case (2026-09-18 Today View spec, point 2): a
+                  // customer has BOTH birthday and anniversary today (real
+                  // live example: "sneha", birthday === anniversary === "9-18").
+                  // Only possible on the today tabs (year-less M-D strings, so
+                  // "tomorrow" combined-occasion customers get the same
+                  // treatment automatically once their day arrives). Detected
+                  // directly off the row's own birthday/anniversary fields
+                  // (both present on the locally-shaped customer record via
+                  // withLocalShape above) rather than re-deriving today's M-D
+                  // separately — todayMD() below already exists for this.
+                  const isCombinedToday = isToday && c.birthday && c.anniversary && c.birthday === c.anniversary;
                   const decided = decidedActions[decisionKey(c.id, occasion)];
                   const cancelError = cancelErrors[decisionKey(c.id, occasion)];
+                  // Combined row: BOTH occasions must be marked decided before
+                  // showing the "already handled" badge — if only one leg of a
+                  // combined send/cancel completed (e.g. a partial failure),
+                  // the row still shows the action buttons so the merchant can
+                  // retry the missing leg. Non-combined rows keep the original
+                  // single-occasion `decided` check unchanged.
+                  const combinedDecided = isCombinedToday
+                    ? (decidedActions[decisionKey(c.id, 'birthday')] && decidedActions[decisionKey(c.id, 'anniversary')])
+                    : null;
+                  const combinedCancelError = isCombinedToday
+                    ? (cancelErrors[decisionKey(c.id, 'birthday')] || cancelErrors[decisionKey(c.id, 'anniversary')])
+                    : null;
                   return (
                     <td className="text-center whitespace-nowrap">
-                      {decided ? (
+                      {isCombinedToday ? (
+                        combinedDecided ? (
+                          <span className="text-[10px] tracking-wide2 uppercase text-steel">
+                            {decidedActions[decisionKey(c.id, 'birthday')] === 'cancelled' && decidedActions[decisionKey(c.id, 'anniversary')] === 'cancelled'
+                              ? '✗ Cancelled'
+                              : '✓ Sent (Birthday + Anniversary)'}
+                          </span>
+                        ) : (
+                          <div className="inline-flex gap-1.5 items-center">
+                            <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion: 'birthday', combined: true }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send both occasions">
+                              Approve &amp; Send (Both)
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                // Cancel-both: reuses the exact same single-occasion
+                                // handleCancel twice — no combined-cancel backend
+                                // logic invented, per spec point 3's "reuse existing
+                                // single-occasion code paths called twice" guidance.
+                                handleCancel(c, 'birthday', true);
+                                handleCancel(c, 'anniversary', true);
+                              }}
+                              className="btn-ghost !px-2 !py-1.5 text-[11px]"
+                              aria-label="Cancel both occasions"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )
+                      ) : decided ? (
                         <span className="text-[10px] tracking-wide2 uppercase text-steel">
                           {/* P2-4 fix (2026-09-09): 3rd badge for 'link_opened' —
                               a wa.me link-open only confirms the merchant was
@@ -363,12 +437,12 @@ export default function Customers() {
                           <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send">
                             Approve &amp; Send
                           </button>
-                          <button onClick={(e) => { e.stopPropagation(); handleCancel(c, occasion); }} className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Cancel">
+                          <button onClick={(e) => { e.stopPropagation(); handleCancel(c, occasion, isToday); }} className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Cancel">
                             Cancel
                           </button>
                         </div>
                       )}
-                      {cancelError && <div className="text-red-600 text-[10px] mt-1">{cancelError}</div>}
+                      {(cancelError || combinedCancelError) && <div className="text-red-600 text-[10px] mt-1">{cancelError || combinedCancelError}</div>}
                     </td>
                   );
                 })()}
@@ -580,11 +654,10 @@ function todayMD() { const d = new Date(); return `${d.getMonth() + 1}-${d.getDa
  * offset convex/customers.ts's own IST_OFFSET_MS constant uses for its
  * birthday/anniversary "today"/"tomorrow" window arithmetic. Duplicated here
  * (not imported — this is a browser bundle, convex/ is a separate server
- * module) rather than reusing Dashboard.jsx's todayList(), which reads the
- * BROWSER's local clock with no IST shift at all — fine for that helper's
- * own use (a same-device search marker), but wrong for a canonical dedup key,
- * since a merchant opening this page from outside IST would silently compute
- * a different calendar day than the boutique's actual "tomorrow".
+ * module). Using the BROWSER's local clock with no IST shift would be wrong
+ * for a canonical dedup key, since a merchant opening this page from outside
+ * IST would silently compute a different calendar day than the boutique's
+ * actual "today"/"tomorrow".
  */
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -620,6 +693,24 @@ function canonicalTomorrowOccasionDate() {
   const istNow = new Date(Date.now() + IST_OFFSET_MS);
   const istTomorrow = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + 1));
   return `${istTomorrow.getUTCFullYear()}-${istTomorrow.getUTCMonth() + 1}-${istTomorrow.getUTCDate()}`;
+}
+
+/**
+ * canonicalTodayOccasionDate — sibling to canonicalTomorrowOccasionDate above,
+ * added for the Today View — Approve & Send task (2026-09-18 spec, point 5).
+ * SAME IST-aware "YYYY-M-D" canonical-key logic, but `+ 0` days instead of
+ * `+ 1` — this modal/tab pair only ever means "today, in IST" (the new
+ * 'birthday_today'/'anniversary_today' filters, confirmed via this file's
+ * `filter ===` checks below). Deliberately a separate function rather than
+ * parameterizing canonicalTomorrowOccasionDate with an offset argument, per
+ * the spec's explicit instruction not to reuse that function verbatim (it
+ * hardcodes +1 day) — kept as two small, obviously-correct siblings instead
+ * of one function whose behavior depends on a caller-supplied magic number.
+ */
+function canonicalTodayOccasionDate() {
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const istToday = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+  return `${istToday.getUTCFullYear()}-${istToday.getUTCMonth() + 1}-${istToday.getUTCDate()}`;
 }
 
 function Info({ label, value }) {
@@ -660,11 +751,19 @@ function Info({ label, value }) {
  * unchanged fallback branch, not a replacement.
  */
 function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent }) {
-  const { customer, occasion } = target;
+  const { customer, occasion, combined } = target;
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
   const [aiDraftText, setAiDraftText] = useState(null);
   const [aiDraftLoading, setAiDraftLoading] = useState(false);
+  // Combined-occasion second draft (2026-09-18 Today View spec, point 3/8) —
+  // when target.combined is true, this modal ALSO fetches the anniversary
+  // draft (via the exact same generateMessageDraftRemote call, occasion
+  // hardcoded to 'anniversary') so the preview can show both texts and the
+  // combined send can fire both without a second round-trip mid-click. Stays
+  // null and unused for the (default, unchanged) single-occasion case.
+  const [aiDraftTextAnniversary, setAiDraftTextAnniversary] = useState(null);
+  const [aiDraftLoadingAnniversary, setAiDraftLoadingAnniversary] = useState(false);
   const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
   const waTemplate = waTemplates[occasion];
   const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
@@ -674,6 +773,18 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   const rawOccasionDate = occasion === 'birthday' ? customer.birthday : customer.anniversary;
   const occasionDate = parseMD(rawOccasionDate);
 
+  // isToday (2026-09-18 Today View spec) — this modal now also opens from the
+  // 'birthday_today'/'anniversary_today' tabs (setApproveTarget's call sites,
+  // both plain-single AND combined, are all gated on isCombinedToday/isToday
+  // in the row block above), in addition to the original two "tomorrow" tabs.
+  // The combined case ONLY ever opens from a today-tab row (isCombinedToday
+  // in the parent requires filter to be one of the *_today keys), so
+  // `combined` alone is sufficient to pick canonicalTodayOccasionDate below —
+  // but isToday is also derived independently (from the customer's own
+  // birthday/anniversary match against real IST "today") so a future
+  // non-combined today-tab click computes the correct date too.
+  const isToday = combined || todayMD() === rawOccasionDate;
+
   // P0-1/P1-3 fix (2026-09-09) — canonical "YYYY-M-D" dedup/cache key,
   // computed ONCE per modal instance (this component only ever mounts fresh
   // per approveTarget — see the `{approveTarget && <ApprovalModal .../>}`
@@ -681,14 +792,14 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   // change) and reused for BOTH the AI-draft cache call below AND the
   // recordMessageAction call the parent's onSent handler makes, so a cached
   // draft and its corresponding sent/cancelled decision for the same real
-  // occurrence always agree on the exact same key string. This modal only
-  // ever opens from the Birthdays/Anniversaries "tomorrow" tabs (confirmed:
-  // setApproveTarget's only call site is gated on
-  // filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow'), so
-  // "tomorrow's real IST calendar date" is always the correct occurrence —
-  // computed independently of the customer's raw (year-less) birthday/
-  // anniversary string, same reasoning as handleCancel's identical fix above.
-  const canonicalOccasionDate = useMemo(() => canonicalTomorrowOccasionDate(), []);
+  // occurrence always agree on the exact same key string. This modal opens
+  // from four tabs now: Birthdays/Anniversaries "tomorrow" (original) and
+  // "today" (2026-09-18 addition) — isToday above picks the correct
+  // canonical-date helper for whichever tab this instance opened from.
+  const canonicalOccasionDate = useMemo(
+    () => (isToday ? canonicalTodayOccasionDate() : canonicalTomorrowOccasionDate()),
+    [isToday]
+  );
 
   // On open (or if the target customer/occasion changes) AND the customer has
   // given WhatsApp consent, ask the backend for a real AI draft — a cache hit
@@ -721,6 +832,30 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     return () => { live = false; };
   }, [customer.id, customer.name, customer.tier, customer.whatsapp_consent, occasion, canonicalOccasionDate]);
 
+  // Combined-occasion second draft fetch (2026-09-18 Today View spec, point
+  // 3/8) — ONLY runs when target.combined is true (the row-click that opens
+  // this modal for a combined customer always passes occasion: 'birthday'
+  // for the effect above, so this second effect covers the anniversary half).
+  // Identical shape/gating to the effect above — same consent gate, same
+  // generateMessageDraftRemote call, same "no new AI mode" constraint from
+  // spec point 8 (occasion is hardcoded 'anniversary' here, not a new
+  // combined-aware prompt).
+  useEffect(() => {
+    setAiDraftTextAnniversary(null);
+    if (!combined || !customer.whatsapp_consent) {
+      setAiDraftLoadingAnniversary(false);
+      return;
+    }
+    let live = true;
+    setAiDraftLoadingAnniversary(true);
+    generateMessageDraftRemote(customer.id, customer.name, customer.tier, 'anniversary', canonicalOccasionDate)
+      .then((draftText) => {
+        if (live && draftText) setAiDraftTextAnniversary(draftText);
+      })
+      .finally(() => { if (live) setAiDraftLoadingAnniversary(false); });
+    return () => { live = false; };
+  }, [combined, customer.id, customer.name, customer.tier, customer.whatsapp_consent, canonicalOccasionDate]);
+
   // Preview text — reference-only for the merchant, assembled from the
   // customer's name plus the configured discount/coupon/valid-days for this
   // occasion type. Anniversary has no partner-name field in the data model,
@@ -737,6 +872,33 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   // same fixed-text fallback this modal always showed.
   const previewText = aiDraftText || fallbackPreviewText;
 
+  // Combined-occasion anniversary fallback text (2026-09-18 spec) — same
+  // fixed-template shape as previewLines above, occasion hardcoded to
+  // 'anniversary'. Only computed/used when combined is true.
+  const anniversaryCfg = templateConfig.anniversary || { discountPercent: '', couponCode: '', validDays: '' };
+  const anniversaryFallbackPreviewText = combined
+    ? [
+        `Happy anniversary, ${customer.name}! With love, 85 Lansdowne.`,
+        `(Both name slots {{1}} and {{2}} use "${customer.name}" — no separate partner name on file.)`,
+        anniversaryCfg.discountPercent ? `Enjoy ${anniversaryCfg.discountPercent}% off` + (anniversaryCfg.couponCode ? ` with code ${anniversaryCfg.couponCode}` : '') + (anniversaryCfg.validDays ? `, valid for ${anniversaryCfg.validDays} days.` : '.') : null,
+      ].filter(Boolean).join('\n')
+    : '';
+  const anniversaryPreviewText = aiDraftTextAnniversary || anniversaryFallbackPreviewText;
+
+  // Combined-occasion single wa.me text (spec point 3) — ONE wa.me open
+  // containing both texts concatenated with a clear separator, chosen over
+  // two separate wa.me opens. Reason: window.open() twice in a row in most
+  // browsers/popup-blockers only reliably allows the FIRST call through as a
+  // direct user-gesture result — the second is commonly blocked as an
+  // unrequested popup, which would silently drop the anniversary message half
+  // the time. A single wa.me open with both texts is simpler AND more
+  // reliable given this real constraint. The two recordMessageAction calls
+  // (birthday then anniversary) still fire separately right after, per spec
+  // point 3, so points/dedup bookkeeping is unaffected by this choice.
+  const combinedPreviewText = combined
+    ? `${previewText}\n\n— — — — —\n\n${anniversaryPreviewText}`
+    : '';
+
   const openWaLinkFallback = () => {
     window.open(`https://wa.me/${waDigits(customer.whatsapp || customer.mobile)}?text=${encodeURIComponent(previewText)}`, '_blank');
   };
@@ -746,6 +908,24 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   // API — that is now the explicit secondary action below.
   const sendViaWaLink = () => {
     if (!customer.whatsapp_consent) return;
+
+    // Combined path (2026-09-18 spec, point 3) — single wa.me open with both
+    // occasions' text (see combinedPreviewText above for why one open, not
+    // two), followed by TWO sequential recordMessageAction calls — one per
+    // occasion, both using canonicalOccasionDate (== canonicalTodayOccasionDate()
+    // here, since combined only ever opens from a today-tab row) — so both
+    // birthday and anniversary points bonuses correctly credit per the
+    // existing, already-tested recordMessageAction auto-points logic. This
+    // reuses that existing logic called twice; no new combined-send mutation.
+    if (combined) {
+      window.open(`https://wa.me/${waDigits(customer.whatsapp || customer.mobile)}?text=${encodeURIComponent(combinedPreviewText)}`, '_blank');
+      setSendMsg('Sent via WhatsApp link (Birthday + Anniversary)');
+      onSent?.(customer.id, 'birthday', 'wa_fallback', canonicalOccasionDate, 'link_opened');
+      onSent?.(customer.id, 'anniversary', 'wa_fallback', canonicalOccasionDate, 'link_opened');
+      onClose();
+      return;
+    }
+
     openWaLinkFallback();
     setSendMsg('Sent via WhatsApp link');
     // 4th arg (canonicalOccasionDate) added 2026-09-09 — see the P0-1/P1-3
@@ -796,25 +976,47 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   };
 
   return (
-    <Modal open onClose={onClose} title={`Approve & Send — ${occasionLabel}`}>
+    <Modal open onClose={onClose} title={combined ? 'Approve & Send — Birthday + Anniversary' : `Approve & Send — ${occasionLabel}`}>
       <div className="space-y-4">
         <div className="grid sm:grid-cols-2 gap-4">
           <Info label="Client" value={customer.name} />
-          <Info label="Occasion" value={occasionLabel} />
-          <Info label={occasionLabel} value={occasionDate} />
+          <Info label="Occasion" value={combined ? 'Birthday + Anniversary' : occasionLabel} />
+          <Info label={combined ? 'Date' : occasionLabel} value={occasionDate} />
           <Info label="Mobile" value={customer.mobile} />
         </div>
         <div>
           <div className="label">Preview (merchant reference only)</div>
-          {aiDraftLoading && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
-          <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{previewText}</div>
+          {(aiDraftLoading || (combined && aiDraftLoadingAnniversary)) && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
+          {/* Combined case shows both texts (birthday then anniversary, same
+              separator sendViaWaLink's single wa.me open will use) so the
+              merchant sees exactly what will be sent before approving —
+              single-occasion case is completely unchanged below. */}
+          <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{combined ? combinedPreviewText : previewText}</div>
         </div>
         <div className="flex gap-2">
           <button onClick={onClose} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Cancel</button>
-          <button onClick={sendViaWaLink} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
+          <button onClick={sendViaWaLink} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">
+            {combined ? 'Approve & Send (Both)' : 'Approve & Send'}
+          </button>
         </div>
-        <div className="flex gap-2">
-          <button onClick={sendViaCloudApi} disabled={sending || !customer.whatsapp_consent || !waTemplate} title={waTemplate ? 'Send via WhatsApp Cloud API template instead' : 'No WhatsApp template configured for this occasion'} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Send via Cloud API instead</button>
+        <div className="flex flex-col gap-1">
+          <div className="flex gap-2">
+            {/* Cloud API secondary button — disabled for the combined case
+                (2026-09-18 spec, point 7): its fixed-template mechanism can
+                only represent ONE occasion per send, so it cannot correctly
+                represent a combined birthday+anniversary send. Completely
+                unchanged (enabled, same waTemplate/consent gating) for every
+                single-occasion case, today or tomorrow. */}
+            <button
+              onClick={sendViaCloudApi}
+              disabled={combined || sending || !customer.whatsapp_consent || !waTemplate}
+              title={combined ? 'Not available for combined occasions yet' : (waTemplate ? 'Send via WhatsApp Cloud API template instead' : 'No WhatsApp template configured for this occasion')}
+              className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1"
+            >
+              Send via Cloud API instead
+            </button>
+          </div>
+          {combined && <div className="text-[10px] text-steel">Not available for combined occasions yet</div>}
         </div>
         {!customer.whatsapp_consent && (
           <div className="text-red-600 text-xs">This customer hasn't given WhatsApp consent yet — can't send.</div>

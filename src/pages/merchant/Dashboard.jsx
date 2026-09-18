@@ -109,12 +109,20 @@ export default function Dashboard() {
             <span className="text-xs text-steel uppercase tracking-wide2">Google reviews to approve</span>
             <span className="ml-auto text-gold">→</span>
           </button>
-          <button onClick={() => navigate('/merchant/customers', { state: { q: todayList('b') } })} className="chip">
+          {/* Today View — Approve & Send (2026-09-18 spec, point 6): navigate via
+              the same location.state.tab mechanism the 'reviews' chip above
+              already uses, instead of the old todayList()-based search marker
+              (q: 'b:9-18'), which landed on the plain "All clients" search view
+              with no Approve & Send/Cancel/points UI at all. 'birthday_today'/
+              'anniversary_today' are new filter keys Customers.jsx now
+              recognizes (see its filter state initializer) — same pattern as
+              the existing 'birthday_tomorrow'/'anniversary_tomorrow' tabs. */}
+          <button onClick={() => navigate('/merchant/customers', { state: { tab: 'birthday_today' } })} className="chip">
             <span className="luxe-title text-3xl">{m.birthdaysToday}</span>
             <span className="text-xs text-steel uppercase tracking-wide2">Birthdays today</span>
             <span className="ml-auto text-gold">→</span>
           </button>
-          <button onClick={() => navigate('/merchant/customers', { state: { q: todayList('a') } })} className="chip">
+          <button onClick={() => navigate('/merchant/customers', { state: { tab: 'anniversary_today' } })} className="chip">
             <span className="luxe-title text-3xl">{m.anniversariesToday}</span>
             <span className="text-xs text-steel uppercase tracking-wide2">Anniversaries pending</span>
             <span className="ml-auto text-gold">→</span>
@@ -266,11 +274,4 @@ export default function Dashboard() {
       )}
     </div>
   );
-}
-
-function todayList(kind) {
-  const d = new Date();
-  const md = `${d.getMonth() + 1}-${d.getDate()}`;
-  // Signals to Customers page via URL hash query — returns a marker string
-  return kind === 'b' ? `b:${md}` : `a:${md}`;
 }
