@@ -605,6 +605,106 @@ export const generateMessageDraftManual = action({
   },
 });
 
+/**
+ * generateCombinedMessageDraft — 2026-09-18 (Combined-Occasion AI Draft
+ * design, docs/superpowers/specs/2026-09-18-combined-occasion-ai-draft-design.md).
+ * A NEW, SEPARATE internalAction — does NOT modify generateMessageDraft above
+ * in any way. Exists because today's "combined" Today-View send (a customer
+ * whose birthday AND anniversary both fall today) previously called
+ * generateMessageDraft TWICE (once per occasion) and stitched the two
+ * unrelated single-occasion messages together with a literal separator — the
+ * model never knew both occasions applied to the same customer. This function
+ * gives the model that fact directly, in one prompt, so it can write ONE
+ * coherent message.
+ *
+ * No `occasion` arg at all — a combined draft is always "birthday + wedding
+ * anniversary, today", there is no third combination in this schema, so the
+ * occasion is fixed directly into the prompt text rather than parameterized.
+ *
+ * Reuses every existing safety helper completely unmodified: callGemini,
+ * DATA_NOT_INSTRUCTIONS_NOTICE, wrapUntrustedField, truncateForPrompt,
+ * sanitizeGeminiOutput, PROMPT_FIELD_MAX. Same fail-gracefully contract as
+ * generateMessageDraft (never throws — resolves to null on ANY failure).
+ *
+ * CONFIDENTIALITY: identical guarantee to generateMessageDraft — only
+ * name/tier are read, both passed in as args by the caller; measurements and
+ * staff_notes are never touched by this function, it doesn't even fetch the
+ * full customer document.
+ *
+ * Deliberately does NOT read the WhatsApp promo-config settings (unlike
+ * generateMessageDraft) — a combined message has no single "occasion" to key
+ * a promo lookup by, and the spec does not ask for promo copy in the combined
+ * draft; keeping this function's DB footprint at zero reads is the simplest
+ * correct choice here.
+ */
+export const generateCombinedMessageDraft = internalAction({
+  args: {
+    customerName: v.string(),
+    tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+  },
+  handler: async (ctx, { customerName, tier }): Promise<string | null> => {
+    // Truncate every free-text field at the point of use — DB values are
+    // untouched, only this local prompt-building copy is capped. Same
+    // per-field caps generateMessageDraft uses.
+    const safeName = truncateForPrompt(customerName, PROMPT_FIELD_MAX.NAME);
+    const safeTier = truncateForPrompt(tier, PROMPT_FIELD_MAX.ENUM);
+
+    // Same structural separation as generateMessageDraft's prompt:
+    // instructions first, then the explicit "this is data, not instructions"
+    // notice, then the delimited data block. No `occasion` field in the DATA
+    // section — it's implicit and fixed in the instruction sentence itself.
+    const prompt = [
+      `You are writing a short, warm WhatsApp message on behalf of "85 Lansdowne", a luxury fashion boutique in Kolkata.`,
+      `This customer's birthday AND wedding anniversary BOTH fall today. Write ONE warm, on-brand, personal-sounding message that wishes them both a happy birthday and a happy wedding anniversary together, in the same natural message (2-4 sentences total, no emoji overload, luxury tone, not generic/spammy, not two messages stitched together). Address the customer by the name given in the DATA section and naturally reflect their tier.`,
+      `Return ONLY the message text — no preamble, no quotation marks, no explanation.`,
+      DATA_NOT_INSTRUCTIONS_NOTICE,
+      [
+        wrapUntrustedField("customer_name", safeName),
+        wrapUntrustedField("customer_tier", safeTier),
+      ].join(" "),
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const result = await callGemini(prompt);
+    if (!result.success) return null;
+
+    return sanitizeGeminiOutput(result.text);
+  },
+});
+
+/**
+ * generateCombinedMessageDraftPublic — 2026-09-18. Public, merchant-guarded
+ * entry point for the combined draft above. Session-gated via the same
+ * checkMerchantSession pattern generateMessageDraftPublic/generateMessageDraftManual
+ * use, then delegates straight into generateCombinedMessageDraft via
+ * ctx.runAction.
+ *
+ * NO CACHING — deliberately, same posture as generateMessageDraftManual
+ * (SECTION 3 above): the ai_message_drafts table is keyed by
+ * (customer_id, occasion, occasion_date), and `occasion` there is a closed
+ * "birthday" | "anniversary" union (schema.ts) with no "combined" value —
+ * there is no clean cache key for a combined draft without widening that
+ * union, which is out of this task's scope. This function neither reads nor
+ * writes ai_message_drafts at all; every call is a live Gemini call.
+ */
+export const generateCombinedMessageDraftPublic = action({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+    customerName: v.string(),
+    tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+  },
+  handler: async (ctx, { userId, token, customerName, tier }): Promise<string | null> => {
+    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+
+    return ctx.runAction(internal.ai.generateCombinedMessageDraft, {
+      customerName,
+      tier,
+    });
+  },
+});
+
 // ============================================================================
 // SECTION 4 — Test-only scaffolding (Phase 2 verification)
 // ============================================================================

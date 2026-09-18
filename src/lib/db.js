@@ -655,6 +655,31 @@ export async function generateMessageDraftManualRemote(customerName, occasion) {
 }
 
 /**
+ * generateCombinedMessageDraftRemote — 2026-09-18 bridge for the
+ * Combined-Occasion AI Draft feature (docs/superpowers/specs/2026-09-18-combined-occasion-ai-draft-design.md).
+ * Mirrors generateMessageDraftRemote's exact shape/error-handling above —
+ * resolves to null on ANY failure (missing client/session, or a thrown
+ * error), NEVER throws, so the caller (Customers.jsx's ApprovalModal
+ * combined path) can fall back to its own fixed combined-template text. No
+ * occasion/occasionDate args — see convex/ai.ts's generateCombinedMessageDraftPublic
+ * doc comment for why this call is always live/uncached.
+ */
+export async function generateCombinedMessageDraftRemote(customerId, customerName, tier) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.ai.generateCombinedMessageDraftPublic, {
+      customerName,
+      tier,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * generateActivitySummaryRemote — 2026-09-09 addition, bridge for on-demand
  * per-customer AI activity-summary generation (24h server-side cache) —
  * triggered from Shell.jsx's NotificationBell when the merchant clicks a

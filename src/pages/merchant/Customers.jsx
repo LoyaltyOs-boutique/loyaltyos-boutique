@@ -6,7 +6,7 @@ import {
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
-  recordMessageAction, awardPoints, generateMessageDraftRemote,
+  recordMessageAction, awardPoints, generateMessageDraftRemote, generateCombinedMessageDraftRemote,
   hydrateCustomers, hydrateReviews, hydratePointsHistory,
   hydrateCustomersPage, customersPage, resetCustomersPageCache,
   clearMerchantSession,
@@ -756,14 +756,16 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   const [sendMsg, setSendMsg] = useState('');
   const [aiDraftText, setAiDraftText] = useState(null);
   const [aiDraftLoading, setAiDraftLoading] = useState(false);
-  // Combined-occasion second draft (2026-09-18 Today View spec, point 3/8) —
-  // when target.combined is true, this modal ALSO fetches the anniversary
-  // draft (via the exact same generateMessageDraftRemote call, occasion
-  // hardcoded to 'anniversary') so the preview can show both texts and the
-  // combined send can fire both without a second round-trip mid-click. Stays
-  // null and unused for the (default, unchanged) single-occasion case.
-  const [aiDraftTextAnniversary, setAiDraftTextAnniversary] = useState(null);
-  const [aiDraftLoadingAnniversary, setAiDraftLoadingAnniversary] = useState(false);
+  // Combined-occasion draft (2026-09-18 Combined-Occasion AI Draft design,
+  // docs/superpowers/specs/2026-09-18-combined-occasion-ai-draft-design.md) —
+  // when target.combined is true, this modal fetches ONE real combined draft
+  // (generateCombinedMessageDraftRemote — a single Gemini call that is TOLD
+  // both occasions fall today, so it writes one coherent message) instead of
+  // the old two separate single-occasion calls stitched together with a
+  // separator. Stays null and unused for the (completely unchanged)
+  // single-occasion case.
+  const [combinedAiDraftText, setCombinedAiDraftText] = useState(null);
+  const [combinedAiDraftLoading, setCombinedAiDraftLoading] = useState(false);
   const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
   const waTemplate = waTemplates[occasion];
   const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
@@ -832,29 +834,28 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     return () => { live = false; };
   }, [customer.id, customer.name, customer.tier, customer.whatsapp_consent, occasion, canonicalOccasionDate]);
 
-  // Combined-occasion second draft fetch (2026-09-18 Today View spec, point
-  // 3/8) — ONLY runs when target.combined is true (the row-click that opens
-  // this modal for a combined customer always passes occasion: 'birthday'
-  // for the effect above, so this second effect covers the anniversary half).
-  // Identical shape/gating to the effect above — same consent gate, same
-  // generateMessageDraftRemote call, same "no new AI mode" constraint from
-  // spec point 8 (occasion is hardcoded 'anniversary' here, not a new
-  // combined-aware prompt).
+  // Combined-occasion draft fetch (2026-09-18 Combined-Occasion AI Draft
+  // design) — ONLY runs when target.combined is true. Fires ONE
+  // generateCombinedMessageDraftRemote call (not two) so Gemini writes a
+  // single coherent birthday+anniversary message. The original single-
+  // occasion effect above still runs unchanged (harmless extra fetch for the
+  // combined case — its result is simply not used in the combined preview
+  // below, see combinedPreviewText).
   useEffect(() => {
-    setAiDraftTextAnniversary(null);
+    setCombinedAiDraftText(null);
     if (!combined || !customer.whatsapp_consent) {
-      setAiDraftLoadingAnniversary(false);
+      setCombinedAiDraftLoading(false);
       return;
     }
     let live = true;
-    setAiDraftLoadingAnniversary(true);
-    generateMessageDraftRemote(customer.id, customer.name, customer.tier, 'anniversary', canonicalOccasionDate)
+    setCombinedAiDraftLoading(true);
+    generateCombinedMessageDraftRemote(customer.id, customer.name, customer.tier)
       .then((draftText) => {
-        if (live && draftText) setAiDraftTextAnniversary(draftText);
+        if (live && draftText) setCombinedAiDraftText(draftText);
       })
-      .finally(() => { if (live) setAiDraftLoadingAnniversary(false); });
+      .finally(() => { if (live) setCombinedAiDraftLoading(false); });
     return () => { live = false; };
-  }, [combined, customer.id, customer.name, customer.tier, customer.whatsapp_consent, canonicalOccasionDate]);
+  }, [combined, customer.id, customer.name, customer.tier, customer.whatsapp_consent]);
 
   // Preview text — reference-only for the merchant, assembled from the
   // customer's name plus the configured discount/coupon/valid-days for this
@@ -872,31 +873,31 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
   // same fixed-text fallback this modal always showed.
   const previewText = aiDraftText || fallbackPreviewText;
 
-  // Combined-occasion anniversary fallback text (2026-09-18 spec) — same
-  // fixed-template shape as previewLines above, occasion hardcoded to
-  // 'anniversary'. Only computed/used when combined is true.
-  const anniversaryCfg = templateConfig.anniversary || { discountPercent: '', couponCode: '', validDays: '' };
-  const anniversaryFallbackPreviewText = combined
+  // Combined-occasion fallback text (2026-09-18 Combined-Occasion AI Draft
+  // design) — used only if generateCombinedMessageDraftRemote fails/returns
+  // null. Adapts the existing single-occasion fixed-template style (same
+  // "Happy <occasion>, <name>! With love, 85 Lansdowne." + promo-line shape
+  // as previewLines above) into ONE message mentioning both occasions,
+  // rather than inventing unrelated new copy. Only computed/used when
+  // combined is true.
+  const combinedFallbackPreviewText = combined
     ? [
-        `Happy anniversary, ${customer.name}! With love, 85 Lansdowne.`,
+        `Happy birthday and happy anniversary, ${customer.name}! With love, 85 Lansdowne.`,
         `(Both name slots {{1}} and {{2}} use "${customer.name}" — no separate partner name on file.)`,
-        anniversaryCfg.discountPercent ? `Enjoy ${anniversaryCfg.discountPercent}% off` + (anniversaryCfg.couponCode ? ` with code ${anniversaryCfg.couponCode}` : '') + (anniversaryCfg.validDays ? `, valid for ${anniversaryCfg.validDays} days.` : '.') : null,
+        cfg.discountPercent ? `Enjoy ${cfg.discountPercent}% off` + (cfg.couponCode ? ` with code ${cfg.couponCode}` : '') + (cfg.validDays ? `, valid for ${cfg.validDays} days.` : '.') : null,
       ].filter(Boolean).join('\n')
     : '';
-  const anniversaryPreviewText = aiDraftTextAnniversary || anniversaryFallbackPreviewText;
 
-  // Combined-occasion single wa.me text (spec point 3) — ONE wa.me open
-  // containing both texts concatenated with a clear separator, chosen over
-  // two separate wa.me opens. Reason: window.open() twice in a row in most
-  // browsers/popup-blockers only reliably allows the FIRST call through as a
-  // direct user-gesture result — the second is commonly blocked as an
-  // unrequested popup, which would silently drop the anniversary message half
-  // the time. A single wa.me open with both texts is simpler AND more
-  // reliable given this real constraint. The two recordMessageAction calls
-  // (birthday then anniversary) still fire separately right after, per spec
-  // point 3, so points/dedup bookkeeping is unaffected by this choice.
+  // Combined-occasion single wa.me text (2026-09-18 design) — the AI's ONE
+  // combined draft when available, else the combined fallback above. This is
+  // no longer a stitched concatenation of two separate draft texts — it is
+  // one coherent message. Still sent via a single wa.me open (unchanged
+  // reasoning: window.open() twice in a row is commonly popup-blocked on the
+  // second call), followed by the same two sequential recordMessageAction
+  // calls (birthday then anniversary) so points/dedup bookkeeping is
+  // unaffected by this change.
   const combinedPreviewText = combined
-    ? `${previewText}\n\n— — — — —\n\n${anniversaryPreviewText}`
+    ? (combinedAiDraftText || combinedFallbackPreviewText)
     : '';
 
   const openWaLinkFallback = () => {
@@ -986,10 +987,9 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
         </div>
         <div>
           <div className="label">Preview (merchant reference only)</div>
-          {(aiDraftLoading || (combined && aiDraftLoadingAnniversary)) && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
-          {/* Combined case shows both texts (birthday then anniversary, same
-              separator sendViaWaLink's single wa.me open will use) so the
-              merchant sees exactly what will be sent before approving —
+          {(combined ? combinedAiDraftLoading : aiDraftLoading) && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
+          {/* Combined case shows the ONE combined AI message (or its fallback)
+              so the merchant sees exactly what will be sent before approving —
               single-occasion case is completely unchanged below. */}
           <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{combined ? combinedPreviewText : previewText}</div>
         </div>
