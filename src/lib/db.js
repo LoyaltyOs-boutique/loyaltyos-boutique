@@ -2320,10 +2320,23 @@ export async function onboardCustomerRemote(f) {
     });
     if (!linkRes || !linkRes.user || !cvxId) return createLocalCustomer(f);
 
+    // BUG FIX: generateMagicTokenSelf's linkRes.user goes through auth.ts's
+    // toPublicUser projection, which has no whatsapp_consent/vvip fields (it's
+    // shared with merchant login, which has no business returning those) — so
+    // using it as-is here left the just-onboarded local row with
+    // whatsapp_consent/vvip undefined until the next hydrateCustomers() call
+    // self-healed it from createCustomer's own (correct) response. Patch the
+    // two fields back in from created.customer, which already carries the
+    // true saved values (including the upgrade-only re-onboarding path),
+    // before this reaches syncMagicLinkCustomer/toLocalCustomer.
+    const userForSync = created && created.customer
+      ? { ...linkRes.user, whatsapp_consent: created.customer.whatsapp_consent, vvip: created.customer.vvip }
+      : linkRes.user;
+
     // Stamp a local row keyed by the CONVEX id so likes/checkout/ledger and
     // the same-browser session all target the backend-backed customer. The
     // result card preserves the merchant-entered city/country via fallback.
-    const synced = syncMagicLinkCustomer(linkRes.user, linkRes.token, cvxId, {
+    const synced = syncMagicLinkCustomer(userForSync, linkRes.token, cvxId, {
       location: { city: f.city || '', country: f.country || 'India' },
     });
     if (!synced) return createLocalCustomer(f);
