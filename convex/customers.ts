@@ -4,6 +4,7 @@ import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
 import { rateLimiter } from "./rateLimits";
+import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -744,6 +745,70 @@ export const recordMessageAction = mutation({
       decided_at: Date.now(),
       ...(channel ? { channel } : {}),
     });
+
+    // ------------------------------------------------------------------
+    // Birthday/Anniversary automatic points crediting (2026-09-18 fix).
+    // Design spec: docs/superpowers/specs/2026-09-18-birthday-anniversary-points-design.md
+    //
+    // Gate: only a genuine send outcome credits points — never "cancelled".
+    // Reuses the EXACT tier-aware, live-settings-read pattern reviews.ts's
+    // approveReview now uses (2026-09-17 fix): read the real settings doc at
+    // its correct FLAT path (settingsDoc.value, no ".tiers" wrapper — that
+    // wrapper only exists in getSettings' read-side merge output), then
+    // resolve the customer's own tier override only when that tier's "on"
+    // toggle is true, else fall back to global's rate. See approveReview's
+    // resolveRuleValue for the same shape.
+    // ------------------------------------------------------------------
+    if (action === "sent" || action === "link_opened") {
+      const settingsDoc = await ctx.db
+        .query("settings")
+        .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
+        .first();
+
+      // Same flat-path read as approveReview — settingsDoc.value is stored
+      // FLAT as { global, silver, gold, platinum }, never `.tiers`.
+      const rules = settingsDoc?.value || DEFAULT_SETTINGS.tiers;
+      const globalRules = rules.global;
+
+      const customerTier = doc.tier as "silver" | "gold" | "platinum" | undefined;
+      const tierRules = customerTier ? rules[customerTier] : undefined;
+      const tierOverrideActive = Boolean(tierRules && tierRules.on === true);
+
+      // occasion selects the field name: "birthdayBonus" | "anniversaryBonus".
+      const field = occasion === "birthday" ? "birthdayBonus" : "anniversaryBonus";
+      const bonus =
+        tierOverrideActive && typeof tierRules?.[field] === "number"
+          ? (tierRules[field] as number)
+          : globalRules[field];
+
+      // Judgment call: a resolved bonus of 0 (tier off with no configured
+      // global fallback amount, or merchant explicitly zeroed the rate) is
+      // harmless to "credit" but pointless to log — skip the points_ledger
+      // insert entirely rather than writing a delta:0 row. This keeps the
+      // Activity Ledger free of no-op noise while still fully crediting any
+      // genuinely configured bonus, however small.
+      if (bonus > 0) {
+        const resulting_balance = Math.max(0, (doc.points ?? 0) + bonus);
+        await ctx.db.patch(customer_id, { points: resulting_balance });
+
+        await ctx.db.insert("points_ledger", {
+          customer_id,
+          delta: bonus,
+          reason_type: occasion, // "birthday" | "anniversary" — valid awardPoints literals
+          note: `Auto-credited on Approve & Send (${trimmedDate})`,
+          resulting_balance,
+          // points_ledger.created_by is schema-restricted to "admin" | "system"
+          // (convex/schema.ts) — "admin" means a human typed a number into the
+          // manual Points Tool; this credit is automatic, fired from the
+          // Approve & Send flow with no human-entered amount, so "system" is
+          // the correct, already-valid, honest value (never "admin" — that
+          // would make this indistinguishable from a manual award).
+          created_by: "system",
+          created_at: Date.now(),
+        });
+      }
+    }
+
     return { ok: true, id };
   },
 });
