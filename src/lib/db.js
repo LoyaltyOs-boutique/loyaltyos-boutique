@@ -1251,34 +1251,43 @@ export function hydrateCatalogue() {
 // expects (handle/likes/likedBy are client-only derived fields, matching the
 // hydrateCatalogue() convention above).
 let customerCatalogueHydrating = false;
-// `onSettled` (optional, added for the seed/real-catalogue race fix — see
-// Lookbook.jsx `catalogueReady`): fires exactly once when this fetch ATTEMPT
-// is done, success or failure, so the caller knows the pre-swap seed
-// snapshot is no longer at risk of being swapped out from under a click.
-// Purely a "done trying" signal — it does not change what gets hydrated.
+// `onSettled` (optional — outcome-reporting contract, 2026-09-19 permanent
+// staleness fix; see docs/superpowers/specs/2026-09-19-lookbook-staleness-
+// permanent-fix-design.md). Previously this was a bare no-arg callback that
+// fired identically on success AND every failure branch, so Lookbook.jsx's
+// boolean `catalogueReady` gate could never distinguish "real data loaded"
+// from "fetch silently failed, still showing stale/seed data". Now it
+// always fires with a result object so the caller can react correctly:
+//   { ok: true }                          — genuine success, items.length > 0
+//   { ok: false, reason: 'empty' }        — genuine success, but the
+//                                            merchant simply has 0 items
+//                                            (NOT an error — see Lookbook.jsx)
+//   { ok: false, reason: 'no-client' }    — Convex client not available
+//   { ok: false, reason: 'no-array' }     — response wasn't an array (e.g.
+//                                            an auth failure returning null)
+//   { ok: false, reason: 'error' }        — fetch threw/rejected
 export function hydrateCustomerCatalogue(id, token, onSettled) {
   if (customerCatalogueHydrating) return;
   const client = getConvex();
-  if (!client) { if (onSettled) onSettled(); return; }
+  if (!client) { if (onSettled) onSettled({ ok: false, reason: 'no-client' }); return; }
   customerCatalogueHydrating = true;
 
   client.query(api.lookbooks.getCustomerCatalogue, { id, token })
     .then((items) => {
-      if (!Array.isArray(items)) { customerCatalogueHydrating = false; if (onSettled) onSettled(); return; }
+      customerCatalogueHydrating = false;
+      if (!Array.isArray(items)) { if (onSettled) onSettled({ ok: false, reason: 'no-array' }); return; }
+      if (items.length === 0) { if (onSettled) onSettled({ ok: false, reason: 'empty' }); return; }
       const mappedItems = items.map((i) => ({
         ...i,
         handle: i.id.toLowerCase(),
         likes: 0,
         likedBy: [], // per-customer like toggle state (see likeItem())
       }));
-      if (mappedItems.length > 0) {
-        state.catalogueItems = mappedItems;
-        emit();
-      }
-      customerCatalogueHydrating = false;
-      if (onSettled) onSettled();
+      state.catalogueItems = mappedItems;
+      emit();
+      if (onSettled) onSettled({ ok: true });
     })
-    .catch(() => { customerCatalogueHydrating = false; if (onSettled) onSettled(); });
+    .catch(() => { customerCatalogueHydrating = false; if (onSettled) onSettled({ ok: false, reason: 'error' }); });
 }
 
 /* ---------- Customer actions ---------- */

@@ -47,12 +47,21 @@ export default function Lookbook() {
   const [points, setPoints] = useState(0);
   const [payMethod, setPayMethod] = useState('online');
   const [likeAnim, setLikeAnim] = useState(null);
-  // Race-condition fix (2026-09-17): true once hydrateCustomerCatalogue's
-  // fetch attempt has settled (success or failure) — see catalogueHydratedRef
-  // below and hydrateCustomerCatalogue's onSettled param in db.js. Gates ONLY
-  // the product grid so a click can never capture a seed-data id that then
-  // vanishes when the real Convex catalogue swaps in mid-session.
-  const [catalogueReady, setCatalogueReady] = useState(false);
+  // Race-condition fix (2026-09-17), upgraded 2026-09-19 (see
+  // docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md):
+  // was a bare boolean that flipped true on ANY hydrateCustomerCatalogue
+  // outcome (success or silent failure), so the grid rendered normally even
+  // when the real fetch had failed — no error, no retry, just stale/seed
+  // data shown forever. Now a 3-state machine driven by db.js's
+  // onSettled({ ok, reason }) contract:
+  //   'loading' — fetch attempt in flight, grid shows the loading message
+  //   'ready'   — genuine success (items.length > 0), render the real grid
+  //   'error'   — a true failure (no-client/no-array/thrown error) — NOT an
+  //               empty catalogue, which is its own honest state below
+  //   'empty'   — genuine success but the merchant has 0 items — distinct
+  //               from 'error' so we never show a false "retry" prompt for
+  //               a perfectly normal empty-catalogue merchant
+  const [catalogueState, setCatalogueState] = useState('loading');
 
   const navigate = useNavigate();
 
@@ -63,6 +72,25 @@ export default function Lookbook() {
   // regardless of unrelated re-renders. A separate ref from viewTrackedRef
   // since it tracks a different concern (catalogue fetch vs view tracking).
   const catalogueHydratedRef = useState(() => ({ done: false }))[0];
+  // Retry support: remember the last (id, token) pair a hydration attempt
+  // used, so the "tap to retry" button (error state only) can re-invoke
+  // hydrateCustomerCatalogue without re-running the whole auth effect.
+  const lastAuthRef = useState(() => ({ id: null, token: null }))[0];
+
+  // Maps db.js's onSettled outcome onto the 3-state machine above. Shared by
+  // every call site below (magic-link first-visit, Convex fallback,
+  // retry button) so the mapping logic lives in exactly one place.
+  const handleCatalogueSettled = (result) => {
+    if (result && result.ok) { setCatalogueState('ready'); return; }
+    if (result && result.reason === 'empty') { setCatalogueState('empty'); return; }
+    setCatalogueState('error');
+  };
+  const retryCatalogueHydration = () => {
+    const { id, token } = lastAuthRef;
+    if (!id || !token) return;
+    setCatalogueState('loading');
+    hydrateCustomerCatalogue(id, token, handleCatalogueSettled);
+  };
 
   // Authenticate via magic link (query) or 180-day session
   useEffect(() => {
@@ -81,7 +109,8 @@ export default function Lookbook() {
         setCustomer(u);
         if (!catalogueHydratedRef.done) {
           catalogueHydratedRef.done = true;
-          hydrateCustomerCatalogue(id, token, () => setCatalogueReady(true));
+          lastAuthRef.id = id; lastAuthRef.token = token;
+          hydrateCustomerCatalogue(id, token, handleCatalogueSettled);
         }
         return;
       }
@@ -99,7 +128,8 @@ export default function Lookbook() {
           setCustomer(synced || res.user);
           if (!catalogueHydratedRef.done) {
             catalogueHydratedRef.done = true;
-            hydrateCustomerCatalogue(id, token, () => setCatalogueReady(true));
+            lastAuthRef.id = id; lastAuthRef.token = token;
+            hydrateCustomerCatalogue(id, token, handleCatalogueSettled);
           }
         } else {
           // Truly invalid token (id doesn't exist in Convex OR local) → join form
@@ -115,6 +145,18 @@ export default function Lookbook() {
       const u = validateLookbook(s.id, s.token);
       if (u) {
         setCustomer(u);
+        // Returning-session catalogue hydration (gap fix, 2026-09-22): this
+        // branch previously only set auth state and relied on the background
+        // refresh below — it never called hydrateCustomerCatalogue, so a
+        // returning customer (bookmarked page, no fresh magic-link URL) had
+        // catalogueState stuck on 'loading' forever. Same 3-line pattern as
+        // branches A/B above, using this branch's resolved s.id/s.token
+        // (the outer id/token params are null here — no URL params).
+        if (!catalogueHydratedRef.done) {
+          catalogueHydratedRef.done = true;
+          lastAuthRef.id = s.id; lastAuthRef.token = s.token;
+          hydrateCustomerCatalogue(s.id, s.token, handleCatalogueSettled);
+        }
         // Background refresh: local cache may be stale (e.g. points credited via
         // a review approval since this browser's last visit). Re-validate against
         // Convex in the background and merge in the live data once resolved —
@@ -247,18 +289,37 @@ export default function Lookbook() {
               <span className="btn-gold !py-2">Write review</span>
             </button>
 
-            {/* Lookbook grid — gated on catalogueReady (race-condition fix,
-                2026-09-17) so a like/add-to-bag click can never target a
-                seed-data id right before hydrateCustomerCatalogue swaps the
-                real Convex catalogue in mid-session. Only this grid waits;
-                the membership card, Google review banner, and everything
-                else above/below render unconditionally once customer resolves. */}
-            {!catalogueReady ? (
+            {/* Lookbook grid — gated on catalogueState (race-condition fix,
+                2026-09-17; upgraded to a real success/failure/empty
+                distinction 2026-09-19, see
+                docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md)
+                so a like/add-to-bag click can never target a seed-data id
+                right before hydrateCustomerCatalogue swaps the real Convex
+                catalogue in mid-session, AND so a genuine fetch failure is
+                never silently masked by stale/seed data — the customer sees
+                an explicit retry prompt instead. Only this grid waits; the
+                membership card, Google review banner, and everything else
+                above/below render unconditionally once customer resolves. */}
+            {catalogueState === 'loading' && (
               <div className="py-16 text-center">
                 <div className="eyebrow mb-3">Loading your lookbook…</div>
                 <div className="luxe-title text-2xl text-gold animate-pulse">85 Lansdowne</div>
               </div>
-            ) : (
+            )}
+            {catalogueState === 'error' && (
+              <div className="py-16 text-center">
+                <div className="eyebrow mb-3 text-gold">Couldn't load your lookbook right now</div>
+                <p className="text-sm text-steel mb-5">Please check your connection and try again.</p>
+                <button onClick={retryCatalogueHydration} className="btn-ink">Tap to retry</button>
+              </div>
+            )}
+            {catalogueState === 'empty' && (
+              <div className="py-16 text-center">
+                <div className="eyebrow mb-3">No pieces added yet</div>
+                <p className="text-sm text-steel">Your boutique is curating your lookbook — check back soon.</p>
+              </div>
+            )}
+            {catalogueState === 'ready' && (
               <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-10">
                 {catalogue.map((item) => (
                   <article key={item.id} className="animate-fadeUp group">

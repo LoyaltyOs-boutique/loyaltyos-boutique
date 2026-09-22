@@ -1,5 +1,16 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }],
+  "functions": {
+    "api/dynamic-shell.js": {
+      "includeFiles": "dist/index.html"
+    }
+  },
+  "rewrites": [
+    { "source": "/lookbook", "destination": "/api/dynamic-shell" },
+    { "source": "/join", "destination": "/api/dynamic-shell" },
+    { "source": "/lookbook/public/:lookbookId", "destination": "/api/dynamic-shell" },
+    { "source": "/lookbook/piece/:pieceId", "destination": "/api/dynamic-shell" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ],
   "headers": [
     {
       "source": "/assets/(.*)",
