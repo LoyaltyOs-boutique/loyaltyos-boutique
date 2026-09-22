@@ -189,7 +189,14 @@ export default function Lookbook() {
     }
   }, [customer]);
 
-  const catalogue = useMemo(() => allCatalogue(), [db]);
+  // `db` is a referentially-stable, mutated-in-place singleton (see src/lib/db.js
+  // load()) — its object identity never changes, so React's Object.is dep check
+  // would never see it as "changed" and this memo would never recompute after
+  // mount even once the real Convex catalogue lands. `catalogueState` is a real
+  // useState that flips to 'ready' at exactly the moment fresh data is
+  // available, so it's the genuinely-changing second dependency that makes
+  // this memo recompute at the right time.
+  const catalogue = useMemo(() => allCatalogue(), [db, catalogueState]);
   const reviewedItemIds = useMemo(
     () => customer ? db.reviews.filter((r) => r.userId === customer.id && r.platform === 'in-app').map((r) => r.catalogueItemId) : [],
     [db, customer]
