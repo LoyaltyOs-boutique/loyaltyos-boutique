@@ -1,7 +1,8 @@
 import { action, internalQuery } from "./_generated/server";
 import { v } from "convex/values";
-import { internal } from "./_generated/api";
+import { internal, api } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
+import type { Id } from "./_generated/dataModel";
 
 /**
  * WhatsApp Cloud API integration — Templates section (server-side send).
@@ -273,3 +274,335 @@ export const sendWhatsAppServiceMessage = action({
     return postToGraphApi(phoneNumberId, waAccessToken, body, "sendWhatsAppServiceMessage");
   },
 });
+
+// ============================================================================
+// SECTION 4 — "Send All" bulk AI-drafted outreach (2026-09-22)
+// Design spec: docs/superpowers/specs/2026-09-22-send-all-bulk-whatsapp-design.md
+//
+// PURE ADDITION — does not modify sendWhatsAppTemplateMessage/
+// sendWhatsAppServiceMessage above, or any existing per-customer
+// Approve & Send code path (convex/customers.ts's recordMessageAction is
+// CALLED, never edited; convex/ai.ts's generateMessageDraft/
+// generateCombinedMessageDraft are CALLED, never edited).
+//
+// This is architecture-only until a real Meta-approved WhatsApp template
+// exists (D-17, blocked on Ma'am's Meta Business approval — see spec). Today,
+// live Convex data has whatsapp_templates.birthday === null AND
+// .anniversary === null, so this action's guard clause (step 2 below) always
+// takes the graceful "no_template" early-return path and NEVER reaches the
+// Graph API. It is written now so it activates immediately, with no further
+// code changes, once a real template is configured.
+// ============================================================================
+
+/** One eligible tomorrow-occasion recipient, after merging birthday+anniversary hits by customer. */
+interface OccasionRecipient {
+  customerId: Id<"users">;
+  name: string;
+  mobile: string;
+  tier: "silver" | "gold" | "platinum";
+  /** true when this SAME customer_id appears in both tomorrow's birthday AND anniversary lists. */
+  combined: boolean;
+  /** Present when NOT combined — the single occasion this customer is being messaged for. */
+  occasion: "birthday" | "anniversary" | null;
+  /** Canonical "YYYY-M-D" occasion_date for the birthday leg (used for recordMessageAction). */
+  birthdayOccasionDate: string | null;
+  /** Canonical "YYYY-M-D" occasion_date for the anniversary leg (used for recordMessageAction). */
+  anniversaryOccasionDate: string | null;
+}
+
+/** Per-customer outcome row returned to the merchant after a send attempt (or a skip). */
+interface SendAllResult {
+  customerId: Id<"users">;
+  name: string;
+  occasion: "birthday" | "anniversary" | "combined";
+  status: "sent" | "skipped" | "failed";
+  reason?: string;
+}
+
+/**
+ * Merge tomorrow's birthday + anniversary hit lists (both already filtered to
+ * days_until === 1 by findUpcomingInternal's `days` arg) by customer_id, so a
+ * customer with BOTH occasions tomorrow becomes ONE combined recipient
+ * instead of two separate sends — same "same customer, same date, both
+ * occasions" idea as Customers.jsx's isCombinedToday, adapted for tomorrow's
+ * date (that frontend check is `c.birthday === c.anniversary` on the MD
+ * string; here we instead check "did this exact customer_id appear in both
+ * already-date-filtered internal lists", which is equivalent and needs no MD
+ * string comparison since findUpcomingInternal already did the date match).
+ * Consent (`whatsapp_consent`) is filtered here too — non-consenting
+ * customers are silently excluded, never sent to, never listed as "skipped"
+ * (they were never eligible in the first place).
+ */
+function mergeOccasionHits(
+  birthdayHits: Array<{
+    _id: Id<"users">;
+    name: string;
+    mobile: string;
+    tier: "silver" | "gold" | "platinum";
+    whatsapp_consent: boolean;
+    occasion_date: string;
+  }>,
+  anniversaryHits: Array<{
+    _id: Id<"users">;
+    name: string;
+    mobile: string;
+    tier: "silver" | "gold" | "platinum";
+    whatsapp_consent: boolean;
+    occasion_date: string;
+  }>,
+): OccasionRecipient[] {
+  const byCustomer = new Map<Id<"users">, OccasionRecipient>();
+
+  for (const b of birthdayHits) {
+    if (!b.whatsapp_consent) continue;
+    byCustomer.set(b._id, {
+      customerId: b._id,
+      name: b.name,
+      mobile: b.mobile,
+      tier: b.tier,
+      combined: false,
+      occasion: "birthday",
+      birthdayOccasionDate: b.occasion_date,
+      anniversaryOccasionDate: null,
+    });
+  }
+
+  for (const a of anniversaryHits) {
+    if (!a.whatsapp_consent) continue;
+    const existing = byCustomer.get(a._id);
+    if (existing) {
+      // Same customer already has a tomorrow birthday hit — upgrade to combined.
+      existing.combined = true;
+      existing.occasion = null;
+      existing.anniversaryOccasionDate = a.occasion_date;
+    } else {
+      byCustomer.set(a._id, {
+        customerId: a._id,
+        name: a.name,
+        mobile: a.mobile,
+        tier: a.tier,
+        combined: false,
+        occasion: "anniversary",
+        birthdayOccasionDate: null,
+        anniversaryOccasionDate: a.occasion_date,
+      });
+    }
+  }
+
+  return Array.from(byCustomer.values());
+}
+
+/**
+ * sendAllUpcomingOccasionMessages — bulk "Send All" for tomorrow's
+ * consenting birthday/anniversary customers. MERCHANT-ONLY (Merchant Session
+ * Lock) — session verified via checkMerchantSession before any read or send.
+ *
+ * See SECTION 4 header above for the "architecture-only until a real
+ * template exists" framing. Today this always resolves via the `no_template`
+ * early-return (step 2) — it does not throw, and it never partially sends.
+ */
+export const sendAllUpcomingOccasionMessages = action({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { userId, token }) => {
+    await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+
+    // Step 1 — fetch tomorrow's (days_until === 1) birthday + anniversary
+    // hits via the existing no-session internal query (same one the daily
+    // AI-drafts cron already uses) — reused as-is, not duplicated.
+    const [birthdayHits, anniversaryHits] = await Promise.all([
+      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday" }),
+      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary" }),
+    ]);
+    const tomorrowBirthdays = birthdayHits.filter((h) => h.days_until === 1);
+    const tomorrowAnniversaries = anniversaryHits.filter((h) => h.days_until === 1);
+
+    const recipients = mergeOccasionHits(tomorrowBirthdays, tomorrowAnniversaries);
+
+    // Step 2 — guard clause: no real Meta-approved template configured yet
+    // (today's live state, D-17). Return early, gracefully — no Graph API
+    // call, no partial sends, no crash. This is the only path reachable
+    // today; everything below only runs once a real template exists.
+    const templates = await ctx.runQuery(api.settings.getWhatsAppTemplates, { userId, token });
+    const hasBirthdayTemplate = Boolean(templates?.birthday);
+    const hasAnniversaryTemplate = Boolean(templates?.anniversary);
+    if (!hasBirthdayTemplate && !hasAnniversaryTemplate) {
+      return {
+        ok: false as const,
+        reason: "no_template" as const,
+        sent: 0,
+        skipped: 0,
+        failed: 0,
+        results: [] as SendAllResult[],
+      };
+    }
+
+    // Step 3 — for each eligible recipient, generate their AI draft, send via
+    // the Cloud API template, then record the decision. Failures are caught
+    // PER-CUSTOMER so one bad send never aborts the rest of the batch.
+    const results: SendAllResult[] = [];
+    let sent = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const r of recipients) {
+      const occasionLabel: "birthday" | "anniversary" | "combined" = r.combined
+        ? "combined"
+        : (r.occasion as "birthday" | "anniversary");
+
+      // Which template this recipient needs. A combined customer is sent via
+      // the birthday template if configured, else the anniversary template —
+      // Option 1 (see spec) puts the whole AI draft into one body param
+      // regardless of which template slot carries it, so either approved
+      // template works as the delivery vehicle for a combined message.
+      const templateType: "birthday" | "anniversary" | null = r.combined
+        ? (hasBirthdayTemplate ? "birthday" : hasAnniversaryTemplate ? "anniversary" : null)
+        : r.occasion === "birthday"
+          ? (hasBirthdayTemplate ? "birthday" : null)
+          : (hasAnniversaryTemplate ? "anniversary" : null);
+
+      if (!templateType) {
+        // This recipient's specific occasion has no approved template yet
+        // (e.g. only anniversary is approved, but this row is birthday-only).
+        skipped += 1;
+        results.push({ customerId: r.customerId, name: r.name, occasion: occasionLabel, status: "skipped", reason: "no_template_for_occasion" });
+        continue;
+      }
+      const template = templateType === "birthday" ? templates.birthday : templates.anniversary;
+      if (!template) {
+        skipped += 1;
+        results.push({ customerId: r.customerId, name: r.name, occasion: occasionLabel, status: "skipped", reason: "no_template_for_occasion" });
+        continue;
+      }
+
+      try {
+        // Step 3a — AI draft: combined uses the single-Gemini-call combined
+        // draft, single-occasion uses the existing per-occasion draft. Both
+        // are called EXACTLY as they exist today (zero changes).
+        const draftText: string | null = r.combined
+          ? await ctx.runAction(internal.ai.generateCombinedMessageDraft, { customerName: r.name, tier: r.tier })
+          : await ctx.runAction(internal.ai.generateMessageDraft, {
+              customerName: r.name,
+              tier: r.tier,
+              occasion: r.occasion as "birthday" | "anniversary",
+            });
+
+        if (!draftText) {
+          failed += 1;
+          results.push({ customerId: r.customerId, name: r.name, occasion: occasionLabel, status: "failed", reason: "draft_generation_failed" });
+          continue;
+        }
+
+        // Step 3b — Cloud API send. Option 1 (spec): the full AI draft is the
+        // template's sole body parameter — a placeholder assumption flagged
+        // in the spec for whoever configures the real Meta template.
+        await postToGraphApiViaSend(r.mobile, template.name, template.language, draftText);
+
+        // Step 3c — record the decision(s). Combined recipients need BOTH
+        // legs recorded (mirrors the Today View combined flow, which also
+        // performs two recordMessageAction calls under the hood) so each
+        // occasion's idempotency + tier-aware points-crediting fires exactly
+        // as it does for a manual Approve & Send. recordMessageAction itself
+        // is the EXACT existing, unmodified mutation — called here, not
+        // edited anywhere in this diff.
+        if (r.combined) {
+          if (r.birthdayOccasionDate) {
+            await ctx.runMutation(api.customers.recordMessageAction, {
+              customer_id: r.customerId,
+              occasion: "birthday",
+              occasion_date: r.birthdayOccasionDate,
+              action: "sent",
+              channel: "cloud_api",
+              userId,
+              token,
+            });
+          }
+          if (r.anniversaryOccasionDate) {
+            await ctx.runMutation(api.customers.recordMessageAction, {
+              customer_id: r.customerId,
+              occasion: "anniversary",
+              occasion_date: r.anniversaryOccasionDate,
+              action: "sent",
+              channel: "cloud_api",
+              userId,
+              token,
+            });
+          }
+        } else {
+          const occasion = r.occasion as "birthday" | "anniversary";
+          const occasionDate = occasion === "birthday" ? r.birthdayOccasionDate : r.anniversaryOccasionDate;
+          if (occasionDate) {
+            await ctx.runMutation(api.customers.recordMessageAction, {
+              customer_id: r.customerId,
+              occasion,
+              occasion_date: occasionDate,
+              action: "sent",
+              channel: "cloud_api",
+              userId,
+              token,
+            });
+          }
+        }
+
+        sent += 1;
+        results.push({ customerId: r.customerId, name: r.name, occasion: occasionLabel, status: "sent" });
+      } catch (err) {
+        // Per-customer catch — a Graph API error, an "already decided"
+        // idempotency rejection from recordMessageAction, etc. — continue to
+        // the next recipient rather than aborting the whole batch.
+        failed += 1;
+        results.push({
+          customerId: r.customerId,
+          name: r.name,
+          occasion: occasionLabel,
+          status: "failed",
+          reason: err instanceof Error ? err.message : "unknown_error",
+        });
+      }
+    }
+
+    return { ok: true as const, sentCount: sent, skippedCount: skipped, failedCount: failed, sent, skipped, failed, results };
+  },
+});
+
+/**
+ * Thin internal helper so sendAllUpcomingOccasionMessages can reuse the exact
+ * postToGraphApi/toWaPhone plumbing sendWhatsAppTemplateMessage already uses,
+ * without duplicating the fetch/try-catch shape. NOT exported as a Convex
+ * function — a plain in-module async helper, called directly (no
+ * ctx.runAction indirection needed since it lives in this same file and
+ * shares module scope with postToGraphApi/toWaPhone/GRAPH_API_VERSION).
+ */
+async function postToGraphApiViaSend(
+  to: string,
+  templateName: string,
+  languageCode: string,
+  draftText: string,
+): Promise<{ ok: true; messageId: string }> {
+  // Secrets are re-read here (not passed in) — same "read inside the handler,
+  // never module scope" discipline as sendWhatsAppTemplateMessage above.
+  const waAccessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (!waAccessToken) {
+    throw new Error("[sendAllUpcomingOccasionMessages] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.");
+  }
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  if (!phoneNumberId) {
+    throw new Error("[sendAllUpcomingOccasionMessages] WHATSAPP_PHONE_NUMBER_ID is not set in the Convex deployment environment.");
+  }
+
+  const normalizedTo = toWaPhone(to);
+  const components: TemplateComponent[] = [
+    { type: "body", parameters: [{ type: "text", text: draftText }] },
+  ];
+  const body = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: normalizedTo,
+    type: "template",
+    template: { name: templateName, language: { code: languageCode }, components },
+  };
+
+  return postToGraphApi(phoneNumberId, waAccessToken, body, "sendAllUpcomingOccasionMessages");
+}

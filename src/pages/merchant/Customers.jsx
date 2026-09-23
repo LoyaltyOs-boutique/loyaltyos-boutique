@@ -7,6 +7,7 @@ import {
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
   recordMessageAction, awardPoints, generateMessageDraftRemote, generateCombinedMessageDraftRemote,
+  sendAllUpcomingOccasionMessagesRemote,
   hydrateCustomers, hydrateReviews, hydratePointsHistory,
   hydrateCustomersPage, customersPage, resetCustomersPageCache,
   clearMerchantSession,
@@ -163,6 +164,28 @@ export default function Customers() {
   // updates (backend rejects the second with an idempotency error).
   const [cancelErrors, setCancelErrors] = useState({});
 
+  // 2026-09-22 "Send All" bulk-outreach — small inline row under the tomorrow
+  // tab lists, replacing an earlier oversized modal version per review
+  // feedback. Three local states drive the same click -> confirm -> result
+  // flow the modal used to, just rendered inline instead: sendAllConfirming
+  // toggles the button into its "Send to N customers?" confirm step,
+  // sendAllSending is true only while the bridge call is in flight, and
+  // sendAllResult holds whatever it resolves to (or null on the never-throw
+  // failure signal) so the inline result line can render.
+  const [sendAllConfirming, setSendAllConfirming] = useState(false);
+  const [sendAllSending, setSendAllSending] = useState(false);
+  const [sendAllResult, setSendAllResult] = useState(null);
+
+  // N for the inline "Send All (N)" label — unique consenting customers with
+  // days_until === 1 across both tomorrow arrays (a customer present in both,
+  // i.e. birthday === anniversary tomorrow, counts once, not twice).
+  const sendAllCount = useMemo(() => {
+    const ids = new Set();
+    (tomorrowBirthdays || []).forEach((c) => { if (c.days_until === 1 && c.whatsapp_consent) ids.add(c._id); });
+    (tomorrowAnniversaries || []).forEach((c) => { if (c.days_until === 1 && c.whatsapp_consent) ids.add(c._id); });
+    return ids.size;
+  }, [tomorrowBirthdays, tomorrowAnniversaries]);
+
   // isToday (2026-09-18 Today View spec, point 5): handleCancel now fires
   // from FOUR tabs, not just the two "tomorrow" ones — the new
   // 'birthday_today'/'anniversary_today' tabs need canonicalTodayOccasionDate()
@@ -187,6 +210,18 @@ export default function Customers() {
       // don't crash. If it was already decided, reflect that in the UI too.
       setCancelErrors((prev) => ({ ...prev, [key]: err?.message || 'Could not cancel — try again.' }));
     }
+  };
+
+  // Confirm step of the inline "Send All" row — calls the bridge, then shows
+  // one inline result line. Never throws (see sendAllUpcomingOccasionMessagesRemote's
+  // own doc comment in db.js) — a null result means "couldn't reach server".
+  const handleSendAll = async () => {
+    setSendAllSending(true);
+    setSendAllResult(null);
+    const res = await sendAllUpcomingOccasionMessagesRemote();
+    setSendAllSending(false);
+    setSendAllConfirming(false);
+    setSendAllResult(res);
   };
 
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
@@ -454,6 +489,44 @@ export default function Customers() {
         </table>
       </div>
 
+      {/* 2026-09-22 "Send All" — small inline row under the tomorrow-tab
+          list, replacing an earlier oversized modal per review feedback. No
+          new component, no window.confirm — a local two-state toggle
+          (confirming -> Confirm/Cancel) rendered right here. */}
+      {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (
+        <div className="flex items-center gap-3 text-xs text-steel">
+          {!sendAllConfirming ? (
+            <button
+              onClick={() => { setSendAllResult(null); setSendAllConfirming(true); }}
+              disabled={sendAllCount === 0 || (!waTemplates?.birthday && !waTemplates?.anniversary) || sendAllSending}
+              className="btn-gold !px-2 !py-1.5 text-[11px] disabled:opacity-40"
+              aria-label="Send all"
+            >
+              Send All ({sendAllCount})
+            </button>
+          ) : (
+            <div className="inline-flex gap-1.5 items-center">
+              <span>Send to {sendAllCount} customers?</span>
+              <button onClick={handleSendAll} disabled={sendAllSending} className="btn-gold !px-2 !py-1.5 text-[11px] disabled:opacity-40" aria-label="Confirm send all">
+                Confirm
+              </button>
+              <button onClick={() => setSendAllConfirming(false)} disabled={sendAllSending} className="btn-ghost !px-2 !py-1.5 text-[11px] disabled:opacity-40" aria-label="Cancel send all">
+                Cancel
+              </button>
+            </div>
+          )}
+          {!waTemplates?.birthday && !waTemplates?.anniversary && (
+            <span>WhatsApp template pending Meta approval — Send All not available yet.</span>
+          )}
+          {sendAllResult && (sendAllResult.ok
+            ? <span>Sent {sendAllResult.sent} · Skipped {sendAllResult.skipped} · Failed {sendAllResult.failed}</span>
+            : sendAllResult.reason === 'no_template'
+              ? <span>Template pending Meta approval — nothing was sent.</span>
+              : <span className="text-red-600 text-[10px]">Could not reach the server — nothing was sent.</span>
+          )}
+        </div>
+      )}
+
       <div className="flex items-center justify-between text-xs text-steel">
         <span>Showing {rows.length} of {list.length}</span>
         <div className="flex gap-2">
@@ -643,6 +716,7 @@ export default function Customers() {
           <PointsTool userId={pointsTarget.id} />
         </Modal>
       )}
+
     </div>
   );
 }

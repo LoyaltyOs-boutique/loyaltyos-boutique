@@ -28,6 +28,7 @@ const ACTION = {
   campaign: { icon: '✆', label: 'campaign' },
   like: { icon: '♥', label: 'like' },
   catalogue: { icon: '❖', label: 'catalogue' },
+  message_action: { icon: '✉', label: 'message' },
 };
 
 export default function Dashboard() {

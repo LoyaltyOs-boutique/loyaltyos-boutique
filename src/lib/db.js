@@ -729,6 +729,19 @@ export function recordMessageAction(customer_id, occasion, occasion_date, action
     action,
     ...(channel ? { channel } : {}),
     ...session,
+  }).then((result) => {
+    // 2026-09-22 additive fix (Send All design spec, point 7): the individual
+    // Approve & Send / Cancel flow never showed up in Recent Activity before
+    // — this is the ONLY change to this function, a local-activity pushEvent
+    // call after the mutation already resolved successfully. Does not alter
+    // the resolved value, does not touch error handling above.
+    const customer = customerById(customer_id);
+    if (customer) {
+      const actionLabel = action === 'sent' ? 'wish sent' : action === 'link_opened' ? 'wish opened in WhatsApp' : action === 'cancelled' ? 'wish cancelled' : action;
+      pushEvent(customer.id, 'message_action', `${customer.name}'s ${occasion} ${actionLabel}`);
+      emit();
+    }
+    return result;
   });
 }
 
@@ -1056,6 +1069,60 @@ export function sendWhatsAppServiceMessage(to, type, text, imageUrl) {
     ...(imageUrl ? { imageUrl } : {}),
     ...session,
   });
+}
+
+/**
+ * sendAllUpcomingOccasionMessagesRemote — 2026-09-22 bridge for the "Send
+ * All" bulk AI-drafted WhatsApp outreach feature (Birthdays/Anniversaries
+ * tomorrow tabs). See docs/superpowers/specs/2026-09-22-send-all-bulk-whatsapp-design.md
+ * and convex/whatsapp.ts's sendAllUpcomingOccasionMessages for the full
+ * design/implementation.
+ *
+ * Same null-on-failure, never-throw bridge shape as generateMessageDraftRemote/
+ * generateCombinedMessageDraftRemote above (NOT the propagate-real-errors
+ * shape sendWhatsAppTemplateMessage/recordMessageAction use) — the confirmation
+ * modal this feeds needs a single "something went wrong, nothing was sent"
+ * fallback rather than a thrown error, since a genuinely partial-send state is
+ * already fully described by the resolved `results` array on success.
+ *
+ * Today (no Meta-approved template configured yet, D-17) this always
+ * resolves to `{ ok:false, reason:'no_template', sent:0, skipped:0, failed:0,
+ * results:[] }` — see the Convex action's own doc comment for why that is the
+ * ONLY reachable path right now, and is not an error state.
+ *
+ * Design spec point 6: on a real send completing (future state, once a
+ * template exists), loop through the returned results and call the existing
+ * LOCAL pushEvent() helper once per successful send, so Send All sends
+ * appear in this merchant browser's Recent Activity exactly like every other
+ * locally-tracked action today. pushEvent is a private module-scoped helper
+ * (never exported — see its definition near the top of this file), so that
+ * loop lives HERE rather than in the calling component, which has no access
+ * to it.
+ */
+export async function sendAllUpcomingOccasionMessagesRemote() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    const res = await client.action(api.whatsapp.sendAllUpcomingOccasionMessages, { ...session });
+    if (res?.ok && Array.isArray(res.results)) {
+      let pushed = false;
+      res.results.forEach((r) => {
+        if (r.status === 'sent') {
+          // Resolve the Convex _id back to the local slug-style id so this
+          // event groups under the real customer row, same key every other
+          // pushEvent call site in this file uses.
+          const local = state.users.find((u) => u.convexId === r.customerId || u.id === r.customerId);
+          pushEvent(local ? local.id : r.customerId, 'message_action', `${r.name}'s ${r.occasion} wish sent (Send All)`);
+          pushed = true;
+        }
+      });
+      if (pushed) emit();
+    }
+    return res;
+  } catch {
+    return null;
+  }
 }
 
 /**
