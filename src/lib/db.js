@@ -16,6 +16,7 @@ import { buildSeed } from '../data/seed.js';
 // hit the live backend (pleasant-cobra-560) while the UI stays synchronous.
 import { ConvexReactClient } from 'convex/react';
 import { api } from '../../convex/_generated/api.js';
+import { chunk } from './csvImport.js';
 
 const KEY = 'loyaltyos85_v2';
 const SEED_VERSION = 2;
@@ -851,30 +852,96 @@ export function hydratePointsHistory(userId) {
  * `finally` with no `catch` in the component, leaving the merchant with no
  * error message and a reset button.
  *
- * Fix: route the call through this bridge, following the SAME
- * propagate-real-errors contract as awardPoints above (no swallowing
- * .catch) — bulkCreateCustomers returns a plain
- * { created, skipped, createdCount, skippedCount } object (no `ok` field,
- * confirmed from convex/customers.ts), so there is no success/failure flag
- * to branch on here; a thrown rejection (offline / not logged in / a real
- * Convex error) is the only failure signal, and the caller's try/catch
- * shows it to the merchant.
- *
- * On success, calls hydrateCustomers() (same background-refresh mechanism
- * used elsewhere) so the local customers() cache — used by the CSV preview's
- * duplicate-mobile detection for the NEXT import in the same session —
- * includes the customers just created.
+ * 2026-09-23 CSV bulk onboarding design — the backend now accepts at most
+ * 100 rows per call, so this bridge splits `rows` into chunks of 100 and
+ * calls the mutation SEQUENTIALLY (never in parallel), aggregating
+ * created/reactivated/skipped across every chunk. The "offline" and "not
+ * logged in" checks still happen up front, before any network call. If a
+ * chunk throws, hydrateCustomers() still runs (so the CRM reflects whatever
+ * WAS created before the failure) and the function resolves — it does NOT
+ * reject — with { ok: false, error, partial }, so the caller can show the
+ * partial-progress message from the design spec ("N customers were already
+ * created — importing the same file again is safe"). On full success it
+ * resolves { ok: true, ...aggregatedResults }.
  */
 export function bulkCreateCustomers(rows) {
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
   if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
-  return client.mutation(api.customers.bulkCreateCustomers, { rows, ...session })
-    .then((res) => {
-      hydrateCustomers();
-      return res;
-    });
+
+  const chunks = chunk(rows, 100);
+  const created = [];
+  const reactivated = [];
+  const skipped = [];
+
+  const runChunks = async () => {
+    for (const part of chunks) {
+      let res;
+      try {
+        res = await client.mutation(api.customers.bulkCreateCustomers, { rows: part, ...session });
+      } catch (err) {
+        hydrateCustomers();
+        return {
+          ok: false,
+          error: err?.message || 'Import failed — please try again.',
+          partial: {
+            created, reactivated, skipped,
+            createdCount: created.length, reactivatedCount: reactivated.length, skippedCount: skipped.length,
+          },
+        };
+      }
+      created.push(...(res.created || []));
+      reactivated.push(...(res.reactivated || []));
+      skipped.push(...(res.skipped || []));
+    }
+    hydrateCustomers();
+    return {
+      ok: true,
+      created, reactivated, skipped,
+      createdCount: created.length, reactivatedCount: reactivated.length, skippedCount: skipped.length,
+    };
+  };
+
+  return runChunks();
+}
+
+/**
+ * 2026-09-23 CSV bulk onboarding amendment — checkMobilesStatus bridge.
+ *
+ * The CSV preview used to trust the browser's local customer list to decide
+ * "Already a customer" — but that list never drops a customer soft-deleted
+ * elsewhere, so a mobile eligible for reactivation always showed as "Already
+ * a customer" and the backend's (already correct) reactivation branch in
+ * bulkCreateCustomers was unreachable from the real UI. This bridge instead
+ * asks convex/customers.ts's checkMobilesStatus for real-time status.
+ *
+ * Same up-front offline/not-logged-in rejections as bulkCreateCustomers
+ * above. checkMobilesStatus accepts at most 500 mobiles per call, so this
+ * splits `mobiles` into chunks of 500 with the same chunk() helper and calls
+ * the query SEQUENTIALLY per chunk, merging every chunk's active/deleted
+ * lists into one combined { active: Set, deleted: Set }.
+ *
+ * Unlike bulkCreateCustomers's never-throw/partial-result contract, this
+ * bridge THROWS on any chunk failure — the CSV preview has no meaningful
+ * partial state to show (it hasn't imported anything yet), so the caller
+ * needs a real error to display "could not check" instead of silently
+ * building a preview off incomplete/wrong data.
+ */
+export async function checkMobilesStatusRemote(mobiles) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) throw new Error('Offline — Convex is not connected.');
+  if (!session) throw new Error('Not logged in — please sign in again.');
+
+  const active = new Set();
+  const deleted = new Set();
+  for (const part of chunk(mobiles, 500)) {
+    const res = await client.query(api.customers.checkMobilesStatus, { mobiles: part, ...session });
+    for (const m of res?.active || []) active.add(m);
+    for (const m of res?.deleted || []) deleted.add(m);
+  }
+  return { active, deleted };
 }
 
 /* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */

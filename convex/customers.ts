@@ -2,7 +2,7 @@ import { mutation, query, internalQuery, type MutationCtx, type QueryCtx } from 
 import { v } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
-import { requireMerchantSession } from "./auth";
+import { requireMerchantSession, issueMagicToken } from "./auth";
 import { rateLimiter } from "./rateLimits";
 import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 
@@ -1175,15 +1175,47 @@ export const bulkDeleteCustomers = mutation({
 });
 
 /**
- * Gate 1 — Bulk CSV customer import.
- * Reuses createCustomer's exact validation + duplicate-mobile-check logic
- * (10-digit mobile required, by_mobile index lookup) row by row, so a bad
- * or duplicate row is SKIPPED (reported back) rather than crashing the batch.
- * Also skips duplicate mobiles appearing more than once within the same file.
+ * Gate 1 + CSV Bulk Onboarding first-class-customers fix (2026-09-23).
+ * Design spec: docs/superpowers/specs/2026-09-23-csv-bulk-onboarding-design.md
+ * ("Backend" section).
+ *
+ * Bulk CSV customer import — brought up to parity with single-client
+ * onboarding (createCustomer above). Reuses createCustomer's exact
+ * validation + duplicate-mobile-check logic (10-digit mobile required,
+ * by_mobile index lookup) row by row, so a bad or duplicate row is SKIPPED
+ * (reported back) rather than crashing the batch. Also skips duplicate
+ * mobiles appearing more than once within the same file.
+ *
+ * Three outcomes per row (mirrors createCustomer's own branches):
+ *  - New mobile: inserted with custom_tags: [], whatsapp_consent/vvip set
+ *    ONLY when explicitly true (never an explicit false — same conditional-
+ *    spread shape createCustomer uses), then a real magic link is minted via
+ *    the SHARED issueMagicToken helper (convex/auth.ts) — the exact same
+ *    token issuance the merchant "resend link" path (generateMagicTokenForCustomer)
+ *    uses. This closes the prior gap where bulk-imported customers had
+ *    magic_token: null (CRM eye/copy buttons broken, no usable lookbook link).
+ *  - Existing mobile, soft-deleted (is_deleted === true): reactivated using
+ *    the SAME is_deleted:false patch + consent/vvip upgrade-only logic as
+ *    createCustomer's reactivation branch (see createCustomer above,
+ *    "Decision 2 (2026-09-14 soft-delete design)"). A magic token is minted
+ *    ONLY if the row doesn't already have one (existing valid links are
+ *    never rotated out from under an already-active session).
+ *  - Existing mobile, active: skipped with reason duplicate_existing — NO
+ *    writes, no data about the existing customer is returned (never
+ *    overwrites live customer data via a bulk import).
+ *
+ * Batch limit: rows.length > 100 throws BEFORE any read/write (design spec
+ * decision — chunked imports of 100 rows at a time from the frontend).
  *
  * NOTE: city/country are accepted (CSV column parity with the onboarding
  * form) but — matching createCustomer today — are not persisted; the users
- * schema has no city/country fields yet.
+ * schema has no city/country fields yet. Staff notes and updating existing
+ * ACTIVE customers are explicitly out of scope per the design spec.
+ *
+ * No magic tokens are ever included in this mutation's response — the
+ * merchant reads them back out via the existing getCustomers/getCustomerById
+ * projections (toMerchantCustomer already includes magic_token), the same
+ * path the CRM eye/copy buttons already use for single-onboarded customers.
  */
 export const bulkCreateCustomers = mutation({
   args: {
@@ -1195,6 +1227,8 @@ export const bulkCreateCustomers = mutation({
         anniversary: v.optional(v.string()),
         city: v.optional(v.string()),
         country: v.optional(v.string()),
+        whatsapp_consent: v.optional(v.boolean()),
+        vvip: v.optional(v.boolean()),
       }),
     ),
     userId: v.id("users"),
@@ -1202,7 +1236,15 @@ export const bulkCreateCustomers = mutation({
   },
   handler: async (ctx, { rows, userId, token }) => {
     await requireMerchantSession(ctx, userId, token);
+
+    // Batch limit — checked BEFORE any read or write (design spec: "rows.length
+    // above 100 throws a clear error before any write").
+    if (rows.length > 100) {
+      throw new Error(`bulkCreateCustomers accepts at most 100 rows per call (got ${rows.length}).`);
+    }
+
     const created: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
+    const reactivated: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
     const skipped: Array<{ name: string; whatsapp: string; reason: string }> = [];
     const seenInFile = new Set<string>();
 
@@ -1228,11 +1270,49 @@ export const bulkCreateCustomers = mutation({
         .query("users")
         .withIndex("by_mobile", (q) => q.eq("mobile", digits))
         .first();
+
       if (existing) {
+        if (existing.is_deleted === true) {
+          // Reactivation branch — mirrors createCustomer's exact logic
+          // (convex/customers.ts createCustomer, "Decision 2" block above):
+          // clear is_deleted, then apply consent/vvip strictly upgrade-only
+          // (only ever patch true, never clear an existing true back to
+          // false/absent).
+          seenInFile.add(digits);
+          let record = existing;
+
+          await ctx.db.patch(existing._id, { is_deleted: false });
+          record = { ...existing, is_deleted: false };
+
+          if (row.whatsapp_consent === true && existing.whatsapp_consent !== true) {
+            await ctx.db.patch(existing._id, { whatsapp_consent: true });
+            record = { ...record, whatsapp_consent: true };
+          }
+          if (row.vvip === true && existing.vvip !== true) {
+            await ctx.db.patch(existing._id, { vvip: true });
+            record = { ...record, vvip: true };
+          }
+
+          // Mint a magic token ONLY if this row currently has none — an
+          // already-valid link/session is never rotated out from under the
+          // customer just because they were re-imported.
+          if (!record.magic_token) {
+            await issueMagicToken(ctx, record);
+          }
+
+          reactivated.push({ id: existing._id, name: record.name, mobile: digits });
+          continue;
+        }
+
+        // Active existing customer — skip, NO writes, nothing about the
+        // existing customer is returned (design spec decision 5).
         skipped.push({ name: customerName, whatsapp: digits, reason: "duplicate_existing" });
         continue;
       }
 
+      // Genuinely new row — insert, then mint a real magic link via the
+      // SAME shared helper generateMagicTokenForCustomer uses (never
+      // hand-rolled token logic, never generateMagicTokenSelf).
       seenInFile.add(digits);
       const id = await ctx.db.insert("users", {
         mobile: digits,
@@ -1241,20 +1321,107 @@ export const bulkCreateCustomers = mutation({
         role: "customer",
         points: 0,
         tier: "silver",
+        custom_tags: [],
         ...(row.birthday ? { birthday: row.birthday.trim() } : {}),
         ...(toMD(row.birthday) ? { birthday_md: toMD(row.birthday) } : {}),
         ...(row.anniversary ? { anniversary: row.anniversary.trim() } : {}),
         ...(toMD(row.anniversary) ? { anniversary_md: toMD(row.anniversary) } : {}),
+        // Only set consent/vvip when explicitly true — never persist an
+        // explicit false (same conditional-spread shape as createCustomer).
+        ...(row.whatsapp_consent ? { whatsapp_consent: true } : {}),
+        ...(row.vvip ? { vvip: true } : {}),
       });
+      const newDoc = await ctx.db.get(id);
+      if (newDoc) {
+        await issueMagicToken(ctx, newDoc);
+      }
       created.push({ id, name: customerName, mobile: digits });
     }
 
     return {
       created,
+      reactivated,
       skipped,
       createdCount: created.length,
+      reactivatedCount: reactivated.length,
       skippedCount: skipped.length,
     };
+  },
+});
+
+/**
+ * CSV Bulk Onboarding — preview-accuracy fix (2026-09-23).
+ * Design spec: docs/superpowers/specs/2026-09-23-csv-bulk-onboarding-design.md
+ * ("Amendment — 2026-09-23 (after end-to-end test)", point 1).
+ *
+ * checkMobilesStatus — merchant-only, read-only status check for a batch of
+ * mobile numbers, used by the CSV import preview INSTEAD OF the browser's
+ * local customer list (which never drops a customer deleted elsewhere — a
+ * separate, pre-existing staleness bug in src/lib/db.js's mergeConvexCustomer,
+ * out of scope here). Without this, the preview could mark a soft-deleted
+ * customer as "Already a customer", so reactivation — already correct at the
+ * bulkCreateCustomers level above — could never be triggered from the real UI.
+ *
+ * Reuses, byte-for-byte, the SAME lookup bulkCreateCustomers already performs
+ * per row: normalize digits, by_mobile index .first(), then branch on
+ * is_deleted. This function only READS — it never inserts, patches, or
+ * reactivates anything; the actual reactivate/skip decision still happens
+ * inside bulkCreateCustomers when the merchant confirms the import.
+ *
+ * DATA MINIMIZATION (explicit requirement): the response contains ONLY
+ * mobile number strings, grouped by status — never a name, _id, or any other
+ * customer field. The frontend wiring that calls this from the CSV preview
+ * is a separate, later task (not part of this change).
+ */
+export const checkMobilesStatus = query({
+  args: {
+    mobiles: v.array(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { mobiles, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    // Batch limit — checked BEFORE any database read (same "fail fast"
+    // pattern as bulkCreateCustomers's rows.length > 100 guard above).
+    if (mobiles.length > 500) {
+      throw new Error(`checkMobilesStatus accepts at most 500 mobiles per call (got ${mobiles.length}).`);
+    }
+
+    // Same digit-stripping normalization as bulkCreateCustomers (line 1252
+    // above: `row.whatsapp.replace(/\D/g, "")`), then de-duplicate the
+    // normalized set so a repeated/formatted-differently mobile in the input
+    // is only looked up once. Anything that isn't exactly 10 digits after
+    // normalization is silently ignored (matches bulkCreateCustomers's own
+    // invalid_mobile skip — this preview-only helper has no "reason" channel
+    // to report it through, so it simply never appears in either output list).
+    const normalized = new Set<string>();
+    for (const raw of mobiles) {
+      const digits = raw.replace(/\D/g, "");
+      if (digits.length === 10) normalized.add(digits);
+    }
+
+    const active: string[] = [];
+    const deleted: string[] = [];
+
+    for (const digits of normalized) {
+      // Same by_mobile lookup as bulkCreateCustomers (line 1269-1272 above).
+      const existing = await ctx.db
+        .query("users")
+        .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+        .first();
+
+      if (!existing) continue; // no row — neither list (frontend treats as "New")
+
+      // Same is_deleted branch as bulkCreateCustomers (line 1275 above).
+      if (existing.is_deleted === true) {
+        deleted.push(digits);
+      } else {
+        active.push(digits);
+      }
+    }
+
+    return { active, deleted };
   },
 });
 

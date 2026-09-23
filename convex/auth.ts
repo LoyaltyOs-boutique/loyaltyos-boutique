@@ -154,7 +154,7 @@ export const merchantLogin = mutation({
  * 180-day expiry check, and returns the personalised portal link:
  * <base>/lookbook?id=<_id>&token=<token>
  */
-async function issueMagicToken(
+export async function issueMagicToken(
   ctx: MutationCtx,
   customer: UserDoc,
   baseUrl?: string,

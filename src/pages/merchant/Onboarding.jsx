@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import confetti from 'canvas-confetti';
-import { onboardCustomerRemote, waMessage, waDigits, getData, subscribe, customers, bulkCreateCustomers } from '../../lib/db.js';
+import { onboardCustomerRemote, waMessage, waDigits, getData, subscribe, bulkCreateCustomers, checkMobilesStatusRemote } from '../../lib/db.js';
+import { parseCsv, mapRows, validMobiles, buildPreview, SAMPLE_CSV } from '../../lib/csvImport.js';
 import { COUNTRIES, BRAND } from '../../data/seed.js';
 
 const useDb = () => {
@@ -10,14 +11,26 @@ const useDb = () => {
   return getData();
 };
 
-/** Parse a free-text birthday/anniversary CSV cell into "M-D" (matches the single-add flow's format). */
-const csvToMD = (v) => {
-  if (!v) return '';
-  const trimmed = v.trim();
-  if (/^\d{1,2}-\d{1,2}$/.test(trimmed)) return trimmed; // already M-D
-  const d = new Date(trimmed);
-  if (Number.isNaN(d.getTime())) return '';
-  return `${d.getMonth() + 1}-${d.getDate()}`;
+// 2026-09-23 CSV bulk onboarding design — date parsing (day-first DD-MM-YYYY
+// etc.) now lives in src/lib/csvImport.js's parseDateToMD, used inside
+// buildPreview() below. The old csvToMD (US-order `new Date()` parsing) is
+// removed; buildPreview() already returns each row's birthday/anniversary
+// as the stored "M-D" string.
+
+// Skip-reason codes returned by the backend, mapped to merchant-readable text.
+const SKIP_REASON_TEXT = {
+  invalid_mobile: 'Invalid mobile',
+  missing_name: 'Missing name',
+  duplicate_in_file: 'Duplicate in file',
+  duplicate_existing: 'Already a customer',
+};
+
+// Preview-row status codes (buildPreview) mapped to merchant-readable labels.
+const STATUS_LABEL = {
+  new: 'New',
+  duplicate_in_file: 'Duplicate in file',
+  existing: 'Already a customer',
+  reactivate: 'Will be reactivated',
 };
 
 export default function Onboarding() {
@@ -30,34 +43,53 @@ export default function Onboarding() {
   const set = (k) => (e) => { setF({ ...f, [k]: e.target.value }); if (k === 'whatsapp') setMobileError(''); };
 
   // Gate 1 — CSV bulk import (same parsing pattern as Catalogue.jsx's onCsv()).
-  const [csvPreview, setCsvPreview] = useState(null); // {rows, toCreate, toSkip}
+  const [csvPreview, setCsvPreview] = useState(null); // {rows, toCreate, toReactivate, toSkip}
   const [bulkResult, setBulkResult] = useState(null); // {createdCount, skippedCount, skipped}
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkError, setBulkError] = useState(''); // Task 1, Step 9.9 — surfaces a real bridge rejection instead of a silent reset
+  const [checking, setChecking] = useState(false); // 2026-09-23 amendment — true while checkMobilesStatusRemote is in flight
   const csvRef = useRef(null);
 
-  const onBulkCsv = (file) => {
+  // 2026-09-23 amendment — the preview no longer trusts the browser's local
+  // customer list (it never drops a customer soft-deleted elsewhere). It now
+  // asks checkMobilesStatusRemote for real-time active/deleted status before
+  // building the preview, so a reactivatable mobile shows correctly instead
+  // of "Already a customer".
+  const onBulkCsv = async (file) => {
     if (!file) return;
-    const r = new FileReader();
-    r.onload = () => {
-      const lines = String(r.result).split(/\r?\n/).filter((l) => l.trim());
-      const dataLines = lines.length && /^name\s*,/i.test(lines[0]) ? lines.slice(1) : lines;
-      const existingMobiles = new Set(customers().map((c) => c.mobile));
-      const seen = new Set();
-      const rows = dataLines.map((line) => {
-        const [name = '', whatsapp = '', birthday = '', anniversary = '', city = '', country = ''] = line.split(',').map((c) => c.trim());
-        const digits = waDigits(whatsapp);
-        const invalid = !name || digits.length !== 10;
-        const isDup = !invalid && (existingMobiles.has(digits) || seen.has(digits));
-        if (!invalid) seen.add(digits);
-        return { name, whatsapp, birthday, anniversary, city, country: country || 'India', invalid, isDup };
-      }).filter((row) => row.name || row.whatsapp);
-      const toCreate = rows.filter((row) => !row.invalid && !row.isDup).length;
-      setCsvPreview({ rows, toCreate, toSkip: rows.length - toCreate });
-      setBulkResult(null);
-      setBulkError('');
-    };
-    r.readAsText(file);
+    setCsvPreview(null);
+    setBulkResult(null);
+    setBulkError('');
+    const text = await file.text();
+    const table = parseCsv(text);
+    const rows = mapRows(table);
+    setChecking(true);
+    try {
+      const status = await checkMobilesStatusRemote(validMobiles(rows));
+      const preview = buildPreview(table, status);
+      const toCreate = preview.filter((row) => row.status === 'new').length;
+      const toReactivate = preview.filter((row) => row.status === 'reactivate').length;
+      setCsvPreview({ rows: preview, toCreate, toReactivate, toSkip: preview.length - toCreate - toReactivate });
+    } catch (err) {
+      setBulkError(`Could not check existing customers: ${err?.message || 'unknown error'}. Please try again.`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  // "Download sample CSV" — builds the sample in-browser and triggers a
+  // download via a temporary <a download> element (no server round trip).
+  const downloadSampleCsv = (e) => {
+    e.stopPropagation(); // sits inside the drop zone's clickable area
+    const blob = new Blob([SAMPLE_CSV], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '85-lansdowne-client-import-sample.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   // Task 1, Step 9.9 fix: this used to call convex.mutation(api.customers.bulkCreateCustomers, ...)
@@ -74,14 +106,16 @@ export default function Onboarding() {
     setBulkError('');
     try {
       const payload = csvPreview.rows
-        .filter((row) => !row.invalid)
+        .filter((row) => row.status === 'new' || row.status === 'reactivate')
         .map((row) => ({
           name: row.name,
           whatsapp: row.whatsapp,
-          ...(row.birthday ? { birthday: csvToMD(row.birthday) } : {}),
-          ...(row.anniversary ? { anniversary: csvToMD(row.anniversary) } : {}),
+          ...(row.birthday ? { birthday: row.birthday } : {}),
+          ...(row.anniversary ? { anniversary: row.anniversary } : {}),
           ...(row.city ? { city: row.city } : {}),
           ...(row.country ? { country: row.country } : {}),
+          ...(row.whatsapp_consent ? { whatsapp_consent: true } : {}),
+          ...(row.vvip ? { vvip: true } : {}),
         }));
       const res = await bulkCreateCustomers(payload);
       setBulkResult(res);
@@ -283,28 +317,45 @@ export default function Onboarding() {
           onClick={() => csvRef.current?.click()}
           className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
         >
-          <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => onBulkCsv(e.target.files?.[0])} />
+          <input ref={csvRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => { onBulkCsv(e.target.files?.[0]); e.target.value = ''; }} />
           <div className="text-2xl mb-2">📄</div>
           <div className="text-sm">Drag & drop a client CSV</div>
-          <div className="text-xs text-steel mt-1">Columns: Name, WhatsApp, Birthday, Anniversary, City, Country</div>
+          <div className="text-xs text-steel mt-1">Columns: Name, WhatsApp, Birthday, Anniversary, City, Country, Consent, VVIP · Dates as DD-MM-YYYY</div>
+          <div className="text-xs text-steel mt-1">Put Yes under Consent only if the client has agreed to receive WhatsApp messages.</div>
+          <button
+            type="button"
+            onClick={downloadSampleCsv}
+            className="mt-2 inline-flex items-center gap-2 text-[11px] tracking-luxe uppercase text-gold underline hover:text-ink transition-colors cursor-pointer"
+          >
+            Download sample CSV
+          </button>
         </div>
+
+        {checking && <div className="text-xs text-steel mt-3">Checking existing customers…</div>}
+        {!checking && bulkError && !csvPreview && <div className="text-red-600 text-xs mt-2">{bulkError}</div>}
 
         {csvPreview && (
           <div className="mt-4">
             <div className="text-sm mb-2">
-              <span className="text-gold font-medium">{csvPreview.toCreate} new customers</span>
-              {csvPreview.toSkip > 0 && <span className="text-steel"> · {csvPreview.toSkip} skipped as duplicates/invalid</span>}
+              <span className="text-gold font-medium">{csvPreview.toCreate} new · {csvPreview.toReactivate} to reactivate · {csvPreview.toSkip} skipped</span>
             </div>
             <div className="max-h-56 overflow-y-auto scroll-thin mb-3">
               <table className="tbl text-xs">
-                <thead><tr><th>Name</th><th>WhatsApp</th><th>Status</th></tr></thead>
+                <thead><tr><th>Name</th><th>WhatsApp</th><th>Consent</th><th>VVIP</th><th>Status</th></tr></thead>
                 <tbody>
                   {csvPreview.rows.map((row, i) => (
                     <tr key={i}>
                       <td>{row.name || '—'}</td>
                       <td>{row.whatsapp || '—'}</td>
-                      <td className={row.invalid || row.isDup ? 'text-steel' : 'text-gold'}>
-                        {row.invalid ? 'Invalid mobile' : row.isDup ? 'Duplicate' : 'Will be created'}
+                      <td>{row.whatsapp_consent ? 'Yes' : 'No'}</td>
+                      <td>{row.vvip ? 'Yes' : 'No'}</td>
+                      <td className={row.status === 'new' || row.status === 'reactivate' ? 'text-gold' : 'text-steel'}>
+                        {row.status === 'invalid'
+                          ? `Invalid: ${row.warnings.find((w) => w === 'Missing name' || w === 'Invalid mobile') || 'Invalid'}`
+                          : STATUS_LABEL[row.status] || row.status}
+                        {row.warnings.filter((w) => w !== 'Missing name' && w !== 'Invalid mobile').map((w) => (
+                          <div key={w} className="text-steel">{w}</div>
+                        ))}
                       </td>
                     </tr>
                   ))}
@@ -312,8 +363,8 @@ export default function Onboarding() {
               </table>
             </div>
             <div className="flex gap-2">
-              <button onClick={confirmBulkImport} className="btn-ink flex-1" disabled={bulkBusy || csvPreview.toCreate === 0}>
-                {bulkBusy ? 'Importing…' : `Confirm import (${csvPreview.toCreate})`}
+              <button onClick={confirmBulkImport} className="btn-ink flex-1" disabled={checking || bulkBusy || (csvPreview.toCreate + csvPreview.toReactivate) === 0}>
+                {bulkBusy ? 'Importing…' : `Confirm import (${csvPreview.toCreate + csvPreview.toReactivate})`}
               </button>
               <button onClick={() => setCsvPreview(null)} className="btn-ghost flex-1" disabled={bulkBusy}>Cancel</button>
             </div>
@@ -321,10 +372,30 @@ export default function Onboarding() {
           </div>
         )}
 
+        {bulkResult && bulkResult.ok === false && (
+          <div className="text-red-600 text-xs mt-2">
+            Import stopped: {bulkResult.error}. {bulkResult.partial?.createdCount || 0} customers were already created — importing the same file again is safe.
+          </div>
+        )}
+
         {bulkResult && (
           <div className="mt-4 text-sm border border-line bg-mist px-4 py-3">
-            <span className="text-gold font-medium">{bulkResult.createdCount} customers created</span>
-            {bulkResult.skippedCount > 0 && <span className="text-steel"> · {bulkResult.skippedCount} skipped</span>}
+            {(() => {
+              const r = bulkResult.ok === false ? bulkResult.partial : bulkResult;
+              const skippedList = r?.skipped || [];
+              return (
+                <>
+                  <span className="text-gold font-medium">{r?.createdCount || 0} created · {r?.reactivatedCount || 0} reactivated · {r?.skippedCount || 0} skipped</span>
+                  {skippedList.length > 0 && (
+                    <div className="text-xs text-steel mt-2">
+                      {skippedList.map((s, i) => (
+                        <div key={i}>{s.name || s.whatsapp || '—'} — {SKIP_REASON_TEXT[s.reason] || s.reason}</div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
       </section>
