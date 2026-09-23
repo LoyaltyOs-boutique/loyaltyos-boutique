@@ -161,7 +161,7 @@ export default function Campaigns() {
               <div>
                 <label className="label">Designer</label>
                 <select className="input" value={eventDesigner} onChange={(e) => setEventDesigner(e.target.value)}>
-                  <option value="">Select a designer…</option>
+                  <option value="">Select a lookbook…</option>
                   {eventDesignerLookbooks.map((lb) => <option key={lb._id} value={lb.name}>{lb.name}</option>)}
                 </select>
               </div>
