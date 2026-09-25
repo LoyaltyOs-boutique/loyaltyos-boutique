@@ -495,6 +495,45 @@ function merchantSessionArgs() {
   return { userId: convexUserId(session.id), token: session.token };
 }
 
+// Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+// decision 8 — copied verbatim from Customers.jsx's isSessionRejected (kept
+// byte-identical there, unchanged) so Lookbook Manager can detect the same
+// stale/rotated-token rejection without importing a page component.
+const SESSION_REJECTED_MESSAGES = ['Invalid session', 'Session expired', 'Not authenticated', 'Not authorized'];
+function isSessionRejectedError(err) {
+  const text = (typeof err?.data === 'string' ? err.data : '') || err?.message || '';
+  return SESSION_REJECTED_MESSAGES.some((m) => text.includes(m));
+}
+
+/**
+ * Turn any thrown/rejected error from a Lookbook Manager call into short,
+ * clean text safe to show a merchant — never the raw Convex wrapper text.
+ * Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+ * decision 8. Session-rejection case first (own fixed copy, no sign-out
+ * here — the caller decides); otherwise prefers the ConvexError payload
+ * (err.data), then a cleaned err.message with Convex's wrapper prefixes,
+ * request-id/caller trailer, and stack lines stripped — same idea as
+ * onboardCustomerRemote's catch handler above, extended to also strip the
+ * "Server Error" / request-id / call-site trailer text that handler skips.
+ */
+export function friendlyError(err) {
+  if (isSessionRejectedError(err)) {
+    return 'Your session has ended because this account signed in somewhere else. Please sign out and sign in again.';
+  }
+  if (typeof err?.data === 'string' && err.data.length > 0) {
+    return err.data;
+  }
+  const cleaned = String(err?.message || '')
+    .replace(/^\[CONVEX[^\]]*\]\s*/, '')
+    .replace(/\[Request ID:[^\]]*\]\s*/gi, '')
+    .replace(/Server Error\s*/i, '')
+    .replace(/(Uncaught ConvexError:\s*)+/gi, '')
+    .replace(/\s+at\s+\S+\s*\([^)]*\)[\s\S]*$/i, '')
+    .replace(/\s*Called by client.*$/is, '')
+    .trim();
+  return cleaned || 'Something went wrong — please try again.';
+}
+
 /**
  * Patch a customer's body-fit measurements on Convex (async).
  * Merchant Session Lock (Task 1, Step 9): convex/customers.ts's updateMeasurements
@@ -1232,12 +1271,29 @@ export function updateLookbook(id, patch) {
   return client.mutation(api.lookbooks.updateLookbook, { id, ...patch, ...session }).catch(() => null);
 }
 
-/** Delete lookbook + items on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
+/**
+ * Soft-delete lookbook + its pieces on Convex (async). MERCHANT-ONLY.
+ * Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+ * decision 7 — no optimistic local change; local state is only touched
+ * after the backend confirms. On success, the deleted lookbook's pieces are
+ * pruned from local state, the lookbook-selector cache is invalidated (so
+ * Campaigns/Templates re-fetch instead of reusing the stale list), and a
+ * fresh catalogue fetch is forced (bypassing hydrateCatalogue's in-flight
+ * guard — see its own comment) so the catalogue view stays correct even if the page's
+ * own mount-time hydrate was still running. On failure the promise rejects
+ * with the original error so the caller can show friendlyError(err).
+ */
 export function deleteLookbook(id) {
   const client = getConvex();
   const session = merchantSessionArgs();
-  if (!client || !session) return Promise.resolve(null);
-  return client.mutation(api.lookbooks.deleteLookbook, { id, ...session }).catch(() => null);
+  if (!client || !session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.mutation(api.lookbooks.deleteLookbook, { id, ...session }).then((res) => {
+    state.catalogueItems = state.catalogueItems.filter((i) => i.lookbook_id !== id);
+    selectorCache.lookbooksSelector = null;
+    emit();
+    hydrateCatalogue(true);
+    return res;
+  });
 }
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
@@ -1315,31 +1371,51 @@ export function updateCatalogueItem(id, patch) {
   return client.mutation(api.lookbooks.updateCatalogueItem, { id, ...p, ...session }).catch(() => null);
 }
 
-/** Delete item with optimistic update + Convex write-through (Step 6.2). MERCHANT-ONLY. */
+/**
+ * Delete item on Convex (async). MERCHANT-ONLY.
+ * Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+ * decision 9 — stays a permanent delete, unchanged, but a Convex-backed
+ * piece is now removed from local state only AFTER the backend confirms
+ * (previously removed on click regardless of whether the write actually
+ * succeeded, so an expired session silently left a ghost row that came
+ * back on the next refresh). A purely local/offline-only piece (never
+ * synced to Convex — no convexId) has nothing to await and is removed
+ * synchronously, same as before. Rejects on failure so the caller can show
+ * friendlyError(err) and leave the row in place.
+ */
 export function removeCatalogueItem(id) {
   const item = state.catalogueItems.find((i) => i.id === id);
   const convexId = item ? (item.convexId || (String(id).startsWith('it_') ? null : id)) : null;
 
-  // 1. Optimistic remove
-  state.catalogueItems = state.catalogueItems.filter((i) => i.id !== id);
-  emit();
-
-  // 2. Convex delete. Merchant Session Lock (Task 1, Step 9): skip silently
-  // (same as the pre-existing "offline" catch) when no merchant is logged in.
-  if (convexId) {
-    const client = getConvex();
-    const session = merchantSessionArgs();
-    if (client && session) {
-      client.mutation(api.lookbooks.deleteCatalogueItem, { id: convexId, ...session })
-        .catch(() => { /* offline */ });
-    }
+  if (!convexId) {
+    state.catalogueItems = state.catalogueItems.filter((i) => i.id !== id);
+    emit();
+    return Promise.resolve();
   }
+
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+
+  return client.mutation(api.lookbooks.deleteCatalogueItem, { id: convexId, ...session }).then(() => {
+    state.catalogueItems = state.catalogueItems.filter((i) => i.id !== id);
+    emit();
+  });
 }
 
-/** Background hydrate catalogue items from all lookbooks (Step 6.2). MERCHANT-ONLY. */
+/**
+ * Background hydrate catalogue items from all lookbooks (Step 6.2). MERCHANT-ONLY.
+ * `force` (design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+ * decision 7) — bypasses the in-flight guard below. Without it, a call that
+ * lands while another hydrate is already running is dropped entirely, which
+ * is fine for the module-load/mount-time callers (a later hydrate will
+ * eventually run) but not for the post-delete refresh, which must always
+ * start a fresh fetch. Every existing caller passes no argument, so `force`
+ * is undefined/falsy there and behavior is unchanged.
+ */
 let catalogueHydrating = false;
-export function hydrateCatalogue() {
-  if (catalogueHydrating) return;
+export function hydrateCatalogue(force) {
+  if (catalogueHydrating && !force) return;
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session) return;

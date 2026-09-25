@@ -1,5 +1,5 @@
 import { action, internalMutation, internalQuery, mutation, query, type QueryCtx } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { put } from "@vercel/blob";
 import { internal } from "./_generated/api";
@@ -25,13 +25,16 @@ export const LOOKBOOK_SOURCES = v.union(
 
 // --- HELPERS ---
 
-/** Aggregates catalogue items count for a lookbook. */
+/**
+ * Aggregates catalogue items count for a lookbook. Soft-deleted items excluded
+ * (design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md).
+ */
 async function getItemCount(ctx: QueryCtx, lookbookId: Id<"lookbooks">): Promise<number> {
   const items = await ctx.db
     .query("catalogue_items")
     .withIndex("by_lookbook", (q) => q.eq("lookbook_id", lookbookId))
     .collect();
-  return items.length;
+  return items.filter((i) => i.is_deleted !== true).length;
 }
 
 // --- PUBLIC API ---
@@ -42,8 +45,10 @@ export const getLookbooks = query({
   handler: async (ctx, { userId, token }) => {
     await requireMerchantSession(ctx, userId, token);
     const lookbooks = await ctx.db.query("lookbooks").order("desc").collect();
+    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2).
+    const active = lookbooks.filter((lb) => lb.is_deleted !== true);
     return await Promise.all(
-      lookbooks.map(async (lb) => ({
+      active.map(async (lb) => ({
         ...lb,
         item_count: await getItemCount(ctx, lb._id),
       }))
@@ -70,11 +75,14 @@ export const getLookbooksForSelector = query({
   handler: async (ctx, { userId, token }) => {
     await requireMerchantSession(ctx, userId, token);
     const lookbooks = await ctx.db.query("lookbooks").collect();
-    return lookbooks.map((lb) => ({
-      _id: lb._id,
-      name: lb.title,
-      kind: lb.kind,
-    }));
+    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2).
+    return lookbooks
+      .filter((lb) => lb.is_deleted !== true)
+      .map((lb) => ({
+        _id: lb._id,
+        name: lb.title,
+        kind: lb.kind,
+      }));
   },
 });
 
@@ -83,12 +91,15 @@ export const getLookbookById = query({
   args: { id: v.id("lookbooks") },
   handler: async (ctx, { id }) => {
     const lb = await ctx.db.get(id);
-    if (!lb) return null;
+    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2) —
+    // a deleted lookbook is null to every caller (public pages, OG middleware,
+    // merchant PDF preview), same as a genuinely missing id.
+    if (!lb || lb.is_deleted === true) return null;
     const items = await ctx.db
       .query("catalogue_items")
       .withIndex("by_lookbook", (q) => q.eq("lookbook_id", id))
       .collect();
-    return { ...lb, items };
+    return { ...lb, items: items.filter((i) => i.is_deleted !== true) };
   },
 });
 
@@ -164,12 +175,16 @@ export const getCustomerCatalogue = query({
       lookbook_id: Id<"lookbooks">;
     }> = [];
 
+    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2) —
+    // a deleted lookbook and its pieces must never reach a customer's feed.
     for (const lb of lookbooks) {
+      if (lb.is_deleted === true) continue;
       const items = await ctx.db
         .query("catalogue_items")
         .withIndex("by_lookbook", (q) => q.eq("lookbook_id", lb._id))
         .collect();
       for (const item of items) {
+        if (item.is_deleted === true) continue;
         allItems.push({
           id: item._id,
           convexId: item._id,
@@ -197,7 +212,8 @@ export const getCatalogueItemById = query({
   args: { id: v.id("catalogue_items") },
   handler: async (ctx, { id }) => {
     const item = await ctx.db.get(id);
-    if (!item) return null;
+    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2).
+    if (!item || item.is_deleted === true) return null;
     return item;
   },
 });
@@ -241,24 +257,43 @@ export const updateLookbook = mutation({
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
     await requireMerchantSession(ctx, userId, token);
+    // Reject edits to a soft-deleted lookbook (2026-09-25-lookbook-delete-design.md decision 3).
+    const existing = await ctx.db.get(id);
+    if (!existing || existing.is_deleted === true) {
+      throw new ConvexError("This lookbook has been deleted.");
+    }
     await ctx.db.patch(id, patch);
   },
 });
 
-/** Delete lookbook + items (cleanup). MERCHANT-ONLY. */
+/**
+ * Soft-delete lookbook + its pieces. MERCHANT-ONLY.
+ * Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+ * (decisions 1, 6) — idempotent: a missing or already-deleted lookbook
+ * returns { ok: true, alreadyDeleted: true, hiddenItems: 0 } instead of
+ * throwing, so a double-click/retry never surfaces an error. Nothing is
+ * removed from the database — is_deleted/deleted_at only — so a later
+ * archive/unarchive feature can restore by clearing these fields.
+ */
 export const deleteLookbook = mutation({
   args: { userId: v.id("users"), token: v.string(), id: v.id("lookbooks") },
   handler: async (ctx, { userId, token, id }) => {
     await requireMerchantSession(ctx, userId, token);
-    // Delete all items first
+    const lb = await ctx.db.get(id);
+    if (!lb || lb.is_deleted === true) {
+      return { ok: true, alreadyDeleted: true, hiddenItems: 0 };
+    }
+    const deletedAt = Date.now();
     const items = await ctx.db
       .query("catalogue_items")
       .withIndex("by_lookbook", (q) => q.eq("lookbook_id", id))
       .collect();
-    for (const item of items) {
-      await ctx.db.delete(item._id);
+    const activeItems = items.filter((i) => i.is_deleted !== true);
+    for (const item of activeItems) {
+      await ctx.db.patch(item._id, { is_deleted: true, deleted_at: deletedAt });
     }
-    await ctx.db.delete(id);
+    await ctx.db.patch(id, { is_deleted: true, deleted_at: deletedAt });
+    return { ok: true, alreadyDeleted: false, hiddenItems: activeItems.length };
   },
 });
 
@@ -275,6 +310,11 @@ export const addCatalogueItem = mutation({
   },
   handler: async (ctx, { userId, token, ...args }) => {
     await requireMerchantSession(ctx, userId, token);
+    // Reject adding into a soft-deleted lookbook (2026-09-25-lookbook-delete-design.md decision 3).
+    const lb = await ctx.db.get(args.lookbook_id);
+    if (!lb || lb.is_deleted === true) {
+      throw new ConvexError("This lookbook has been deleted.");
+    }
     return await ctx.db.insert("catalogue_items", args);
   },
 });
@@ -292,6 +332,11 @@ export const updateCatalogueItem = mutation({
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
     await requireMerchantSession(ctx, userId, token);
+    // Reject edits to a soft-deleted piece (2026-09-25-lookbook-delete-design.md decision 3).
+    const existing = await ctx.db.get(id);
+    if (!existing || existing.is_deleted === true) {
+      throw new ConvexError("This piece has been deleted.");
+    }
     await ctx.db.patch(id, patch);
   },
 });

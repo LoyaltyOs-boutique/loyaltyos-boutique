@@ -151,6 +151,12 @@ export default defineSchema({
     // lookbooks.generatePdfUploadUrl -> createPdfLookbook; catalogue/designer
     // lookbooks never set this field.
     pdf_url: v.optional(v.string()),
+    // Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+    // Soft-delete pair (decision 1) — missing/false = active, same optional-field
+    // pattern as users.is_deleted above. Kept so a later archive/unarchive
+    // feature can restore a lookbook by clearing both fields.
+    is_deleted: v.optional(v.boolean()),
+    deleted_at: v.optional(v.number()),
   }),
 
   /** PRD §6 Table `catalogue_items` — items inside a lookbook. */
@@ -162,6 +168,11 @@ export default defineSchema({
     instagram_link: v.optional(v.string()),
     size: v.optional(v.string()), // Gate 2 — e.g. "S", "M", "L", "Free Size"
     colour: v.optional(v.string()), // Gate 2 — e.g. "Ivory", "Blush"
+    // Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
+    // Soft-delete pair (decision 1) — set by deleteLookbook's cascade when the
+    // parent lookbook is deleted; missing/false = active.
+    is_deleted: v.optional(v.boolean()),
+    deleted_at: v.optional(v.number()),
   }).index("by_lookbook", ["lookbook_id"]),
 
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */

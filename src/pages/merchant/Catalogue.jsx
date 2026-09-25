@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia, hydrateCatalogue } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia, hydrateCatalogue, deleteLookbook, friendlyError } from '../../lib/db.js';
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty } from '../../components/ui.jsx';
@@ -47,6 +47,17 @@ export default function Catalogue() {
     const [pdfUrl, setPdfUrl] = useState(null);
     const csvRef = useRef(null);
     const pdfRef = useRef(null);
+
+    // Lookbook delete (design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md)
+    const [lbMenuOpen, setLbMenuOpen] = useState(false);
+    const [deleteConfirmFor, setDeleteConfirmFor] = useState(null); // lookbook _id showing the inline confirm, or null
+    const [deleting, setDeleting] = useState(false);
+    const deletingRef = useRef(false); // extra guard so a second click can never fire a second request, even before the `deleting` re-render lands
+    const [deleteMsg, setDeleteMsg] = useState('');
+    const [deleteErr, setDeleteErr] = useState('');
+    const [removingId, setRemovingId] = useState(null);
+    const [removeErrId, setRemoveErrId] = useState(null);
+    const [removeErrMsg, setRemoveErrMsg] = useState('');
 
     // Load lookbook/PDF options for the selector dropdown.
     useEffect(() => {
@@ -103,6 +114,64 @@ export default function Catalogue() {
     // Grid items: all when on "Current catalogue", else filtered to the chosen lookbook.
     const shownItems = isLookbookSelected ? items.filter((i) => i.lookbook_id === selected) : items;
 
+    // Delete is offered ONLY for a real designer/PDF lookbook document — never
+    // for "Current catalogue" (not a lookbook row at all — see addManual: a
+    // piece added there gets no lookbook_id) and never for a legacy row whose
+    // `kind` is "catalogue" or missing, even though designerLookbooks above
+    // (used for grouping the dropdown, unchanged) lumps those in with real
+    // designer lookbooks by only excluding kind "pdf".
+    const selectedOption = lookbookOptions.find((lb) => lb._id === selected);
+    const canDeleteSelected = !!selectedOption && (selectedOption.kind === 'designer' || selectedOption.kind === 'pdf');
+
+    const selectLookbook = (value) => {
+      setSelected(value);
+      setLbMenuOpen(false);
+      setDeleteConfirmFor(null);
+      setDeleteErr('');
+    };
+
+    const confirmLookbook = lookbookOptions.find((lb) => lb._id === deleteConfirmFor);
+    const confirmPieceCount = deleteConfirmFor ? items.filter((i) => i.lookbook_id === deleteConfirmFor).length : 0;
+    const confirmText = !confirmLookbook ? '' : confirmLookbook.kind === 'pdf'
+      ? `Delete PDF lookbook ${confirmLookbook.name}? It will be hidden everywhere.`
+      : `Delete ${confirmLookbook.name} and its ${confirmPieceCount} ${confirmPieceCount === 1 ? 'piece' : 'pieces'}? They will be hidden everywhere.`;
+
+    const cancelDeleteLookbook = () => { setDeleteConfirmFor(null); };
+
+    const confirmDeleteLookbook = async () => {
+      if (deletingRef.current) return;
+      deletingRef.current = true;
+      setDeleting(true);
+      setDeleteErr('');
+      const title = confirmLookbook ? confirmLookbook.name : 'Lookbook';
+      try {
+        await deleteLookbook(deleteConfirmFor);
+        setDeleteConfirmFor(null);
+        setSelected('all');
+        setDeleteMsg(`${title} deleted.`);
+        getLookbooksForSelector().then((rows) => { if (Array.isArray(rows)) setLookbookOptions(rows); });
+      } catch (err) {
+        setDeleteErr(friendlyError(err));
+      } finally {
+        deletingRef.current = false;
+        setDeleting(false);
+      }
+    };
+
+    const onRemove = async (item) => {
+      if (!confirm(`Remove "${item.title}" from the shared catalogue?`)) return;
+      setRemovingId(item.id);
+      setRemoveErrId(null);
+      try {
+        await removeCatalogueItem(item.id);
+      } catch (err) {
+        setRemoveErrId(item.id);
+        setRemoveErrMsg(friendlyError(err));
+      } finally {
+        setRemovingId(null);
+      }
+    };
+
   const addManual = async () => {
     if (!manual.title || !manual.price) return;
     // Step C — resolve which lookbook the piece is assigned to:
@@ -149,7 +218,7 @@ export default function Catalogue() {
         setMediaMsg('Upload failed — please try again.');
       }
     } catch (err) {
-      setMediaMsg(`Upload failed: ${err?.message || 'please try again.'}`);
+      setMediaMsg(friendlyError(err));
     } finally {
       setMediaUploading(false);
     }
@@ -205,7 +274,7 @@ export default function Catalogue() {
         setBulkMsg('PDF upload failed — please try again.');
       }
     } catch (err) {
-      setBulkMsg(`PDF upload failed: ${err?.message || 'please try again.'}`);
+      setBulkMsg(friendlyError(err));
     } finally {
       setPdfUploading(false);
       setPendingPdfFile(null);
@@ -349,14 +418,35 @@ export default function Catalogue() {
               <select
                 className="input !w-auto !py-1.5 text-xs"
                 value={selected}
-                onChange={(e) => setSelected(e.target.value)}
+                onChange={(e) => selectLookbook(e.target.value)}
               >
                 <option value="all">Current catalogue</option>
                 {designerLookbooks.map((lb) => <option key={lb._id} value={lb._id}>{lb.name}</option>)}
                 {pdfLookbooks.map((lb) => <option key={lb._id} value={lb._id}>{lb.name} (PDF)</option>)}
               </select>
-              {isLookbookSelected && (
+              {isLookbookSelected && !deleteConfirmFor && (
                 <div className="flex items-center gap-2">
+                  {canDeleteSelected && (
+                    <div className="relative shrink-0">
+                      <button
+                        onClick={() => setLbMenuOpen((v) => !v)}
+                        className="text-steel hover:text-ink px-1.5 leading-none text-sm"
+                        aria-label="Lookbook options"
+                      >
+                        ⋮
+                      </button>
+                      {lbMenuOpen && (
+                        <div className="absolute right-0 top-full mt-1 w-28 bg-white border border-line shadow-lg z-50">
+                          <button
+                            onClick={() => { setLbMenuOpen(false); setDeleteConfirmFor(selected); }}
+                            className="w-full text-left px-3 py-2 text-[11px] text-steel hover:text-ink hover:bg-mist"
+                          >
+                            Delete lookbook
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <button onClick={() => copyPublicLink(selected)} className="btn-ghost !py-1 !px-2 text-[9px]">
                     {copiedId === selected ? '✓ Copied' : '🔗 Copy Link'}
                   </button>
@@ -365,9 +455,20 @@ export default function Catalogue() {
                   </a>
                 </div>
               )}
+              {deleteConfirmFor && (
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-steel">{confirmText}</span>
+                  <button onClick={confirmDeleteLookbook} disabled={deleting} className="btn-ink !py-1 !px-2 text-[9px]">
+                    {deleting ? 'Deleting…' : 'Delete'}
+                  </button>
+                  <button onClick={cancelDeleteLookbook} disabled={deleting} className="btn-ghost !py-1 !px-2 text-[9px]">Cancel</button>
+                </div>
+              )}
             </div>
           }
         />
+        {deleteMsg && <div className="text-xs text-steel mt-2">{deleteMsg}</div>}
+        {deleteErr && <div className="text-xs text-gold mt-2">{deleteErr}</div>}
         {selectedPdf ? (
           pdfUrl ? (
             <iframe src={pdfUrl} className="w-full h-[600px]" title="PDF preview" />
@@ -388,10 +489,11 @@ export default function Catalogue() {
                   <div className="text-sm font-medium truncate">{i.title}</div>
                   <div className="flex items-center justify-between mt-2">
                     <span className="text-sm">{i.price ? inr(i.price) : 'IG · shoppable'}</span>
-                    <button onClick={() => { if (confirm(`Remove "${i.title}" from the shared catalogue?`)) removeCatalogueItem(i.id); }} className="btn-ghost !py-1 !px-3 text-[9px]">
-                      Remove
+                    <button onClick={() => onRemove(i)} disabled={removingId === i.id} className="btn-ghost !py-1 !px-3 text-[9px]">
+                      {removingId === i.id ? 'Removing…' : 'Remove'}
                     </button>
                   </div>
+                  {removeErrId === i.id && <div className="text-xs text-gold mt-2">{removeErrMsg}</div>}
                   <div className="flex items-center gap-2 mt-3">
                     <button onClick={() => copyPieceLink(i.id)} className="btn-ghost !py-1 !px-2 text-[9px] flex-1">
                       {copiedId === i.id ? '✓ Copied' : '🔗 Copy Link'}
