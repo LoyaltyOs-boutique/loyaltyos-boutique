@@ -16,6 +16,7 @@ import { buildSeed } from '../data/seed.js';
 // hit the live backend (pleasant-cobra-560) while the UI stays synchronous.
 import { ConvexReactClient } from 'convex/react';
 import { api } from '../../convex/_generated/api.js';
+import { chunk } from './csvImport.js';
 
 const KEY = 'loyaltyos85_v2';
 const SEED_VERSION = 2;
@@ -305,12 +306,153 @@ function refreshFromConvexSheet(doc) {
   return doc;
 }
 
+/**
+ * Scaling Fix 1 frontend wiring (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md):
+ * server-side cursor pagination for the Customers.jsx default "all clients,
+ * A-Z" view, via getCustomersPaginated (convex/customers.ts) instead of
+ * hydrateCustomers()'s full unpaginated pull.
+ *
+ * Convex's .paginate() is cursor-based, not offset/page-number based — there
+ * is no "give me page 3 directly" call, only "give me the page that follows
+ * THIS cursor". Customers.jsx's Prev/Next footer never jumps to an arbitrary
+ * page though, so a small forward-only cursor cache is enough: cursors[i] is
+ * the cursor that PRODUCES page i (cursors[0] is always null — Convex's
+ * "start from the beginning" cursor), filled in lazily as the merchant pages
+ * forward for the first time. Paging Prev never needs a network call — the
+ * cursor for a previously-visited page index is already cached.
+ *
+ * This cache is a separate, ephemeral, UI-driven module singleton — NOT part
+ * of the persisted `state` object (unlike state.users) — a page reload always
+ * starts back at page 0, same as the existing `page` useState in Customers.jsx
+ * already resets on remount.
+ */
+// Shared page size for the paginated Customers.jsx default view. Kept EQUAL to
+// `const PAGE = 6` in src/pages/merchant/Customers.jsx:22 — the two must stay in
+// sync (they page the same cursor cache). Defined here (an allowed data-layer
+// file) rather than imported from the protected page so hydrateAllMerchantData()
+// can warm page 0 without editing Customers.jsx.
+const CUSTOMERS_PAGE_SIZE = 6;
+
+const paginatedCustomers = {
+  cursors: [null], // cursors[i] = the Convex cursor that fetches page i; index 0 always starts fresh
+  rowsByPage: new Map(), // pageIndex -> merchant-shaped customer rows (already run through toLocalCustomer via mergeConvexCustomer)
+  isDoneByPage: new Map(), // pageIndex -> true once that page's fetch reports isDone (no further pages exist)
+  fetchingPage: null, // pageIndex currently in flight, or null — guards duplicate concurrent fetches
+};
+
+/**
+ * Fetch one page (0-indexed) of the A-Z customer list from Convex and merge
+ * the rows into shared state, same background-hydrate + emit() pattern as
+ * hydrateCustomers() above. Components read the result via
+ * customersPage(pageIndex) below, which stays synchronous like every other
+ * getter in this file — this function only fires the fetch and updates the
+ * cache; re-render happens through the normal subscribe()/emit() flow.
+ *
+ * Self-guards against overlapping concurrent calls (e.g. the merchant
+ * clicking Next twice fast) via `fetchingPage` — a second call for a
+ * DIFFERENT page while one is in flight still queues normally since each
+ * call only checks/sets its own page's fetch state below.
+ */
+export function hydrateCustomersPage(pageIndex, pageSize) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  // Already have this page cached — nothing to fetch (Prev after a prior Next
+  // reads straight from cache, no network round-trip).
+  if (paginatedCustomers.rowsByPage.has(pageIndex)) return;
+  // The cursor that produces this page isn't known yet (merchant jumped ahead
+  // of a page that hasn't loaded) — cannot fetch out of sequence with a pure
+  // forward cursor cache; Customers.jsx only ever asks for page-1-past-the-
+  // furthest-loaded-so-far via Next, so this should not normally trigger.
+  if (paginatedCustomers.cursors[pageIndex] === undefined) return;
+  if (paginatedCustomers.fetchingPage === pageIndex) return;
+
+  paginatedCustomers.fetchingPage = pageIndex;
+  client.query(api.customers.getCustomersPaginated, {
+    paginationOpts: { numItems: pageSize, cursor: paginatedCustomers.cursors[pageIndex] },
+    ...session,
+  })
+    .then((result) => {
+      paginatedCustomers.fetchingPage = null;
+      if (!result || !Array.isArray(result.page)) return;
+      // Merge each row into the shared state.users array (silent — one emit
+      // at the end) so every other reader of customers()/state.users stays in
+      // sync, exactly like hydrateCustomers()'s full-list merge above.
+      for (const c of result.page) mergeConvexCustomer(c, true);
+      paginatedCustomers.rowsByPage.set(pageIndex, result.page.map((c) => c.id));
+      paginatedCustomers.isDoneByPage.set(pageIndex, result.isDone);
+      if (!result.isDone) paginatedCustomers.cursors[pageIndex + 1] = result.continueCursor;
+      emit();
+    })
+    .catch(() => { paginatedCustomers.fetchingPage = null; /* offline — page stays unloaded, caller keeps showing nothing new */ });
+}
+
+/**
+ * Synchronous reader for one cached paginated page — mirrors customers()'s
+ * synchronous contract. Returns { rows, isDone, loaded } where `rows` are the
+ * full local customer objects (looked up live from state.users by id, so
+ * edits made elsewhere — e.g. the profile modal's Save — are reflected
+ * immediately without needing to re-fetch this page), `isDone` is whether
+ * this is the last page (Convex's isDone flag, undefined = not yet known),
+ * and `loaded` is false until hydrateCustomersPage(pageIndex, …) resolves at
+ * least once for this index.
+ */
+export function customersPage(pageIndex) {
+  const ids = paginatedCustomers.rowsByPage.get(pageIndex);
+  if (!ids) return { rows: [], isDone: paginatedCustomers.isDoneByPage.get(pageIndex), loaded: false };
+  const byId = new Map(state.users.map((u) => [u.id, u]));
+  return {
+    rows: ids.map((id) => byId.get(id)).filter(Boolean),
+    isDone: paginatedCustomers.isDoneByPage.get(pageIndex),
+    loaded: true,
+  };
+}
+
+/**
+ * Reset the paginated-page cache back to page 0 — called by Customers.jsx
+ * whenever it switches INTO the default paginated view (mount, or coming
+ * back from a search/filter that was using the full unpaginated list). The
+ * cursor chain is only valid for a fixed page size and a stable underlying
+ * A-Z ordering; starting over is simplest and matches the page-reset-to-0
+ * behavior already required at every mode switch.
+ */
+export function resetCustomersPageCache() {
+  paginatedCustomers.cursors = [null];
+  paginatedCustomers.rowsByPage.clear();
+  paginatedCustomers.isDoneByPage.clear();
+  paginatedCustomers.fetchingPage = null;
+}
+
+/**
+ * Shared, session-warmed cache for the two dropdown bridges that fetch fresh
+ * per call into component-local useState and read no other shared state
+ * (Templates.jsx's getCustomers(), Campaigns.jsx's getLookbooksForSelector()).
+ *
+ * Root cause of the reload/new-tab "empty dropdown" bug: those two pages' mount
+ * effects run BEFORE the persisted session is resolvable, so their one-shot
+ * fetch returns [] and never retries. hydrateAllMerchantData() (fired from
+ * Shell.jsx once a valid session exists) populates this cache; the two bridges
+ * below then return the warmed array instead of a cold []. Falls back to a
+ * fresh fetch whenever the cache is still empty, so behavior is unchanged when
+ * the warm-up hasn't run yet (e.g. direct call before Shell mounts).
+ */
+const selectorCache = {
+  customers: null, // last successful getCustomers() result (array) or null = not yet warmed
+  lookbooksSelector: null, // last successful getLookbooksForSelector() result (array) or null
+};
+
 /** Full customer list from Convex (async). Falls back to [] when offline/error/no session. */
 export function getCustomers() {
+  if (Array.isArray(selectorCache.customers)) return Promise.resolve(selectorCache.customers);
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session) return Promise.resolve([]);
-  return client.query(api.customers.getCustomers, session).catch(() => []);
+  return client.query(api.customers.getCustomers, session)
+    .then((rows) => {
+      if (Array.isArray(rows)) selectorCache.customers = rows;
+      return Array.isArray(rows) ? rows : [];
+    })
+    .catch(() => []);
 }
 
 /** Full customer profile by Convex id (async). Falls back to null when offline/error/no session. */
@@ -413,6 +555,158 @@ export function getUpcomingAnniversaries(days) {
 }
 
 /**
+ * Fetch a customer's current pending AI-generated WhatsApp draft for one
+ * occasion (birthday/anniversary), if the daily drafts cron has already
+ * produced one for today's occasion_date — see convex/customers.ts's
+ * getDraftForCustomer (requireMerchantSession-gated, read-path-only).
+ * Best-effort preview lookup, same resolve-to-null-on-any-failure shape as
+ * getUpcomingBirthdays/getUpcomingAnniversaries above (never throws into the
+ * caller) — a missing/failed draft lookup must fall back to the existing
+ * fixed-text preview, not surface as an error.
+ * occasionDate must be the raw "M-D" string (e.g. "8-27"), matching the
+ * customer.birthday/customer.anniversary field convention already used by
+ * recordMessageAction's callers — not the human-readable parseMD() display format.
+ */
+export function fetchCustomerDraft(customerId, occasion, occasionDate) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session || !occasionDate) return Promise.resolve(null);
+  return client.query(api.customers.getDraftForCustomer, {
+    customerId: convexUserId(customerId),
+    occasion,
+    occasionDate,
+    ...session,
+  }).catch(() => null);
+}
+
+/**
+ * On-demand AI WhatsApp draft generation, WITH server-side caching (async).
+ * MERCHANT-ONLY. See convex/ai.ts's generateMessageDraftPublic — the first
+ * call for a given (customerId, occasion, occasionDate) tuple triggers one
+ * real Gemini call and caches the result into the SAME ai_message_drafts
+ * table the old nightly cron wrote to; every subsequent call for that exact
+ * tuple returns the cached row instantly with zero Gemini calls. This fixes
+ * the real gap in fetchCustomerDraft above (a read-only lookup of whatever
+ * the nightly cron already produced): a customer created/updated AFTER the
+ * cron already ran would never get a draft until the next night — this call
+ * generates one immediately instead.
+ *
+ * occasionDate must be the raw "M-D" string (e.g. "8-27"), same convention
+ * fetchCustomerDraft/recordMessageAction already use — not the
+ * human-readable parseMD() display format.
+ *
+ * ERROR-HANDLING SHAPE — resolves to null on ANY failure (network error,
+ * missing session, Gemini failure, etc.), deliberately matching
+ * fetchCustomerDraft's resolve-to-null shape above rather than propagating a
+ * real error like sendWhatsAppTemplateMessage does. Reasoning: unlike a send
+ * action (where a swallowed error would hide a real failed WhatsApp send from
+ * the merchant), this call only ever feeds the ApprovalModal's PREVIEW text —
+ * the modal already has a well-established, always-correct fallback (today's
+ * fixed-template text) for exactly this "no AI draft available" case. Every
+ * other AI-drafting path in this codebase (fetchCustomerDraft here,
+ * generateEventDraftRemote below) already resolves to null on failure for
+ * the same reason — staying consistent with that established fail-gracefully
+ * posture is more valuable here than surfacing a raw error the modal has no
+ * specific UI for anyway.
+ */
+export async function generateMessageDraftRemote(customerId, customerName, tier, occasion, occasionDate, forceRegenerate = false) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session || !occasionDate) return null;
+  try {
+    return await client.action(api.ai.generateMessageDraftPublic, {
+      customerId: convexUserId(customerId),
+      customerName,
+      tier,
+      occasion,
+      occasionDate,
+      // Default false keeps every existing caller (e.g. Customers.jsx's
+      // ApprovalModal) cache-first and behaviorally unchanged. Templates.jsx's
+      // Regenerate control passes true to force a fresh, cache-overwriting draft.
+      forceRegenerate,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * generateMessageDraftManualRemote — 2026-09-14 bridge for Templates.jsx's
+ * MANUAL customer-entry path (a typed-in name with no users row, so no
+ * customerId/tier/occasionDate). Forwards to api.ai.generateMessageDraftManual,
+ * which runs a live, uncached Gemini call each time (tier hardcoded "silver"
+ * server-side). EXACT same fail-gracefully shape as generateMessageDraftRemote
+ * above: resolves null on missing client/session or any thrown error, so the
+ * caller falls back to the static template text — never throws.
+ */
+export async function generateMessageDraftManualRemote(customerName, occasion) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.ai.generateMessageDraftManual, {
+      customerName,
+      occasion,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * generateCombinedMessageDraftRemote — 2026-09-18 bridge for the
+ * Combined-Occasion AI Draft feature (docs/superpowers/specs/2026-09-18-combined-occasion-ai-draft-design.md).
+ * Mirrors generateMessageDraftRemote's exact shape/error-handling above —
+ * resolves to null on ANY failure (missing client/session, or a thrown
+ * error), NEVER throws, so the caller (Customers.jsx's ApprovalModal
+ * combined path) can fall back to its own fixed combined-template text. No
+ * occasion/occasionDate args — see convex/ai.ts's generateCombinedMessageDraftPublic
+ * doc comment for why this call is always live/uncached.
+ */
+export async function generateCombinedMessageDraftRemote(customerId, customerName, tier) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.ai.generateCombinedMessageDraftPublic, {
+      customerName,
+      tier,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * generateActivitySummaryRemote — 2026-09-09 addition, bridge for on-demand
+ * per-customer AI activity-summary generation (24h server-side cache) —
+ * triggered from Shell.jsx's NotificationBell when the merchant clicks a
+ * "weekly activity" bell notification. EXACT same bridge shape as
+ * generateMessageDraftRemote above (resolve-to-null on ANY failure — offline,
+ * missing session, or a genuine Gemini failure — never throws, since this
+ * only ever feeds a popup with an established "no summary yet" fallback, not
+ * a user-initiated send action that needs a surfaced error).
+ */
+export async function generateActivitySummaryRemote(customerId, customerName, tier) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.ai.generateActivitySummaryPublic, {
+      customerId: convexUserId(customerId),
+      customerName,
+      tier,
+      ...session,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Record an admin decision (Approve & Send → "sent", Cancel → "cancelled")
  * for one customer's birthday/anniversary occasion on a specific occasion_date
  * ("M-D" string, e.g. "8-27") — see docs/superpowers/specs/2026-08-26-message-action-tracking-design.md.
@@ -436,6 +730,19 @@ export function recordMessageAction(customer_id, occasion, occasion_date, action
     action,
     ...(channel ? { channel } : {}),
     ...session,
+  }).then((result) => {
+    // 2026-09-22 additive fix (Send All design spec, point 7): the individual
+    // Approve & Send / Cancel flow never showed up in Recent Activity before
+    // — this is the ONLY change to this function, a local-activity pushEvent
+    // call after the mutation already resolved successfully. Does not alter
+    // the resolved value, does not touch error handling above.
+    const customer = customerById(customer_id);
+    if (customer) {
+      const actionLabel = action === 'sent' ? 'wish sent' : action === 'link_opened' ? 'wish opened in WhatsApp' : action === 'cancelled' ? 'wish cancelled' : action;
+      pushEvent(customer.id, 'message_action', `${customer.name}'s ${occasion} ${actionLabel}`);
+      emit();
+    }
+    return result;
   });
 }
 
@@ -545,30 +852,96 @@ export function hydratePointsHistory(userId) {
  * `finally` with no `catch` in the component, leaving the merchant with no
  * error message and a reset button.
  *
- * Fix: route the call through this bridge, following the SAME
- * propagate-real-errors contract as awardPoints above (no swallowing
- * .catch) — bulkCreateCustomers returns a plain
- * { created, skipped, createdCount, skippedCount } object (no `ok` field,
- * confirmed from convex/customers.ts), so there is no success/failure flag
- * to branch on here; a thrown rejection (offline / not logged in / a real
- * Convex error) is the only failure signal, and the caller's try/catch
- * shows it to the merchant.
- *
- * On success, calls hydrateCustomers() (same background-refresh mechanism
- * used elsewhere) so the local customers() cache — used by the CSV preview's
- * duplicate-mobile detection for the NEXT import in the same session —
- * includes the customers just created.
+ * 2026-09-23 CSV bulk onboarding design — the backend now accepts at most
+ * 100 rows per call, so this bridge splits `rows` into chunks of 100 and
+ * calls the mutation SEQUENTIALLY (never in parallel), aggregating
+ * created/reactivated/skipped across every chunk. The "offline" and "not
+ * logged in" checks still happen up front, before any network call. If a
+ * chunk throws, hydrateCustomers() still runs (so the CRM reflects whatever
+ * WAS created before the failure) and the function resolves — it does NOT
+ * reject — with { ok: false, error, partial }, so the caller can show the
+ * partial-progress message from the design spec ("N customers were already
+ * created — importing the same file again is safe"). On full success it
+ * resolves { ok: true, ...aggregatedResults }.
  */
 export function bulkCreateCustomers(rows) {
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
   if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
-  return client.mutation(api.customers.bulkCreateCustomers, { rows, ...session })
-    .then((res) => {
-      hydrateCustomers();
-      return res;
-    });
+
+  const chunks = chunk(rows, 100);
+  const created = [];
+  const reactivated = [];
+  const skipped = [];
+
+  const runChunks = async () => {
+    for (const part of chunks) {
+      let res;
+      try {
+        res = await client.mutation(api.customers.bulkCreateCustomers, { rows: part, ...session });
+      } catch (err) {
+        hydrateCustomers();
+        return {
+          ok: false,
+          error: err?.message || 'Import failed — please try again.',
+          partial: {
+            created, reactivated, skipped,
+            createdCount: created.length, reactivatedCount: reactivated.length, skippedCount: skipped.length,
+          },
+        };
+      }
+      created.push(...(res.created || []));
+      reactivated.push(...(res.reactivated || []));
+      skipped.push(...(res.skipped || []));
+    }
+    hydrateCustomers();
+    return {
+      ok: true,
+      created, reactivated, skipped,
+      createdCount: created.length, reactivatedCount: reactivated.length, skippedCount: skipped.length,
+    };
+  };
+
+  return runChunks();
+}
+
+/**
+ * 2026-09-23 CSV bulk onboarding amendment — checkMobilesStatus bridge.
+ *
+ * The CSV preview used to trust the browser's local customer list to decide
+ * "Already a customer" — but that list never drops a customer soft-deleted
+ * elsewhere, so a mobile eligible for reactivation always showed as "Already
+ * a customer" and the backend's (already correct) reactivation branch in
+ * bulkCreateCustomers was unreachable from the real UI. This bridge instead
+ * asks convex/customers.ts's checkMobilesStatus for real-time status.
+ *
+ * Same up-front offline/not-logged-in rejections as bulkCreateCustomers
+ * above. checkMobilesStatus accepts at most 500 mobiles per call, so this
+ * splits `mobiles` into chunks of 500 with the same chunk() helper and calls
+ * the query SEQUENTIALLY per chunk, merging every chunk's active/deleted
+ * lists into one combined { active: Set, deleted: Set }.
+ *
+ * Unlike bulkCreateCustomers's never-throw/partial-result contract, this
+ * bridge THROWS on any chunk failure — the CSV preview has no meaningful
+ * partial state to show (it hasn't imported anything yet), so the caller
+ * needs a real error to display "could not check" instead of silently
+ * building a preview off incomplete/wrong data.
+ */
+export async function checkMobilesStatusRemote(mobiles) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) throw new Error('Offline — Convex is not connected.');
+  if (!session) throw new Error('Not logged in — please sign in again.');
+
+  const active = new Set();
+  const deleted = new Set();
+  for (const part of chunk(mobiles, 500)) {
+    const res = await client.query(api.customers.checkMobilesStatus, { mobiles: part, ...session });
+    for (const m of res?.active || []) active.add(m);
+    for (const m of res?.deleted || []) deleted.add(m);
+  }
+  return { active, deleted };
 }
 
 /* ---------- Catalogue → Convex bridge (Step 6.2, PRD Module 2) ---------- */
@@ -600,10 +973,16 @@ export function getLookbookById(id) {
 
 /** Lookbook list for the Catalogue selector dropdown (async). Returns [{_id, name, kind}]. MERCHANT-ONLY. */
 export function getLookbooksForSelector() {
+  if (Array.isArray(selectorCache.lookbooksSelector)) return Promise.resolve(selectorCache.lookbooksSelector);
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session) return Promise.resolve([]);
-  return client.query(api.lookbooks.getLookbooksForSelector, session).catch(() => []);
+  return client.query(api.lookbooks.getLookbooksForSelector, session)
+    .then((rows) => {
+      if (Array.isArray(rows)) selectorCache.lookbooksSelector = rows;
+      return Array.isArray(rows) ? rows : [];
+    })
+    .catch(() => []);
 }
 
 /**
@@ -760,6 +1139,60 @@ export function sendWhatsAppServiceMessage(to, type, text, imageUrl) {
 }
 
 /**
+ * sendAllUpcomingOccasionMessagesRemote — 2026-09-22 bridge for the "Send
+ * All" bulk AI-drafted WhatsApp outreach feature (Birthdays/Anniversaries
+ * tomorrow tabs). See docs/superpowers/specs/2026-09-22-send-all-bulk-whatsapp-design.md
+ * and convex/whatsapp.ts's sendAllUpcomingOccasionMessages for the full
+ * design/implementation.
+ *
+ * Same null-on-failure, never-throw bridge shape as generateMessageDraftRemote/
+ * generateCombinedMessageDraftRemote above (NOT the propagate-real-errors
+ * shape sendWhatsAppTemplateMessage/recordMessageAction use) — the confirmation
+ * modal this feeds needs a single "something went wrong, nothing was sent"
+ * fallback rather than a thrown error, since a genuinely partial-send state is
+ * already fully described by the resolved `results` array on success.
+ *
+ * Today (no Meta-approved template configured yet, D-17) this always
+ * resolves to `{ ok:false, reason:'no_template', sent:0, skipped:0, failed:0,
+ * results:[] }` — see the Convex action's own doc comment for why that is the
+ * ONLY reachable path right now, and is not an error state.
+ *
+ * Design spec point 6: on a real send completing (future state, once a
+ * template exists), loop through the returned results and call the existing
+ * LOCAL pushEvent() helper once per successful send, so Send All sends
+ * appear in this merchant browser's Recent Activity exactly like every other
+ * locally-tracked action today. pushEvent is a private module-scoped helper
+ * (never exported — see its definition near the top of this file), so that
+ * loop lives HERE rather than in the calling component, which has no access
+ * to it.
+ */
+export async function sendAllUpcomingOccasionMessagesRemote() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    const res = await client.action(api.whatsapp.sendAllUpcomingOccasionMessages, { ...session });
+    if (res?.ok && Array.isArray(res.results)) {
+      let pushed = false;
+      res.results.forEach((r) => {
+        if (r.status === 'sent') {
+          // Resolve the Convex _id back to the local slug-style id so this
+          // event groups under the real customer row, same key every other
+          // pushEvent call site in this file uses.
+          const local = state.users.find((u) => u.convexId === r.customerId || u.id === r.customerId);
+          pushEvent(local ? local.id : r.customerId, 'message_action', `${r.name}'s ${r.occasion} wish sent (Send All)`);
+          pushed = true;
+        }
+      });
+      if (pushed) emit();
+    }
+    return res;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch a single catalogue piece by its Convex id (async). PUBLIC — called
  * from PublicPiece.jsx with NO merchant logged in, so this must never
  * require a session.
@@ -809,6 +1242,18 @@ export function deleteLookbook(id) {
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
 export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id }) {
+  // 0. Guard the missing-session case BEFORE the optimistic write. When a Convex
+  // client exists but there is no merchant session, the item would otherwise be
+  // added to the local UI and silently never persist — it vanishes on the next
+  // hydrate with no error. Surface a clear error instead so nothing is lost.
+  // (When client is null — pure offline/demo — we intentionally fall through to
+  // local-only, same as every other bridge in this file.)
+  const client = getConvex();
+  const addSession = merchantSessionArgs();
+  if (client && !addSession) {
+    return { ok: false, error: 'Your session has expired — please refresh and log in again to add items.' };
+  }
+
   // 1. Optimistic update (INR price for local UI)
   const item = {
     id: uid('it'),
@@ -831,8 +1276,7 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
   // merchant's session; skip the write-through entirely (keep the local
   // optimistic item) when no merchant is logged in, same as every other
   // "no session → stay on local/offline state" bridge in this file.
-  const client = getConvex();
-  const addSession = merchantSessionArgs();
+  // (client/addSession resolved above, before the optimistic write.)
   if (client && addSession) {
     // If no lookbook_id provided, we try to find one or ignore (PRD says item must have lookbook)
     // For the demo / standalone catalogue, we expect the caller to provide it or the first lookbook.
@@ -932,6 +1376,54 @@ export function hydrateCatalogue() {
     .catch(() => { catalogueHydrating = false; });
 }
 
+// Customer-side catalogue hydration (parallel/additive to hydrateCatalogue()
+// above, which is merchant-session-gated and can never succeed in a real
+// customer's browser). A customer authenticates via magic link (id + token),
+// not a merchant session, so this bridge calls the dedicated
+// getCustomerCatalogue query (already validates the magic link server-side)
+// and maps the result onto the same catalogue-item shape the rest of the app
+// expects (handle/likes/likedBy are client-only derived fields, matching the
+// hydrateCatalogue() convention above).
+let customerCatalogueHydrating = false;
+// `onSettled` (optional — outcome-reporting contract, 2026-09-19 permanent
+// staleness fix; see docs/superpowers/specs/2026-09-19-lookbook-staleness-
+// permanent-fix-design.md). Previously this was a bare no-arg callback that
+// fired identically on success AND every failure branch, so Lookbook.jsx's
+// boolean `catalogueReady` gate could never distinguish "real data loaded"
+// from "fetch silently failed, still showing stale/seed data". Now it
+// always fires with a result object so the caller can react correctly:
+//   { ok: true }                          — genuine success, items.length > 0
+//   { ok: false, reason: 'empty' }        — genuine success, but the
+//                                            merchant simply has 0 items
+//                                            (NOT an error — see Lookbook.jsx)
+//   { ok: false, reason: 'no-client' }    — Convex client not available
+//   { ok: false, reason: 'no-array' }     — response wasn't an array (e.g.
+//                                            an auth failure returning null)
+//   { ok: false, reason: 'error' }        — fetch threw/rejected
+export function hydrateCustomerCatalogue(id, token, onSettled) {
+  if (customerCatalogueHydrating) return;
+  const client = getConvex();
+  if (!client) { if (onSettled) onSettled({ ok: false, reason: 'no-client' }); return; }
+  customerCatalogueHydrating = true;
+
+  client.query(api.lookbooks.getCustomerCatalogue, { id, token })
+    .then((items) => {
+      customerCatalogueHydrating = false;
+      if (!Array.isArray(items)) { if (onSettled) onSettled({ ok: false, reason: 'no-array' }); return; }
+      if (items.length === 0) { if (onSettled) onSettled({ ok: false, reason: 'empty' }); return; }
+      const mappedItems = items.map((i) => ({
+        ...i,
+        handle: i.id.toLowerCase(),
+        likes: 0,
+        likedBy: [], // per-customer like toggle state (see likeItem())
+      }));
+      state.catalogueItems = mappedItems;
+      emit();
+      if (onSettled) onSettled({ ok: true });
+    })
+    .catch(() => { customerCatalogueHydrating = false; if (onSettled) onSettled({ ok: false, reason: 'error' }); });
+}
+
 /* ---------- Customer actions ---------- */
 // Like/unlike TOGGLE (bug fix — 2026-09-02): previously this was a bare
 // counter increment with no per-customer uniqueness, so N clicks by the SAME
@@ -956,6 +1448,9 @@ export function likeItem(userId, itemId) {
   if (alreadyLiked) {
     // Unlike: remove this customer, decrement counter. No new feed event —
     // removing a like is not something the merchant needs to be notified of.
+    // Customer Activity Intelligence (Part 1): matching that same "unlike is
+    // a state change, not an activity" reasoning, no trackActivity row is
+    // written on this branch either — see design doc §b.1.
     item.likedBy = item.likedBy.filter((id) => id !== userId);
     item.likes = Math.max(0, (item.likes || 0) - 1);
   } else {
@@ -965,6 +1460,70 @@ export function likeItem(userId, itemId) {
     pushEvent(userId, 'like', `${user.name} liked ${item.title} ♥`);
   }
   emit();
+
+  // Customer Activity Intelligence (Part 1, design doc §b.1): fire a
+  // fire-and-forget Convex tracking write on the genuine first-like branch
+  // ONLY — never blocks/delays the local toggle above (already committed via
+  // emit()), and any failure is fully swallowed so it can never surface to
+  // the customer. Requires a real Convex customer id (the customer's own
+  // browser has no merchant session — see activity.ts's auth note).
+  if (!alreadyLiked) {
+    const client = getConvex();
+    const customerConvexId = user.convexId || (user._isConvex ? user.id : null);
+    const itemConvexId = item.convexId || (item._isConvex ? item.id : null);
+    if (client && customerConvexId) {
+      try {
+        client.mutation(api.activity.trackActivity, {
+          customerId: customerConvexId,
+          action: 'like',
+          ...(itemConvexId ? { catalogueItemId: itemConvexId } : {}),
+        }).catch(() => { /* tracking failure must never surface to the customer */ });
+      } catch { /* same */ }
+    }
+  }
+}
+
+/**
+ * Customer Activity Intelligence (Part 1, design doc §b.1) — fire-and-forget
+ * cart_add tracking, called from Lookbook.jsx's existing addToCart handler
+ * alongside (never instead of, never gating) its own setCart(...) call. The
+ * cart itself stays a plain useState — this is strictly an additive tracking
+ * side-effect, matching the design doc's explicit "not Option A" decision.
+ */
+export function trackCartAdd(userId, itemId) {
+  const client = getConvex();
+  const user = state.users.find((u) => u.id === userId);
+  const item = state.catalogueItems.find((i) => i.id === itemId);
+  const customerConvexId = user && (user.convexId || (user._isConvex ? user.id : null));
+  const itemConvexId = item && (item.convexId || (item._isConvex ? item.id : null));
+  if (!client || !customerConvexId) return;
+  try {
+    client.mutation(api.activity.trackActivity, {
+      customerId: customerConvexId,
+      action: 'cart_add',
+      ...(itemConvexId ? { catalogueItemId: itemConvexId } : {}),
+    }).catch(() => { /* tracking failure must never surface to the customer */ });
+  } catch { /* same */ }
+}
+
+/**
+ * Customer Activity Intelligence (Part 1, design doc §b.2) — fire-and-forget
+ * lookbook_view tracking, called once from a mount-only effect on the
+ * customer's personal lookbook page (Lookbook.jsx). `lookbookId` is optional
+ * (a whole-catalogue view has no single lookbook to attribute to).
+ */
+export function trackLookbookView(userId, lookbookId) {
+  const client = getConvex();
+  const user = state.users.find((u) => u.id === userId);
+  const customerConvexId = user && (user.convexId || (user._isConvex ? user.id : null));
+  if (!client || !customerConvexId) return;
+  try {
+    client.mutation(api.activity.trackActivity, {
+      customerId: customerConvexId,
+      action: 'lookbook_view',
+      ...(lookbookId ? { lookbookId } : {}),
+    }).catch(() => { /* tracking failure must never surface to the customer */ });
+  } catch { /* same */ }
 }
 export function adjustPoints(userId, delta, reason) {
   const user = state.users.find((u) => u.id === userId);
@@ -1627,6 +2186,175 @@ export function getMerchantSession() {
 }
 export function clearMerchantSession() { localStorage.removeItem(MERC_KEY); }
 
+/* ---------- Virtual Events (Phase 5, Feature C) — Campaigns.jsx "Event Setter" bridge ---------- */
+// Thin wrappers over convex/events.ts, same merchantSessionArgs() pattern as
+// createLookbook/getLookbooksForSelector above — MERCHANT-ONLY, session-gated,
+// local-first-render-free (events have no local/offline seed, so a missing
+// session or client simply yields an empty list / a null result, matching
+// this file's existing offline convention).
+
+/** List events, soonest-first (async). MERCHANT-ONLY. */
+export function getEvents() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.events.getEvents, session).catch(() => []);
+}
+
+/** Create a draft event on Convex (async). MERCHANT-ONLY. */
+export function createEvent(args) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.mutation(api.events.createEvent, { ...args, ...session })
+    .then((doc) => (doc ? { ok: true, event: doc } : { ok: false }))
+    .catch(() => ({ ok: false }));
+}
+
+/**
+ * Ask Gemini to draft an event invitation message (async). MERCHANT-ONLY.
+ *
+ * FIX: convex/events.ts's generateEventDraft is an `internalAction`, not a
+ * public `action` — internal Convex functions are never exposed on the
+ * generated `api.*` surface, so there was no `api.events.generateEventDraft`
+ * for a client to call at all (this used to throw "Could not find public
+ * function" regardless of whether GEMINI_API_KEY was set). Fixed by adding
+ * generateEventDraftPublic, a thin public wrapper in convex/events.ts that
+ * mirrors dispatchEvent's session-guard-then-delegate shape (checkMerchantSession
+ * then ctx.runAction into the real internal action). This call site now
+ * points at that wrapper and passes through the merchant session it requires.
+ */
+export async function generateEventDraftRemote(eventId, eventTitle) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return null;
+  try {
+    return await client.action(api.events.generateEventDraftPublic, { eventId, eventTitle, ...session });
+  } catch {
+    return null;
+  }
+}
+
+/** Dispatch an event's WhatsApp invitations (async). MERCHANT-ONLY. */
+export function dispatchEventRemote(eventId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  return client.action(api.events.dispatchEvent, { eventId, ...session })
+    .then((res) => ({ ok: true, ...res }))
+    .catch((err) => ({ ok: false, error: err?.message || 'Dispatch failed.' }));
+}
+
+/* ---------- Dashboard Notifications (bell icon) → Convex bridge ---------- */
+// Design spec: docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
+// Contract parity: function names mirror convex/notifications.ts. Same
+// local-first hydrate-then-subscribe/emit shape as hydrateCustomers()/
+// customers() above — Shell.jsx calls hydrateNotifications() on mount (fire
+// the fetch) and notifications() synchronously (read the cached result),
+// re-rendering via the same subscribe()/emit() flow every other bridge in
+// this file already uses. Unlike customers()/state.users, notifications have
+// no localStorage/offline seed (seed.js is out of scope — see CLAUDE.md
+// 5.4 — and this data is 100% merchant-internal, generated only by the daily
+// cron), so the cache lives in a module-scoped array here, the same idea as
+// the paginatedCustomers cache above, not a new state.* field.
+let notificationsCache = [];
+let notificationsHydrating = false;
+
+/**
+ * Background hydrate: pull the last-30-days notification rows from Convex
+ * and replace the local cache, then emit() so Shell.jsx's useDb()-style
+ * subscribe() re-renders with the real unseen count / row list. Self-guards
+ * against overlapping concurrent calls, same as hydrateCatalogue()/
+ * hydrateCustomers() above.
+ */
+export function hydrateNotifications() {
+  if (notificationsHydrating) return;
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  notificationsHydrating = true;
+  client.query(api.notifications.getNotifications, session)
+    .then((rows) => {
+      notificationsHydrating = false;
+      if (!Array.isArray(rows)) return;
+      notificationsCache = rows;
+      emit();
+    })
+    .catch(() => { notificationsHydrating = false; /* offline — keep last-known cache */ });
+}
+
+/** Synchronous reader for the cached notification rows (newest-first, as returned by Convex). */
+export function notifications() { return notificationsCache; }
+
+/**
+ * Mark every currently-cached row seen (called when the bell panel opens).
+ * Optimistically flips the local cache to seen:true first (so the red dot
+ * clears immediately without waiting on the round-trip), then confirms with
+ * Convex and re-hydrates to pick up anything that arrived in between.
+ */
+export function markAllSeenRemote() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  notificationsCache = notificationsCache.map((n) => ({ ...n, seen: true }));
+  emit();
+  return client.mutation(api.notifications.markAllSeen, session)
+    .then((res) => { hydrateNotifications(); return { ok: true, ...res }; })
+    .catch((err) => ({ ok: false, error: err?.message || 'Could not mark notifications seen.' }));
+}
+
+/**
+ * Delete one notification row (kebab menu → Delete). Optimistically removes
+ * it from the local cache first, then confirms with Convex. Only ever
+ * touches the notifications table server-side (convex/notifications.ts) —
+ * never the underlying birthday/anniversary customer data.
+ */
+export function deleteNotificationRemote(notificationId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return Promise.resolve({ ok: false });
+  notificationsCache = notificationsCache.filter((n) => n._id !== notificationId);
+  emit();
+  return client.mutation(api.notifications.deleteNotification, { notificationId, ...session })
+    .catch((err) => { hydrateNotifications(); return { ok: false, error: err?.message || 'Delete failed.' }; });
+}
+
+/* ---------- Customer Activity Intelligence Part 3b (Dashboard section) → Convex bridge ---------- */
+// Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md
+// Part 3a (commit 8e0323a) built the merchant-guarded convex/ai.ts:getActiveCustomers
+// query. This bridge wires it into the app the same local-first hydrate-then-subscribe
+// shape as hydrateNotifications()/notifications() above: a module-scoped cache array,
+// a background hydrate function that fires the Convex query and emit()s on success, and
+// a synchronous reader Dashboard.jsx can call on every render via useDb()'s subscribe().
+let activeCustomersCache = [];
+let activeCustomersHydrating = false;
+
+/**
+ * Background hydrate: pull the last-7-days active-customer rows (name +
+ * activity count + latestSummary, already sorted most-active-first by the
+ * query itself) from Convex and replace the local cache, then emit() so
+ * Dashboard's useDb()-style subscribe() re-renders. Self-guards against
+ * overlapping concurrent calls, same as hydrateNotifications() above.
+ */
+export function hydrateActiveCustomers() {
+  if (activeCustomersHydrating) return;
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  activeCustomersHydrating = true;
+  client.query(api.ai.getActiveCustomers, session)
+    .then((rows) => {
+      activeCustomersHydrating = false;
+      if (!Array.isArray(rows)) return;
+      activeCustomersCache = rows;
+      emit();
+    })
+    .catch(() => { activeCustomersHydrating = false; /* offline — keep last-known cache */ });
+}
+
+/** Synchronous reader for the cached active-customer rows (most-active-first, as returned by Convex). */
+export function activeCustomers() { return activeCustomersCache; }
+
 /* ---------- Client onboarding & magic links ---------- */
 const mdFromDate = (iso) => {
   if (!iso) return null;
@@ -1721,9 +2449,21 @@ export function onboardCustomer(f) {
  * the local-only sync check. Falls back to the local link when Convex is
  * unreachable (same-browser demo keeps working).
  */
-export async function onboardCustomerRemote(f) {
+export async function onboardCustomerRemote(f, options = {}) {
   const client = getConvex();
   if (!client) return createLocalCustomer(f);
+
+  // Scope A (merchant Onboarding form): send the merchant session so the
+  // VVIP guard in convex/customers.ts accepts a ticked VVIP box, and surface
+  // real backend errors instead of the silent local fallback. The public
+  // /join path never passes options.asMerchant, so it keeps the old behaviour.
+  const asMerchant = options.asMerchant === true;
+  const session = merchantSessionArgs();
+  // A VVIP tick with no signed-in merchant can never pass the backend guard —
+  // stop before any network call and tell the merchant to sign in again.
+  if (asMerchant && f.vvip && !session) {
+    return { error: 'Not logged in — please sign in again.' };
+  }
 
   const mobile = waDigits(f.whatsapp || f.calling);
   try {
@@ -1735,6 +2475,12 @@ export async function onboardCustomerRemote(f) {
       ...(f.birthday ? { birthday: mdFromDate(f.birthday) } : {}),
       ...(f.anniversary ? { anniversary: mdFromDate(f.anniversary) } : {}),
       ...(f.whatsapp_consent ? { whatsapp_consent: true } : {}),
+      // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
+      // "only send when truthy" shape immediately above.
+      ...(f.vvip ? { vvip: true } : {}),
+      // Merchant session — the backend only checks it when vvip is true, so a
+      // signed-in merchant sends it for every onboarding (harmless otherwise).
+      ...(asMerchant && session ? session : {}),
     });
     // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
     if (created && !created.ok) {
@@ -1757,10 +2503,23 @@ export async function onboardCustomerRemote(f) {
     });
     if (!linkRes || !linkRes.user || !cvxId) return createLocalCustomer(f);
 
+    // BUG FIX: generateMagicTokenSelf's linkRes.user goes through auth.ts's
+    // toPublicUser projection, which has no whatsapp_consent/vvip fields (it's
+    // shared with merchant login, which has no business returning those) — so
+    // using it as-is here left the just-onboarded local row with
+    // whatsapp_consent/vvip undefined until the next hydrateCustomers() call
+    // self-healed it from createCustomer's own (correct) response. Patch the
+    // two fields back in from created.customer, which already carries the
+    // true saved values (including the upgrade-only re-onboarding path),
+    // before this reaches syncMagicLinkCustomer/toLocalCustomer.
+    const userForSync = created && created.customer
+      ? { ...linkRes.user, whatsapp_consent: created.customer.whatsapp_consent, vvip: created.customer.vvip }
+      : linkRes.user;
+
     // Stamp a local row keyed by the CONVEX id so likes/checkout/ledger and
     // the same-browser session all target the backend-backed customer. The
     // result card preserves the merchant-entered city/country via fallback.
-    const synced = syncMagicLinkCustomer(linkRes.user, linkRes.token, cvxId, {
+    const synced = syncMagicLinkCustomer(userForSync, linkRes.token, cvxId, {
       location: { city: f.city || '', country: f.country || 'India' },
     });
     if (!synced) return createLocalCustomer(f);
@@ -1785,7 +2544,23 @@ export async function onboardCustomerRemote(f) {
       user: synced,
       magicLink: `/lookbook?id=${linkRes.user.id}&token=${linkRes.token}`,
     };
-  } catch {
+  } catch (err) {
+    // Scope A: the merchant form surfaces the real error (e.g. the VVIP guard)
+    // instead of faking a local-only success. Prefer the ConvexError payload
+    // (err.data), then a cleaned err.message with Convex's wrapper prefixes
+    // stripped, then a plain fallback.
+    if (asMerchant) {
+      let message;
+      if (typeof err.data === 'string' && err.data.length > 0) {
+        message = err.data;
+      } else if (err.message) {
+        message = err.message
+          .replace(/^\[CONVEX[^\]]*\]/, '')
+          .replace(/^Uncaught ConvexError:/, '')
+          .trim();
+      }
+      return { error: message || 'Something went wrong — please try again.' };
+    }
     return createLocalCustomer(f); // offline / Convex error → same-browser local link (unchanged)
   }
 }
@@ -1822,6 +2597,57 @@ export function syncMagicLinkCustomer(publicUser, token, cvxId, fallback) {
 export const waMessage = (user, magicLink) =>
   `Namaste ${(user.name || '').split(' ')[0]}, welcome to 85 Lansdowne 🖤 Your personal boutique link is ready — tap it when you're ready to browse:\n${location.origin}${magicLink}`;
 
+/**
+ * Merchant hydrate-on-mount bundle (2026-09-15, merchant-hydration-fix spec).
+ *
+ * The one convenience call Shell.jsx fires once per valid session token (on
+ * fresh login, reload, AND new tab) to close the persisted-session reload gap:
+ * hydration previously fired only from merchantLogin()'s success handler
+ * (never on a reload that restores the session from localStorage) and from
+ * module import (which runs BEFORE the session is resolvable → silent no-op).
+ *
+ * Bundles the full warm set:
+ *   1. hydrateCustomers()          → full A-Z list → drives the `Showing X of Y` count
+ *   2. hydrateCatalogue()          → Lookbook Manager items
+ *   3. hydrateReviews()            → Dashboard + CRM reviews
+ *   4. hydrateCustomersPage(0, …)  → the PAGINATED page-0 cache Customers.jsx
+ *                                    actually renders — the missing warm that
+ *                                    caused "56 of … but 0 rows" on reload
+ *   5. hydrateSettings()           → loyalty tier rules (public query, always safe)
+ *   6. selectorCache warm          → Templates' customer dropdown + Campaigns'
+ *                                    designer dropdown, which fetch fresh per
+ *                                    call and read only selectorCache (see
+ *                                    getCustomers/getLookbooksForSelector) — so
+ *                                    warming the cache here reaches both pages
+ *                                    WITHOUT editing Templates.jsx/Campaigns.jsx
+ *
+ * Every hydrate callee self-guards via its own `xHydrating` flag, so this is
+ * idempotent and race-safe alongside merchantLogin()'s existing trigger and the
+ * module-load calls below. Skips entirely when no valid merchant session exists.
+ */
+export function hydrateAllMerchantData() {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return; // no valid merchant session — nothing to warm
+
+  hydrateCustomers();
+  hydrateCatalogue();
+  hydrateReviews();
+  hydrateCustomersPage(0, CUSTOMERS_PAGE_SIZE);
+  hydrateSettings();
+
+  // Warm the selector cache the two dropdown bridges read from FIRST. Fetched
+  // directly (not via getCustomers()/getLookbooksForSelector()) so a stale empty
+  // cache can't short-circuit the warm; success overwrites the cache, failure
+  // leaves it as-is so the next real call falls back to a fresh fetch.
+  client.query(api.customers.getCustomers, session)
+    .then((rows) => { if (Array.isArray(rows)) selectorCache.customers = rows; })
+    .catch(() => { /* offline — bridge falls back to fresh fetch */ });
+  client.query(api.lookbooks.getLookbooksForSelector, session)
+    .then((rows) => { if (Array.isArray(rows)) selectorCache.lookbooksSelector = rows; })
+    .catch(() => { /* offline — bridge falls back to fresh fetch */ });
+}
+
 // Eagerly load on module import so a fresh page load (e.g. straight to /login)
 // can read `state` without a prior getData() call. Placed here — after `state` is
 // initialized to null — to avoid a temporal-dead-zone access inside load().
@@ -1844,3 +2670,8 @@ hydrateCatalogue();
 // background. /merchant/dashboard and /merchant/customers render the
 // localStorage seed instantly, then swap in live Convex reviews.
 hydrateReviews();
+// Dashboard Notifications bridge: hydrate the bell panel's data in the
+// background too, same no-op-until-session-exists guard as the bridges
+// above (merchantSessionArgs() returns null before login, so this is a
+// harmless early no-op on a fresh /login page load).
+hydrateNotifications();

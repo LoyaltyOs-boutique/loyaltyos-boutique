@@ -40,12 +40,35 @@ export default defineSchema({
     session_expiry: v.optional(v.number()), // epoch ms — merchant session expiry (7 days)
     role: v.union(v.literal("customer"), v.literal("merchant")),
     name: v.string(),
+    // Scaling Fix 1 — lowercased mirror of `name`, kept in sync on every name
+    // write (createCustomer / bulkCreateCustomers / updateCustomerProfile).
+    // The `by_role_name_lower` index sorts on this so getCustomersPaginated
+    // streams customers in the SAME case-insensitive A-Z order that
+    // getCustomers produces in-memory via localeCompare. Optional at the type
+    // level for schema flexibility; in practice every customer row carries it,
+    // since all name write-paths keep it current.
+    name_lower: v.optional(v.string()),
     points: v.optional(v.number()), // default 0 — treat missing as 0 in app code (Convex has no field defaults)
     birthday: v.optional(v.string()),
     anniversary: v.optional(v.string()),
+    // Scaling Fix 3 — zero-padded "MM-DD" mirrors of birthday/anniversary,
+    // kept in sync on every write (createCustomer / bulkCreateCustomers /
+    // updateCustomerProfile). birthday/anniversary above allow both "8-1"
+    // and "08-01" for the same real date (parseMD's regex accepts both),
+    // which sorts incorrectly and inconsistently in a raw string index.
+    // These _md fields always store the zero-padded form, so the
+    // by_role_birthday_md / by_role_anniversary_md indexes below can range-read
+    // the "next N days" window directly instead of scanning every customer row.
+    birthday_md: v.optional(v.string()),
+    anniversary_md: v.optional(v.string()),
     tier: v.optional(
       v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     ),
+    // Phase 5 (Feature C, Virtual Events) — VVIP-only event access flag,
+    // mirrors whatsapp_consent's optional-boolean shape directly below.
+    // Set from the Onboarding.jsx "Mark as VVIP client" checkbox (separate,
+    // later frontend task — this field only adds the storage slot).
+    vvip: v.optional(v.boolean()),
     custom_tags: v.optional(v.array(v.string())), // e.g. "Saree Enthusiast", "Needs Care"
     whatsapp_consent: v.optional(v.boolean()), // Gate 1 — customer opted in to WhatsApp messages
     is_deleted: v.optional(v.boolean()), // Gate 1 — soft-delete flag; missing/false = active
@@ -71,7 +94,39 @@ export default defineSchema({
     .index("by_mobile", ["mobile"]) // Billing Desk phone lookup; duplicate mobile = unique in app logic
     .index("by_email", ["email"]) // merchant login + forgot-password lookup (PRD §3.1)
     .index("by_magic_token", ["magic_token"]) // magic-link validation (PRD §3.2)
-    .index("by_tier", ["tier"]), // campaign segmentation by loyalty tier
+    .index("by_tier", ["tier"]) // campaign segmentation by loyalty tier
+    // Scaling Fix 1 — sorted pagination for the CRM customer list. Equality on
+    // `role` + range on `name_lower` lets getCustomersPaginated stream
+    // customers in case-insensitive A-Z order (matching getCustomers'
+    // in-memory localeCompare sort) without a full-table .collect() + .sort().
+    // Indexing on `name_lower` (not `name`) is required: Convex indexes sort by
+    // raw byte order (all uppercase before any lowercase), which would NOT
+    // match getCustomers' case-insensitive localeCompare ordering.
+    .index("by_role_name_lower", ["role", "name_lower"])
+    // Scaling Fix 3 — same shape as by_role_name_lower: equality on `role` +
+    // range on the zero-padded _md mirror lets findUpcoming (customers.ts)
+    // fetch the "next N days" birthday/anniversary window via an indexed
+    // range read instead of a full-table scan + per-row parseMD().
+    .index("by_role_birthday_md", ["role", "birthday_md"])
+    .index("by_role_anniversary_md", ["role", "anniversary_md"])
+    // Phase 5 (Feature C, Virtual Events) — dispatchEvent's recipient lookup.
+    // Field order follows the SAME convention as by_role_birthday_md /
+    // by_role_anniversary_md directly above: the equality-filtered
+    // discriminator that partitions the large, mixed-population `users`
+    // table (merchants + customers) goes FIRST (`role`), exactly like those
+    // two indexes put `role` before the range/equality field that follows.
+    // `whatsapp_consent` is next — every dispatch (VVIP or not) always
+    // filters on it, so it narrows the `role`-partitioned set down to the
+    // consented subset for both event types. `vvip` is last — it is ONLY
+    // constrained when the event being dispatched has vvip_only === true;
+    // for a non-VVIP event, dispatchEvent still range/equality-reads the
+    // same index prefix (role, whatsapp_consent) and simply omits the third
+    // .eq("vvip", ...) clause, which Convex compound indexes support
+    // natively (a query can use any leading prefix of an index). This
+    // "widest/most-selective discriminator first" ordering (Option 2 from
+    // the design doc's (g) discussion) gives BOTH dispatch paths a pure
+    // indexed read with zero in-memory filtering over the users table.
+    .index("by_role_consent_vvip", ["role", "whatsapp_consent", "vvip"]),
 
   /** PRD §6 Table `lookbooks` — designer collection groups. */
   lookbooks: defineTable({
@@ -119,7 +174,14 @@ export default defineSchema({
     final_total: v.number(), // PAISE
     points_earned: v.number(), // earnForAmount(subtotal) × tier multiplier, floored
     created_at: v.number(),
-  }).index("by_user", ["user_id"]),
+  })
+    .index("by_user", ["user_id"])
+    // Scaling Fix 2 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md
+    // Addendum 2026-09-04) — lets getTodayOrdersInternal range-read orders
+    // created_at >= startOfToday via .withIndex(...) instead of a full-table
+    // .filter() scan. created_at is a required, always-populated v.number()
+    // epoch-ms timestamp (Date.now() at insert), so no backfill is needed.
+    .index("by_created_at", ["created_at"]),
 
   /** PRD §6 Table `campaigns` — WhatsApp broadcast + creative flyer campaigns. */
   campaigns: defineTable({
@@ -169,22 +231,37 @@ export default defineSchema({
    * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
    *
    * message_actions — admin decision-log for birthday/anniversary WhatsApp
-   * reminders. Recording a "sent" or "cancelled" row here for a given
-   * (customer_id, occasion, occasion_date) hides that customer from the
+   * reminders. Recording a "sent"/"link_opened"/"cancelled" row here for a
+   * given (customer_id, occasion, occasion_date) hides that customer from the
    * "Birthdays tomorrow" / "Anniversaries tomorrow" Delight Queue lists
    * (see customers.ts getUpcomingBirthdays / getUpcomingAnniversaries).
    *
    * `occasion_date` is an "M-D" string (e.g. "8-27") — not a full date — so
    * the row naturally stops matching once the year rolls over and the
    * customer reappears in next year's queue. No cleanup/cron job needed.
+   *
+   * P2-4 fix (2026-09-09) — `action` additively widened with a third literal,
+   * "link_opened": a wa.me link-open only proves "we handed the merchant a
+   * pre-filled draft" (the merchant still has to tap Send inside WhatsApp
+   * themselves) — NOT the same confirmation level as a genuinely-succeeded
+   * Cloud API send, which Meta's API actually acknowledged. Recording both
+   * cases as "sent" was misleading: the merchant could close WhatsApp without
+   * sending and the system would have no way to know. "link_opened" now
+   * covers BOTH the primary wa.me path (Customers.jsx sendViaWaLink) AND the
+   * Cloud-API-fails-and-falls-back-to-wa.me branch (sendViaCloudApi's catch
+   * block); "sent" is now reserved exclusively for a genuinely-confirmed
+   * Cloud API success (sendViaCloudApi's try block). Purely additive — the
+   * existing "sent"/"cancelled" literals and every existing row are
+   * unaffected. Safe for dedup: hasDecidedAction (customers.ts) only checks
+   * row EXISTENCE for this tuple, never inspects `action`'s value.
    */
   message_actions: defineTable({
     customer_id: v.id("users"),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasion_date: v.string(), // "M-D" e.g. "8-27" — matches parseMD's format in customers.ts
-    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    action: v.union(v.literal("sent"), v.literal("link_opened"), v.literal("cancelled")),
     decided_at: v.number(), // epoch ms
-    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"
+    channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"/"link_opened"
   })
     // Exclusion lookup used by getUpcomingBirthdays/getUpcomingAnniversaries —
     // named after the exact field tuple, matching this file's by_<field(s)> convention.
@@ -225,5 +302,189 @@ export default defineSchema({
   })
     // Per-customer history lookup (Activity Ledger tab, future task) — matches
     // this file's by_<field> index-naming convention.
+    .index("by_customer", ["customer_id"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md
+   * Architecture spec: docs/superpowers/specs/2026-09-03-ai-automation-architecture-design.md:17
+   *
+   * ai_message_drafts — Gemini-generated WhatsApp draft text for an upcoming
+   * birthday/anniversary, written ONLY by the daily crons.ts cron
+   * (generateDailyDrafts -> ai.ts generateMessageDraft). Draft-creation only
+   * (Phase 3 Option 3, design doc §c) — sending/approval wiring is a deferred,
+   * separate task. A cron only ever writes status:"pending"; "used"/
+   * "discarded" are reserved for that later wiring, not set by this table's
+   * writer today.
+   *
+   * `occasion_date` mirrors message_actions' "M-D" string convention (e.g.
+   * "8-27") — see message_actions' own comment above — so the
+   * by_customer_occasion_date index below can use the exact same tuple shape
+   * for the "don't regenerate an existing draft" duplicate check.
+   */
+  ai_message_drafts: defineTable({
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasion_date: v.string(),
+    draft_text: v.string(),
+    generated_at: v.number(), // epoch ms
+    status: v.union(v.literal("pending"), v.literal("used"), v.literal("discarded")),
+  })
+    // Duplicate-prevention + single-draft lookup for a given
+    // (customer, occasion, occasion_date) tuple — mirrors message_actions'
+    // by_customer_occasion_date index shape/style exactly (same field order,
+    // same naming convention).
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-04-phase5-virtual-events-vvip-design.md
+   * Architecture spec: docs/superpowers/specs/2026-09-03-ai-automation-architecture-design.md §4
+   *
+   * events — Phase 5 (Feature C) virtual-event records. A merchant creates a
+   * draft event (designer, date/time, description, optional VVIP-only gate),
+   * optionally generates an AI draft message (convex/events.ts
+   * generateEventDraft, reusing ai.ts's callGemini), then explicitly clicks
+   * "Dispatch Event" to WhatsApp-send the join link to the right recipient
+   * set. `status` flips "draft" -> "dispatched" only on that explicit click —
+   * see design doc (e) "Nothing auto-sends": there is no cron/time-triggered
+   * send anywhere in this feature.
+   *
+   * `event_datetime` (epoch ms) is also the sole input to getEventAccess's
+   * unlock computation (event_datetime - 5min) — the SEND and the UNLOCK are
+   * two independent mechanisms that must never be conflated (design doc (e)).
+   */
+  events: defineTable({
+    designer_name: v.string(),
+    event_datetime: v.number(), // epoch ms — event start; also drives getEventAccess's 5-min-before unlock window
+    vvip_only: v.boolean(), // true = dispatchEvent restricts recipients to consented VVIP customers only
+    description: v.string(),
+    draft_text: v.optional(v.string()), // AI-generated (or merchant-edited) WhatsApp message body
+    status: v.union(v.literal("draft"), v.literal("dispatched")),
+    created_at: v.number(), // epoch ms — Date.now() at insert
+  })
+    // "Upcoming events" range read — see design doc (a): events is a small,
+    // single-purpose table (unlike users, no mixed-population equality
+    // prefix is needed), so a plain range index on the date field alone is
+    // sufficient for getEvents' indexed "soonest first" query with no
+    // full-table scan.
+    .index("by_event_datetime", ["event_datetime"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
+   *
+   * notifications — merchant-internal, non-AI daily birthday/anniversary
+   * reminders shown via a bell icon on the merchant Dashboard. Written ONLY
+   * by the daily crons.ts cron (generateDailyNotifications), which reuses
+   * the SAME internal.customers.findUpcomingInternal read
+   * generateDailyDrafts already calls (crons.ts) — no new scanning path on
+   * `users`. Unlike ai_message_drafts, this feature never messages a
+   * customer (no WhatsApp send, no consent gate, no Gemini call) — it only
+   * informs the merchant.
+   *
+   * `occasion_date` mirrors message_actions'/ai_message_drafts' "M-D" string
+   * convention (e.g. "8-27") — same tuple shape for the dedup index below.
+   *
+   * Customer Activity Intelligence Part 2/3 (design spec
+   * docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md
+   * §b.5) additively widens `occasion` with a third value, "weekly_activity",
+   * for the weekly "most active this week" bell notification generated by
+   * crons.ts's generateWeeklyActivityNotifications. For that occasion value,
+   * `occasion_date` holds the week's Monday date in the SAME "M-D" string
+   * convention (e.g. "9-8") rather than a birthday/anniversary date — no
+   * field type changes, so the by_customer_occasion_date dedup index and
+   * every existing birthday/anniversary read (getNotifications, markAllSeen,
+   * deleteNotification, the bell UI) stay byte-identical and unaffected.
+   */
+  notifications: defineTable({
+    customer_id: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary"), v.literal("weekly_activity")),
+    occasion_date: v.string(), // "M-D" string, e.g. "8-27" (or that week's Monday for weekly_activity)
+    message: v.string(),
+    created_at: v.number(), // epoch ms
+    seen: v.boolean(),
+  })
+    // Dedup check in the daily generator — mirrors hasExistingDraft's tuple
+    // lookup (crons.ts) and message_actions'/ai_message_drafts'
+    // by_customer_occasion_date convention exactly (same field order/naming).
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"])
+    // Equality-only prefix on `seen` — efficient "unseen count" reads, same
+    // "narrow with an equality field first" style as by_role_consent_vvip.
+    .index("by_seen", ["seen"])
+    // Range-read "not expired" (< 30 days old) rows — same shape as orders'
+    // by_created_at index (schema.ts:184).
+    .index("by_created_at", ["created_at"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md
+   *
+   * customer_activity_events — real, durable per-customer tracking of the
+   * four non-purchase engagement signals (cart_add, like, lookbook_view,
+   * event_link_click), replacing today's frontend-only like/cart state with
+   * real Convex persistence. Written ONLY by convex/activity.ts's
+   * trackActivity mutation, which is deliberately PUBLIC/unguarded (no
+   * requireMerchantSession) — the caller is always the customer's own
+   * browser, which has no merchant token (customers authenticate via a
+   * completely separate magic-link mechanism, see auth.ts's
+   * validateMagicToken). Same posture as createReview/generateMagicTokenSelf.
+   *
+   * Purchases are explicitly NOT duplicated here — purchase history is read
+   * directly from the existing `orders` table (by_user index) by the future
+   * per-customer activity-summary function. One source of truth per concern.
+   */
+  customer_activity_events: defineTable({
+    customer_id: v.id("users"),
+    action: v.union(
+      v.literal("cart_add"),
+      v.literal("like"),
+      v.literal("lookbook_view"),
+      v.literal("event_link_click"),
+    ),
+    catalogue_item_id: v.optional(v.id("catalogue_items")), // cart_add / like
+    lookbook_id: v.optional(v.id("lookbooks")),              // lookbook_view
+    event_id: v.optional(v.id("events")),                    // event_link_click
+    created_at: v.number(), // epoch ms
+  })
+    // Primary read pattern: "this customer's activity in [start, now]" for
+    // the future daily summary + weekly most-active scan. Equality prefix on
+    // customer_id, then a range on created_at — same "equality field first"
+    // index style as by_role_birthday_md / by_customer_occasion_date above.
+    .index("by_customer_created_at", ["customer_id", "created_at"])
+    // Secondary read pattern: a future weekly cron needs "all activity in
+    // the last 7 days across all customers" to find who's active — a
+    // range-only index on created_at (mirrors orders' by_created_at,
+    // schema.ts:184) avoids a full-table scan for that global scan.
+    .index("by_created_at", ["created_at"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md §b.3
+   *
+   * customer_activity_summaries — one row PER CUSTOMER, upserted (overwritten)
+   * on each daily refresh, never accumulated as history. Holds the latest
+   * Gemini-generated activity summary text for that customer, written ONLY by
+   * convex/crons.ts's generateDailyActivitySummaries cron (via
+   * convex/ai.ts's generateCustomerActivitySummary + the upsert mutation in
+   * ai.ts).
+   *
+   * Deliberately a SEPARATE table from `ai_message_drafts`, not a reuse of
+   * it, even though both are Gemini-generated text rows written by a daily
+   * cron — per the design doc's own §b.3 reasoning: a WhatsApp draft
+   * (customer-facing, sendable, one row per occasion-date awaiting merchant
+   * approve/discard) and an internal activity summary (merchant-facing only,
+   * NEVER sent to the customer, always just "the latest state" not a queue
+   * of pending items) are different concepts with different consumers and
+   * different lifecycle semantics (upsert-latest vs. append-and-triage) —
+   * the same reasoning the design doc gives for keeping this out of
+   * getCustomerIntelligenceProfile too. Confirmed this table's shape matches
+   * that reasoning: no `status` field (nothing to approve/discard, unlike
+   * ai_message_drafts), one row per customer_id (not per occasion/date).
+   */
+  customer_activity_summaries: defineTable({
+    customer_id: v.id("users"),
+    summary_text: v.string(),
+    generated_at: v.number(), // epoch ms — Date.now() at each (re)generation
+  })
+    // Single-row-per-customer upsert + latest-lookup — same "equality-only
+    // point lookup" style as points_ledger's by_customer index, but here the
+    // upsert mutation additionally uses this index to find (and patch) any
+    // existing row instead of always inserting a new one.
     .index("by_customer", ["customer_id"]),
 });

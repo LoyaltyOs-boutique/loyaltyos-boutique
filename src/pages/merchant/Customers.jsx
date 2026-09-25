@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import {
   getData, subscribe, customers, customerLedger, addStaffNote,
@@ -6,8 +6,10 @@ import {
   updateCustomerProfile, updateMeasurements,
   getUpcomingBirthdays, getUpcomingAnniversaries,
   getWhatsAppTemplateConfig, getWhatsAppTemplates, sendWhatsAppTemplateMessage,
-  recordMessageAction, awardPoints,
+  recordMessageAction, awardPoints, generateMessageDraftRemote, generateCombinedMessageDraftRemote,
+  sendAllUpcomingOccasionMessagesRemote,
   hydrateCustomers, hydrateReviews, hydratePointsHistory,
+  hydrateCustomersPage, customersPage, resetCustomersPageCache,
   clearMerchantSession,
 } from '../../lib/db.js';
 import { inr, fmtDate, parseMD, tierLabel, cls } from '../../lib/util.js';
@@ -24,9 +26,28 @@ export default function Customers() {
   const db = useDb();
   const location = useLocation();
   const [q, setQ] = useState(location.state?.q || '');
-  const [filter, setFilter] = useState(location.state?.tab === 'reviews' ? 'reviews' : 'all');
+  // Today View — Approve & Send (2026-09-18 spec, point 6): 'birthday_today'/
+  // 'anniversary_today' added as two more recognized location.state.tab values,
+  // same additive-checked mechanism the 'reviews'/'*_tomorrow' keys already
+  // use above — Dashboard.jsx's two stat-card arrows now pass these instead of
+  // the old todayList()-based search marker.
+  const [filter, setFilter] = useState(
+    location.state?.tab === 'reviews' ? 'reviews'
+    : location.state?.tab === 'birthday_tomorrow' ? 'birthday_tomorrow'
+    : location.state?.tab === 'anniversary_tomorrow' ? 'anniversary_tomorrow'
+    : location.state?.tab === 'birthday_today' ? 'birthday_today'
+    : location.state?.tab === 'anniversary_today' ? 'anniversary_today'
+    : 'all'
+  );
   const [page, setPage] = useState(0);
-  const [selected, setSelected] = useState(null);
+  // Weekly-activity AI-summary popup's "View Full Profile" button
+  // (Shell.jsx's NotificationBell) navigates here with
+  // `location.state.selectedCustomerId` set — additively checked in this
+  // one-time-mount initializer, same pattern `filter` above already uses for
+  // `location.state?.tab`. Falls back to plain `null` (the original
+  // behavior) when that key isn't present, so a normal navigation to this
+  // page is completely unaffected.
+  const [selected, setSelected] = useState(location.state?.selectedCustomerId || null);
   const [tab, setTab] = useState('basic');
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState({});
@@ -62,6 +83,37 @@ export default function Customers() {
   // subscribe() picks up to re-render. Both self-guard via their own
   // hydrating flags, so rapid navigate-away-and-back never double-fetches.
   useEffect(() => { hydrateCustomers(); hydrateReviews(); }, []);
+
+  // Scaling Fix 1 wiring (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md):
+  // smart hybrid pagination. "Default view" — no search text typed AND no
+  // birthday/anniversary/reviews tab selected, i.e. the plain "all clients,
+  // A-Z" list — fetches just the current page's 6 rows straight from Convex
+  // via getCustomersPaginated, instead of pulling every customer up front.
+  // The moment a search query is typed or any other tab is picked, the list
+  // below falls back to today's full customers() pull + client-side filter +
+  // client-side slice, completely unchanged from before this task.
+  const isDefaultView = filter === 'all' && !q.trim();
+
+  // Mode switch (default <-> search/filter, in either direction) always resets
+  // to page 0 — the two modes' page N mean completely different things (a
+  // Convex cursor position vs. an index into a client-filtered array), so a
+  // stale page number from one mode is meaningless in the other. Also clears
+  // the cursor cache on entering default view so a fresh A-Z walk starts from
+  // the real first page rather than reusing cursors from a previous visit.
+  const wasDefaultView = useRef(isDefaultView);
+  useEffect(() => {
+    if (wasDefaultView.current !== isDefaultView) {
+      wasDefaultView.current = isDefaultView;
+      setPage(0);
+      if (isDefaultView) resetCustomersPageCache();
+    }
+  }, [isDefaultView]);
+
+  // Default view only: fetch (or read from cache) the current page whenever
+  // the merchant moves Prev/Next. No-op while a search/filter is active.
+  useEffect(() => {
+    if (isDefaultView) hydrateCustomersPage(page, PAGE);
+  }, [isDefaultView, page]);
 
   // Approval modal (Birthdays tomorrow / Anniversaries tomorrow "Approve &
   // Send" flow) — the merchant-configured promo copy (discount/coupon/valid
@@ -112,9 +164,43 @@ export default function Customers() {
   // updates (backend rejects the second with an idempotency error).
   const [cancelErrors, setCancelErrors] = useState({});
 
-  const handleCancel = async (c, occasion) => {
+  // 2026-09-22 "Send All" bulk-outreach — small inline row under the tomorrow
+  // tab lists, replacing an earlier oversized modal version per review
+  // feedback. Three local states drive the same click -> confirm -> result
+  // flow the modal used to, just rendered inline instead: sendAllConfirming
+  // toggles the button into its "Send to N customers?" confirm step,
+  // sendAllSending is true only while the bridge call is in flight, and
+  // sendAllResult holds whatever it resolves to (or null on the never-throw
+  // failure signal) so the inline result line can render.
+  const [sendAllConfirming, setSendAllConfirming] = useState(false);
+  const [sendAllSending, setSendAllSending] = useState(false);
+  const [sendAllResult, setSendAllResult] = useState(null);
+
+  // N for the inline "Send All (N)" label — unique consenting customers with
+  // days_until === 1 across both tomorrow arrays (a customer present in both,
+  // i.e. birthday === anniversary tomorrow, counts once, not twice).
+  const sendAllCount = useMemo(() => {
+    const ids = new Set();
+    (tomorrowBirthdays || []).forEach((c) => { if (c.days_until === 1 && c.whatsapp_consent) ids.add(c._id); });
+    (tomorrowAnniversaries || []).forEach((c) => { if (c.days_until === 1 && c.whatsapp_consent) ids.add(c._id); });
+    return ids.size;
+  }, [tomorrowBirthdays, tomorrowAnniversaries]);
+
+  // isToday (2026-09-18 Today View spec, point 5): handleCancel now fires
+  // from FOUR tabs, not just the two "tomorrow" ones — the new
+  // 'birthday_today'/'anniversary_today' tabs need canonicalTodayOccasionDate()
+  // instead, since "tomorrow" would be the wrong calendar day for a same-day
+  // occasion's dedup key. Defaults to false so any other/future call site
+  // keeps today's tomorrow-only behavior unless it opts in explicitly.
+  const handleCancel = async (c, occasion, isToday = false) => {
     const key = decisionKey(c.id, occasion);
-    const occasionDate = occasion === 'birthday' ? c.birthday : c.anniversary;
+    // P0-1/P1-3 fix (2026-09-09): canonical "YYYY-M-D" key (tomorrow's real
+    // IST calendar date, with year) — this Cancel button only ever fires
+    // from the Birthdays/Anniversaries tomorrow tabs, so "tomorrow in IST" is
+    // always the correct occurrence, computed independently of the
+    // customer's raw (year-less) birthday/anniversary string. Same helper
+    // ApprovalModal's onSent path uses below, for key-format consistency.
+    const occasionDate = isToday ? canonicalTodayOccasionDate() : canonicalTomorrowOccasionDate();
     setCancelErrors((prev) => { const next = { ...prev }; delete next[key]; return next; });
     try {
       await recordMessageAction(c.id, occasion, occasionDate, 'cancelled');
@@ -124,6 +210,18 @@ export default function Customers() {
       // don't crash. If it was already decided, reflect that in the UI too.
       setCancelErrors((prev) => ({ ...prev, [key]: err?.message || 'Could not cancel — try again.' }));
     }
+  };
+
+  // Confirm step of the inline "Send All" row — calls the bridge, then shows
+  // one inline result line. Never throws (see sendAllUpcomingOccasionMessagesRemote's
+  // own doc comment in db.js) — a null result means "couldn't reach server".
+  const handleSendAll = async () => {
+    setSendAllSending(true);
+    setSendAllResult(null);
+    const res = await sendAllUpcomingOccasionMessagesRemote();
+    setSendAllSending(false);
+    setSendAllConfirming(false);
+    setSendAllResult(res);
   };
 
   const waToken = (c) => ({ wa: waDigits(c.whatsapp || c.mobile), m: `/lookbook?id=${c.id}&token=${c.magic_token}` });
@@ -146,23 +244,62 @@ export default function Customers() {
   const withLocalShape = (row) => customers().find((u) => u.id === row._id) || { ...row, id: row._id };
 
   const list = useMemo(() => {
+    // Default view (no search, "All clients" tab): the ROWS shown come from
+    // the paginated cache below (hydrateCustomersPage/customersPage), not
+    // from slicing this array — `rows` is overridden in the paginated branch
+    // further down. `list` itself is only kept here for its .length, used by
+    // the footer's "Showing X of Y" total. hydrateCustomers() still runs
+    // unconditionally on mount (effect above, pre-existing/unchanged), so
+    // customers() already reflects the true full count without this view
+    // triggering its own extra full-list fetch.
+    if (isDefaultView) return customers();
+
     // "Tomorrow" tabs read from the separate Convex-fetched days_until state
     // (not the local customers() array) — see the fetch-on-mount effect
     // above. All other tabs are completely unchanged below.
     if (filter === 'birthday_tomorrow') return tomorrowBirthdays.filter((c) => c.days_until === 1).map(withLocalShape);
     if (filter === 'anniversary_tomorrow') return tomorrowAnniversaries.filter((c) => c.days_until === 1).map(withLocalShape);
 
+    // "Today" tabs (2026-09-18 Today View spec) — SAME already-fetched
+    // tomorrowBirthdays/tomorrowAnniversaries arrays (both queried with
+    // days:1, which per convex/customers.ts's upcomingWindow() loops i=0..1
+    // inclusive — i=0 is today, i=1 is tomorrow), just filtered on
+    // days_until === 0 instead of === 1. No new backend query needed.
+    if (filter === 'birthday_today') return tomorrowBirthdays.filter((c) => c.days_until === 0).map(withLocalShape);
+    if (filter === 'anniversary_today') return tomorrowAnniversaries.filter((c) => c.days_until === 0).map(withLocalShape);
+
     let l = customers();
     const query = q.trim().toLowerCase();
     if (query.startsWith('b:')) { const md = query.slice(2); l = l.filter((c) => c.birthday === md); }
     else if (query.startsWith('a:')) { const md = query.slice(2); l = l.filter((c) => c.anniversary === md); }
-    else if (query) l = l.filter((c) => (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query));
+    else if (query) l = l.filter((c) =>
+      (c.name + ' ' + c.mobile + ' ' + (c.custom_tags || []).join(' ')).toLowerCase().includes(query)
+      || (c.tier || '').toLowerCase().includes(query)
+    );
     return l;
-  }, [db, q, filter, tomorrowBirthdays, tomorrowAnniversaries]);
+  }, [db, q, filter, tomorrowBirthdays, tomorrowAnniversaries, isDefaultView]);
 
-  const pages = Math.max(1, Math.ceil(list.length / PAGE));
-  const safePage = Math.min(page, pages - 1);
-  const rows = list.slice(safePage * PAGE, safePage * PAGE + PAGE);
+  // Paginated (default-view) mode reads the current page straight from the
+  // db.js cache populated by hydrateCustomersPage above — real server-side
+  // pagination, 6 rows fetched at a time instead of the full list. Search/
+  // filter mode keeps slicing the full `list` client-side exactly as before
+  // this task — zero behavior change on that path.
+  const currentPage = isDefaultView ? customersPage(page) : null;
+  // Default view: list.length (= customers(), the background-hydrated full
+  // count) gives the normal Math.ceil page total once it has caught up, same
+  // formula as the search/filter branch below. Convex's own isDone flag for
+  // the currently loaded page is the authoritative "is there a next page"
+  // signal though (it can be ahead of a not-yet-finished background count),
+  // so it floors/raises the estimate to stay consistent with what Next/Prev
+  // will actually do: never fewer pages than the one already on screen, and
+  // never claim a next page exists once Convex has reported isDone === true.
+  const pages = isDefaultView
+    ? (currentPage.isDone === false
+        ? Math.max(page + 2, Math.ceil(list.length / PAGE))
+        : Math.max(1, page + 1))
+    : Math.max(1, Math.ceil(list.length / PAGE));
+  const safePage = isDefaultView ? page : Math.min(page, pages - 1);
+  const rows = isDefaultView ? currentPage.rows : list.slice(safePage * PAGE, safePage * PAGE + PAGE);
   const pending = pendingGmbReviews();
   const active = selected ? db.users.find((u) => u.id === selected) : null;
 
@@ -234,7 +371,7 @@ export default function Customers() {
       <div className="card overflow-x-auto">
         <table className="tbl min-w-[680px]">
           <thead>
-            <tr><th>Client</th><th>Mobile</th><th>Points</th><th>Tier</th><th>Birthday</th><th>Anniversary</th><th>Magic link</th>{(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && <th>WhatsApp wish</th>}<th></th></tr>
+            <tr><th>Client</th><th>Mobile</th><th>Points</th><th>Tier</th><th>Birthday</th><th>Anniversary</th><th>Magic link</th>{(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow' || filter === 'birthday_today' || filter === 'anniversary_today') && <th>WhatsApp wish</th>}<th></th></tr>
           </thead>
           <tbody>
             {rows.map((c) => (
@@ -262,27 +399,85 @@ export default function Customers() {
                     </button>
                   </div>
                 </td>
-                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (() => {
-                  const occasion = filter === 'birthday_tomorrow' ? 'birthday' : 'anniversary';
+                {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow' || filter === 'birthday_today' || filter === 'anniversary_today') && (() => {
+                  const isToday = filter === 'birthday_today' || filter === 'anniversary_today';
+                  const occasion = (filter === 'birthday_tomorrow' || filter === 'birthday_today') ? 'birthday' : 'anniversary';
+                  // Combined case (2026-09-18 Today View spec, point 2): a
+                  // customer has BOTH birthday and anniversary today (real
+                  // live example: "sneha", birthday === anniversary === "9-18").
+                  // Only possible on the today tabs (year-less M-D strings, so
+                  // "tomorrow" combined-occasion customers get the same
+                  // treatment automatically once their day arrives). Detected
+                  // directly off the row's own birthday/anniversary fields
+                  // (both present on the locally-shaped customer record via
+                  // withLocalShape above) rather than re-deriving today's M-D
+                  // separately — todayMD() below already exists for this.
+                  const isCombinedToday = isToday && c.birthday && c.anniversary && c.birthday === c.anniversary;
                   const decided = decidedActions[decisionKey(c.id, occasion)];
                   const cancelError = cancelErrors[decisionKey(c.id, occasion)];
+                  // Combined row: BOTH occasions must be marked decided before
+                  // showing the "already handled" badge — if only one leg of a
+                  // combined send/cancel completed (e.g. a partial failure),
+                  // the row still shows the action buttons so the merchant can
+                  // retry the missing leg. Non-combined rows keep the original
+                  // single-occasion `decided` check unchanged.
+                  const combinedDecided = isCombinedToday
+                    ? (decidedActions[decisionKey(c.id, 'birthday')] && decidedActions[decisionKey(c.id, 'anniversary')])
+                    : null;
+                  const combinedCancelError = isCombinedToday
+                    ? (cancelErrors[decisionKey(c.id, 'birthday')] || cancelErrors[decisionKey(c.id, 'anniversary')])
+                    : null;
                   return (
                     <td className="text-center whitespace-nowrap">
-                      {decided ? (
+                      {isCombinedToday ? (
+                        combinedDecided ? (
+                          <span className="text-[10px] tracking-wide2 uppercase text-steel">
+                            {decidedActions[decisionKey(c.id, 'birthday')] === 'cancelled' && decidedActions[decisionKey(c.id, 'anniversary')] === 'cancelled'
+                              ? '✗ Cancelled'
+                              : '✓ Sent (Birthday + Anniversary)'}
+                          </span>
+                        ) : (
+                          <div className="inline-flex gap-1.5 items-center">
+                            <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion: 'birthday', combined: true }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send both occasions">
+                              Approve &amp; Send (Both)
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                // Cancel-both: reuses the exact same single-occasion
+                                // handleCancel twice — no combined-cancel backend
+                                // logic invented, per spec point 3's "reuse existing
+                                // single-occasion code paths called twice" guidance.
+                                handleCancel(c, 'birthday', true);
+                                handleCancel(c, 'anniversary', true);
+                              }}
+                              className="btn-ghost !px-2 !py-1.5 text-[11px]"
+                              aria-label="Cancel both occasions"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )
+                      ) : decided ? (
                         <span className="text-[10px] tracking-wide2 uppercase text-steel">
-                          {decided === 'sent' ? '✓ Sent' : '✗ Cancelled'}
+                          {/* P2-4 fix (2026-09-09): 3rd badge for 'link_opened' —
+                              a wa.me link-open only confirms the merchant was
+                              handed a pre-filled draft, not a real Cloud API
+                              send confirmation, so it gets its own label
+                              instead of falling into the "Cancelled" branch. */}
+                          {decided === 'sent' ? '✓ Sent' : decided === 'link_opened' ? '✓ Link Opened' : '✗ Cancelled'}
                         </span>
                       ) : (
                         <div className="inline-flex gap-1.5 items-center">
                           <button onClick={(e) => { e.stopPropagation(); setApproveTarget({ customer: c, occasion }); }} className="btn-gold !px-2 !py-1.5 text-[11px]" aria-label="Approve and send">
                             Approve &amp; Send
                           </button>
-                          <button onClick={(e) => { e.stopPropagation(); handleCancel(c, occasion); }} className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Cancel">
+                          <button onClick={(e) => { e.stopPropagation(); handleCancel(c, occasion, isToday); }} className="btn-ghost !px-2 !py-1.5 text-[11px]" aria-label="Cancel">
                             Cancel
                           </button>
                         </div>
                       )}
-                      {cancelError && <div className="text-red-600 text-[10px] mt-1">{cancelError}</div>}
+                      {(cancelError || combinedCancelError) && <div className="text-red-600 text-[10px] mt-1">{cancelError || combinedCancelError}</div>}
                     </td>
                   );
                 })()}
@@ -293,6 +488,44 @@ export default function Customers() {
           </tbody>
         </table>
       </div>
+
+      {/* 2026-09-22 "Send All" — small inline row under the tomorrow-tab
+          list, replacing an earlier oversized modal per review feedback. No
+          new component, no window.confirm — a local two-state toggle
+          (confirming -> Confirm/Cancel) rendered right here. */}
+      {(filter === 'birthday_tomorrow' || filter === 'anniversary_tomorrow') && (
+        <div className="flex items-center gap-3 text-xs text-steel">
+          {!sendAllConfirming ? (
+            <button
+              onClick={() => { setSendAllResult(null); setSendAllConfirming(true); }}
+              disabled={sendAllCount === 0 || (!waTemplates?.birthday && !waTemplates?.anniversary) || sendAllSending}
+              className="btn-gold !px-2 !py-1.5 text-[11px] disabled:opacity-40"
+              aria-label="Send all"
+            >
+              Send All ({sendAllCount})
+            </button>
+          ) : (
+            <div className="inline-flex gap-1.5 items-center">
+              <span>Send to {sendAllCount} customers?</span>
+              <button onClick={handleSendAll} disabled={sendAllSending} className="btn-gold !px-2 !py-1.5 text-[11px] disabled:opacity-40" aria-label="Confirm send all">
+                Confirm
+              </button>
+              <button onClick={() => setSendAllConfirming(false)} disabled={sendAllSending} className="btn-ghost !px-2 !py-1.5 text-[11px] disabled:opacity-40" aria-label="Cancel send all">
+                Cancel
+              </button>
+            </div>
+          )}
+          {!waTemplates?.birthday && !waTemplates?.anniversary && (
+            <span>WhatsApp template pending Meta approval — Send All not available yet.</span>
+          )}
+          {sendAllResult && (sendAllResult.ok
+            ? <span>Sent {sendAllResult.sent} · Skipped {sendAllResult.skipped} · Failed {sendAllResult.failed}</span>
+            : sendAllResult.reason === 'no_template'
+              ? <span>Template pending Meta approval — nothing was sent.</span>
+              : <span className="text-red-600 text-[10px]">Could not reach the server — nothing was sent.</span>
+          )}
+        </div>
+      )}
 
       <div className="flex items-center justify-between text-xs text-steel">
         <span>Showing {rows.length} of {list.length}</span>
@@ -450,12 +683,24 @@ export default function Customers() {
           templateConfig={templateConfig}
           waTemplates={waTemplates}
           onClose={() => setApproveTarget(null)}
-          onSent={(customerId, occasion, channel) => {
-            const occasionDate = occasion === 'birthday'
-              ? approveTarget.customer.birthday
-              : approveTarget.customer.anniversary;
-            recordMessageAction(customerId, occasion, occasionDate, 'sent', channel)
-              .then(() => markDecided(customerId, occasion, 'sent'))
+          onSent={(customerId, occasion, channel, occasionDate, action) => {
+            // P0-1/P1-3 fix (2026-09-09): occasionDate now arrives already
+            // computed as the canonical "YYYY-M-D" key (ApprovalModal's
+            // canonicalOccasionDate, passed through as the 4th onSent arg) —
+            // no longer re-derived here from approveTarget.customer's raw
+            // (year-less) birthday/anniversary string, which was the P1-3
+            // inconsistent-format bug's exact source on this call site.
+            //
+            // P2-4 fix (2026-09-09): 5th onSent arg (action) — mirrors how
+            // canonicalOccasionDate was added as a 4th arg above. ApprovalModal
+            // now tells the parent the REAL confirmation level of this send:
+            // 'sent' only for a genuinely-confirmed Cloud API success,
+            // 'link_opened' for a wa.me link-open (primary path, or the
+            // Cloud-API-fails-and-falls-back-to-wa.me branch) — opening wa.me
+            // only proves the merchant was handed a pre-filled draft, not that
+            // they actually pressed Send inside WhatsApp.
+            recordMessageAction(customerId, occasion, occasionDate, action, channel)
+              .then(() => markDecided(customerId, occasion, action))
               .catch((err) => {
                 // Idempotency rejection (already decided) or offline — the
                 // send itself already happened/attempted; just surface the
@@ -471,11 +716,77 @@ export default function Customers() {
           <PointsTool userId={pointsTarget.id} />
         </Modal>
       )}
+
     </div>
   );
 }
 
 function todayMD() { const d = new Date(); return `${d.getMonth() + 1}-${d.getDate()}`; }
+
+/**
+ * IST_OFFSET_MS — same fixed +5:30 (India Standard Time, no daylight-saving)
+ * offset convex/customers.ts's own IST_OFFSET_MS constant uses for its
+ * birthday/anniversary "today"/"tomorrow" window arithmetic. Duplicated here
+ * (not imported — this is a browser bundle, convex/ is a separate server
+ * module). Using the BROWSER's local clock with no IST shift would be wrong
+ * for a canonical dedup key, since a merchant opening this page from outside
+ * IST would silently compute a different calendar day than the boutique's
+ * actual "today"/"tomorrow".
+ */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * canonicalTomorrowOccasionDate — P0-1/P1-3 fix (2026-09-09, same-day dedup
+ * audit). Returns tomorrow's REAL calendar date in IST, as a canonical
+ * "YYYY-M-D" string (full year + unpadded month + unpadded day) — e.g.
+ * "2026-8-28". This is the single source of truth for the occasion_date key
+ * both recordMessageAction (Approve & Send / Cancel) and
+ * generateMessageDraftRemote (AI draft cache) now use for a given
+ * ApprovalModal instance, so a cached draft and its corresponding sent/
+ * cancelled decision for the same real occurrence always agree on the exact
+ * same key string (see ApprovalModal below — computed ONCE per modal
+ * instance, not separately at each call site).
+ *
+ * Deliberately does NOT read the customer's raw birthday/anniversary string
+ * at all — that field only ever has month-day (no year), which is exactly
+ * the un-canonicalized source of the old bug (dedup never expired, since the
+ * key never changed across years). Both tabs this modal opens from
+ * ("Birthdays tomorrow" / "Anniversaries tomorrow", confirmed via
+ * setApproveTarget's only call site further down this file) only ever mean
+ * ONE specific real calendar day — tomorrow, in IST — so that's computed
+ * directly instead.
+ *
+ * Same IST-shift-then-read-UTC-calendar-fields technique as
+ * convex/customers.ts's upcomingWindow() (add the fixed IST offset to the
+ * UTC instant, then read Y/M/D back off the shifted Date's UTC accessors) —
+ * this is what correctly rolls the year forward on a Dec 31 -> Jan 1
+ * boundary, since Date.UTC's own day-rollover arithmetic handles month/year
+ * carries natively (no separate wraparound branch needed).
+ */
+function canonicalTomorrowOccasionDate() {
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const istTomorrow = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + 1));
+  return `${istTomorrow.getUTCFullYear()}-${istTomorrow.getUTCMonth() + 1}-${istTomorrow.getUTCDate()}`;
+}
+
+/**
+ * canonicalTodayOccasionDate — sibling to canonicalTomorrowOccasionDate above,
+ * added for the Today View — Approve & Send task (2026-09-18 spec, point 5).
+ * SAME IST-aware "YYYY-M-D" canonical-key logic, but `+ 0` days instead of
+ * `+ 1` — this modal/tab pair only ever means "today, in IST" (the new
+ * 'birthday_today'/'anniversary_today' filters, confirmed via this file's
+ * `filter ===` checks below). Deliberately a separate function rather than
+ * parameterizing canonicalTomorrowOccasionDate with an offset argument, per
+ * the spec's explicit instruction not to reuse that function verbatim (it
+ * hardcodes +1 day) — kept as two small, obviously-correct siblings instead
+ * of one function whose behavior depends on a caller-supplied magic number.
+ */
+function canonicalTodayOccasionDate() {
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const istToday = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+  return `${istToday.getUTCFullYear()}-${istToday.getUTCMonth() + 1}-${istToday.getUTCDate()}`;
+}
+
 function Info({ label, value }) {
   return (
     <div>
@@ -487,23 +798,138 @@ function Info({ label, value }) {
 
 /**
  * "Approve & Send" modal for the Birthdays tomorrow / Anniversaries tomorrow
- * tabs. Mirrors Templates.jsx's MomentCard.send() guard/try/catch/fallback
- * shape exactly: no template configured for this occasion type → skip
- * straight to the wa.me fallback; template configured → try the Cloud API
- * send, and on ANY failure fall back to the same wa.me link-open, never a
- * silent dead end. The preview block shown here is for the merchant's own
- * reference only — the real outgoing Cloud API bodyParams stay `[name]`
- * only per the locked design decision, since discount/coupon/valid-days
- * position in the real approved template text isn't finalized yet.
+ * tabs. Per docs/superpowers/specs/2026-09-09-whatsapp-ai-draft-wame-design.md
+ * Option B: the wa.me link-open is now the PRIMARY action (one merchant tap
+ * pre-fills WhatsApp with the message; the merchant still has to tap send
+ * themselves inside WhatsApp — an extra manual-approval step, not fewer).
+ * The Cloud API template send stays fully live as an explicit SECONDARY
+ * option, only enabled when a template is configured for this occasion —
+ * identical sendWhatsAppTemplateMessage call/args as before this change.
+ * The preview box shows the customer's real AI-generated draft via
+ * generateMessageDraftRemote (2026-09-09 — on-demand generation + caching,
+ * see convex/ai.ts's generateMessageDraftPublic), gated on
+ * customer.whatsapp_consent === true. That backend call checks its own cache
+ * first (a draft the nightly cron OR a prior on-demand call already produced
+ * for today's occasion_date) and only calls Gemini fresh on a genuine miss —
+ * the modal doesn't know or care which happened, it just shows a brief
+ * "Generating AI draft…" loading state while the call is in flight. This
+ * REPLACES the old read-only fetchCustomerDraft/getDraftForCustomer call this
+ * modal used to make (2026-09-04) — that old call only ever read whatever the
+ * nightly cron had already produced and is now fully subsumed by
+ * generateMessageDraftPublic's own internal cache check, so keeping both
+ * would just be two backend round-trips doing overlapping work.
+ * fetchCustomerDraft/getDraftForCustomer themselves are NOT removed from
+ * db.js/customers.ts — only this call site. If whatsapp_consent is false, or
+ * the call resolves to null for any reason (network/Gemini failure), this
+ * falls back to the exact same fixed-text preview this modal always used —
+ * unchanged fallback branch, not a replacement.
  */
 function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent }) {
-  const { customer, occasion } = target;
+  const { customer, occasion, combined } = target;
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
+  const [aiDraftText, setAiDraftText] = useState(null);
+  const [aiDraftLoading, setAiDraftLoading] = useState(false);
+  // Combined-occasion draft (2026-09-18 Combined-Occasion AI Draft design,
+  // docs/superpowers/specs/2026-09-18-combined-occasion-ai-draft-design.md) —
+  // when target.combined is true, this modal fetches ONE real combined draft
+  // (generateCombinedMessageDraftRemote — a single Gemini call that is TOLD
+  // both occasions fall today, so it writes one coherent message) instead of
+  // the old two separate single-occasion calls stitched together with a
+  // separator. Stays null and unused for the (completely unchanged)
+  // single-occasion case.
+  const [combinedAiDraftText, setCombinedAiDraftText] = useState(null);
+  const [combinedAiDraftLoading, setCombinedAiDraftLoading] = useState(false);
   const cfg = templateConfig[occasion] || { discountPercent: '', couponCode: '', validDays: '' };
   const waTemplate = waTemplates[occasion];
   const occasionLabel = occasion === 'birthday' ? 'Birthday' : 'Anniversary';
-  const occasionDate = parseMD(occasion === 'birthday' ? customer.birthday : customer.anniversary);
+  // Human-readable display string only (e.g. "Aug 27") — shown in the Info
+  // box below. NOT the dedup/cache key — see canonicalOccasionDate below for
+  // that (P0-1/P1-3 fix, 2026-09-09).
+  const rawOccasionDate = occasion === 'birthday' ? customer.birthday : customer.anniversary;
+  const occasionDate = parseMD(rawOccasionDate);
+
+  // isToday (2026-09-18 Today View spec) — this modal now also opens from the
+  // 'birthday_today'/'anniversary_today' tabs (setApproveTarget's call sites,
+  // both plain-single AND combined, are all gated on isCombinedToday/isToday
+  // in the row block above), in addition to the original two "tomorrow" tabs.
+  // The combined case ONLY ever opens from a today-tab row (isCombinedToday
+  // in the parent requires filter to be one of the *_today keys), so
+  // `combined` alone is sufficient to pick canonicalTodayOccasionDate below —
+  // but isToday is also derived independently (from the customer's own
+  // birthday/anniversary match against real IST "today") so a future
+  // non-combined today-tab click computes the correct date too.
+  const isToday = combined || todayMD() === rawOccasionDate;
+
+  // P0-1/P1-3 fix (2026-09-09) — canonical "YYYY-M-D" dedup/cache key,
+  // computed ONCE per modal instance (this component only ever mounts fresh
+  // per approveTarget — see the `{approveTarget && <ApprovalModal .../>}`
+  // conditional render in the parent, which unmounts/remounts on target
+  // change) and reused for BOTH the AI-draft cache call below AND the
+  // recordMessageAction call the parent's onSent handler makes, so a cached
+  // draft and its corresponding sent/cancelled decision for the same real
+  // occurrence always agree on the exact same key string. This modal opens
+  // from four tabs now: Birthdays/Anniversaries "tomorrow" (original) and
+  // "today" (2026-09-18 addition) — isToday above picks the correct
+  // canonical-date helper for whichever tab this instance opened from.
+  const canonicalOccasionDate = useMemo(
+    () => (isToday ? canonicalTodayOccasionDate() : canonicalTomorrowOccasionDate()),
+    [isToday]
+  );
+
+  // On open (or if the target customer/occasion changes) AND the customer has
+  // given WhatsApp consent, ask the backend for a real AI draft — a cache hit
+  // (nightly cron already ran, or a prior on-demand call already generated
+  // one for this exact tuple) resolves near-instantly; a cache miss takes a
+  // moment longer while Gemini generates fresh. Either way the modal shows a
+  // brief "Generating AI draft…" loading state for the duration.
+  //
+  // If whatsapp_consent is false, this effect deliberately does NOTHING —
+  // no backend call of any kind, no loading state — the fixed-template
+  // preview below renders immediately, since a non-consented customer can't
+  // be sent to anyway (no point spending a Gemini-adjacent backend call).
+  useEffect(() => {
+    setAiDraftText(null);
+    if (!customer.whatsapp_consent) {
+      setAiDraftLoading(false);
+      return;
+    }
+    let live = true;
+    setAiDraftLoading(true);
+    // P0-1/P1-3 fix (2026-09-09): canonical key (see canonicalOccasionDate
+    // above), not the raw year-less birthday/anniversary string — this is
+    // what keeps the AI-draft cache tuple aligned with recordMessageAction's
+    // tuple for the exact same real occurrence.
+    generateMessageDraftRemote(customer.id, customer.name, customer.tier, occasion, canonicalOccasionDate)
+      .then((draftText) => {
+        if (live && draftText) setAiDraftText(draftText);
+      })
+      .finally(() => { if (live) setAiDraftLoading(false); });
+    return () => { live = false; };
+  }, [customer.id, customer.name, customer.tier, customer.whatsapp_consent, occasion, canonicalOccasionDate]);
+
+  // Combined-occasion draft fetch (2026-09-18 Combined-Occasion AI Draft
+  // design) — ONLY runs when target.combined is true. Fires ONE
+  // generateCombinedMessageDraftRemote call (not two) so Gemini writes a
+  // single coherent birthday+anniversary message. The original single-
+  // occasion effect above still runs unchanged (harmless extra fetch for the
+  // combined case — its result is simply not used in the combined preview
+  // below, see combinedPreviewText).
+  useEffect(() => {
+    setCombinedAiDraftText(null);
+    if (!combined || !customer.whatsapp_consent) {
+      setCombinedAiDraftLoading(false);
+      return;
+    }
+    let live = true;
+    setCombinedAiDraftLoading(true);
+    generateCombinedMessageDraftRemote(customer.id, customer.name, customer.tier)
+      .then((draftText) => {
+        if (live && draftText) setCombinedAiDraftText(draftText);
+      })
+      .finally(() => { if (live) setCombinedAiDraftLoading(false); });
+    return () => { live = false; };
+  }, [combined, customer.id, customer.name, customer.tier, customer.whatsapp_consent]);
 
   // Preview text — reference-only for the merchant, assembled from the
   // customer's name plus the configured discount/coupon/valid-days for this
@@ -516,65 +942,155 @@ function ApprovalModal({ target, templateConfig, waTemplates, onClose, onSent })
     cfg.discountPercent ? `Enjoy ${cfg.discountPercent}% off` + (cfg.couponCode ? ` with code ${cfg.couponCode}` : '') + (cfg.validDays ? `, valid for ${cfg.validDays} days.` : '.') : null,
   ].filter(Boolean);
 
-  const previewText = previewLines.join('\n');
+  const fallbackPreviewText = previewLines.join('\n');
+  // Real AI draft when one exists for today's occasion_date, else the exact
+  // same fixed-text fallback this modal always showed.
+  const previewText = aiDraftText || fallbackPreviewText;
+
+  // Combined-occasion fallback text (2026-09-18 Combined-Occasion AI Draft
+  // design) — used only if generateCombinedMessageDraftRemote fails/returns
+  // null. Adapts the existing single-occasion fixed-template style (same
+  // "Happy <occasion>, <name>! With love, 85 Lansdowne." + promo-line shape
+  // as previewLines above) into ONE message mentioning both occasions,
+  // rather than inventing unrelated new copy. Only computed/used when
+  // combined is true.
+  const combinedFallbackPreviewText = combined
+    ? [
+        `Happy birthday and happy anniversary, ${customer.name}! With love, 85 Lansdowne.`,
+        `(Both name slots {{1}} and {{2}} use "${customer.name}" — no separate partner name on file.)`,
+        cfg.discountPercent ? `Enjoy ${cfg.discountPercent}% off` + (cfg.couponCode ? ` with code ${cfg.couponCode}` : '') + (cfg.validDays ? `, valid for ${cfg.validDays} days.` : '.') : null,
+      ].filter(Boolean).join('\n')
+    : '';
+
+  // Combined-occasion single wa.me text (2026-09-18 design) — the AI's ONE
+  // combined draft when available, else the combined fallback above. This is
+  // no longer a stitched concatenation of two separate draft texts — it is
+  // one coherent message. Still sent via a single wa.me open (unchanged
+  // reasoning: window.open() twice in a row is commonly popup-blocked on the
+  // second call), followed by the same two sequential recordMessageAction
+  // calls (birthday then anniversary) so points/dedup bookkeeping is
+  // unaffected by this change.
+  const combinedPreviewText = combined
+    ? (combinedAiDraftText || combinedFallbackPreviewText)
+    : '';
 
   const openWaLinkFallback = () => {
     window.open(`https://wa.me/${waDigits(customer.whatsapp || customer.mobile)}?text=${encodeURIComponent(previewText)}`, '_blank');
   };
 
-  const approve = async () => {
-    // Consent gate — never send to a customer who hasn't given WhatsApp
-    // consent, even if the button is somehow triggered while disabled.
+  // Primary action (Option B): open wa.me pre-filled with the preview text
+  // (AI draft if available, else the fixed fallback). Never calls the Cloud
+  // API — that is now the explicit secondary action below.
+  const sendViaWaLink = () => {
     if (!customer.whatsapp_consent) return;
 
-    // No template configured for this occasion type yet → skip the Cloud
-    // API attempt entirely, go straight to wa.me — same guard MomentCard.send()
-    // uses, not an error state.
-    if (!waTemplate) {
-      openWaLinkFallback();
-      setSendMsg('Sent via WhatsApp link');
-      onSent?.(customer.id, occasion, 'wa_fallback');
+    // Combined path (2026-09-18 spec, point 3) — single wa.me open with both
+    // occasions' text (see combinedPreviewText above for why one open, not
+    // two), followed by TWO sequential recordMessageAction calls — one per
+    // occasion, both using canonicalOccasionDate (== canonicalTodayOccasionDate()
+    // here, since combined only ever opens from a today-tab row) — so both
+    // birthday and anniversary points bonuses correctly credit per the
+    // existing, already-tested recordMessageAction auto-points logic. This
+    // reuses that existing logic called twice; no new combined-send mutation.
+    if (combined) {
+      window.open(`https://wa.me/${waDigits(customer.whatsapp || customer.mobile)}?text=${encodeURIComponent(combinedPreviewText)}`, '_blank');
+      setSendMsg('Sent via WhatsApp link (Birthday + Anniversary)');
+      onSent?.(customer.id, 'birthday', 'wa_fallback', canonicalOccasionDate, 'link_opened');
+      onSent?.(customer.id, 'anniversary', 'wa_fallback', canonicalOccasionDate, 'link_opened');
       onClose();
       return;
     }
 
-    // Template IS configured → try the Cloud API send first. bodyParams:
-    // [name] only, no card image URL — identical shape to MomentCard.send().
+    openWaLinkFallback();
+    setSendMsg('Sent via WhatsApp link');
+    // 4th arg (canonicalOccasionDate) added 2026-09-09 — see the P0-1/P1-3
+    // fix note on canonicalOccasionDate above; the parent's onSent handler
+    // now uses this instead of re-deriving from approveTarget.customer's raw
+    // birthday/anniversary string.
+    //
+    // 5th arg 'link_opened' (P2-4 fix, 2026-09-09) — this path only opens
+    // wa.me with a pre-filled draft; it does NOT confirm the merchant actually
+    // pressed Send inside WhatsApp, so it must not be logged as 'sent' (that
+    // value is now reserved for a genuinely-confirmed Cloud API success).
+    onSent?.(customer.id, occasion, 'wa_fallback', canonicalOccasionDate, 'link_opened');
+    onClose();
+  };
+
+  // Secondary action: the original Cloud API template send, unchanged in
+  // behavior — same args, same template-configured check, same on-failure
+  // fallback to the wa.me link-open (still logs 'wa_fallback' if it falls
+  // through, exactly as before this change).
+  const sendViaCloudApi = async () => {
+    if (!customer.whatsapp_consent || !waTemplate) return;
     setSending(true);
     setSendMsg('Sending…');
     let channel = 'cloud_api';
+    // P2-4 fix (2026-09-09) — action confirmation level, independent of
+    // channel: 'sent' only when Meta's Cloud API genuinely acknowledged the
+    // send (try block below); if it fails and we fall back to opening wa.me,
+    // that's the SAME unconfirmed situation as sendViaWaLink's primary path,
+    // so it must log 'link_opened', not 'sent'.
+    let action = 'sent';
     try {
       await sendWhatsAppTemplateMessage(customer.mobile, waTemplate.name, waTemplate.language, undefined, [customer.name.trim() || '{name}']);
       setSendMsg('Sent via WhatsApp');
     } catch (err) {
-      // Any failure (Meta rejection, network error, etc.) → fall back to the
+      // Any failure (Meta rejection, network error, etc.) — fall back to the
       // same wa.me link-open, using the preview text shown above.
       openWaLinkFallback();
       setSendMsg('Sent via WhatsApp link');
       channel = 'wa_fallback';
+      action = 'link_opened';
     } finally {
       setSending(false);
-      onSent?.(customer.id, occasion, channel);
+      // 4th arg (canonicalOccasionDate) added 2026-09-09 — same as
+      // sendViaWaLink above. 5th arg (action) — see P2-4 fix note above.
+      onSent?.(customer.id, occasion, channel, canonicalOccasionDate, action);
       onClose();
     }
   };
 
   return (
-    <Modal open onClose={onClose} title={`Approve & Send — ${occasionLabel}`}>
+    <Modal open onClose={onClose} title={combined ? 'Approve & Send — Birthday + Anniversary' : `Approve & Send — ${occasionLabel}`}>
       <div className="space-y-4">
         <div className="grid sm:grid-cols-2 gap-4">
           <Info label="Client" value={customer.name} />
-          <Info label="Occasion" value={occasionLabel} />
-          <Info label={occasionLabel} value={occasionDate} />
+          <Info label="Occasion" value={combined ? 'Birthday + Anniversary' : occasionLabel} />
+          <Info label={combined ? 'Date' : occasionLabel} value={occasionDate} />
           <Info label="Mobile" value={customer.mobile} />
         </div>
         <div>
           <div className="label">Preview (merchant reference only)</div>
-          <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{previewText}</div>
+          {(combined ? combinedAiDraftLoading : aiDraftLoading) && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
+          {/* Combined case shows the ONE combined AI message (or its fallback)
+              so the merchant sees exactly what will be sent before approving —
+              single-occasion case is completely unchanged below. */}
+          <div className="text-sm border border-line bg-mist px-3 py-2 whitespace-pre-line">{combined ? combinedPreviewText : previewText}</div>
         </div>
         <div className="flex gap-2">
           <button onClick={onClose} className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1">Cancel</button>
-          <button onClick={approve} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">Approve &amp; Send</button>
+          <button onClick={sendViaWaLink} disabled={sending || !customer.whatsapp_consent} className="btn-gold !px-3 !py-1.5 text-[10px] flex-1">
+            {combined ? 'Approve & Send (Both)' : 'Approve & Send'}
+          </button>
+        </div>
+        <div className="flex flex-col gap-1">
+          <div className="flex gap-2">
+            {/* Cloud API secondary button — disabled for the combined case
+                (2026-09-18 spec, point 7): its fixed-template mechanism can
+                only represent ONE occasion per send, so it cannot correctly
+                represent a combined birthday+anniversary send. Completely
+                unchanged (enabled, same waTemplate/consent gating) for every
+                single-occasion case, today or tomorrow. */}
+            <button
+              onClick={sendViaCloudApi}
+              disabled={combined || sending || !customer.whatsapp_consent || !waTemplate}
+              title={combined ? 'Not available for combined occasions yet' : (waTemplate ? 'Send via WhatsApp Cloud API template instead' : 'No WhatsApp template configured for this occasion')}
+              className="btn-ghost !px-3 !py-1.5 text-[10px] flex-1"
+            >
+              Send via Cloud API instead
+            </button>
+          </div>
+          {combined && <div className="text-[10px] text-steel">Not available for combined occasions yet</div>}
         </div>
         {!customer.whatsapp_consent && (
           <div className="text-red-600 text-xs">This customer hasn't given WhatsApp consent yet — can't send.</div>

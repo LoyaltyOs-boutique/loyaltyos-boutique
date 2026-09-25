@@ -1,0 +1,41 @@
+# Send All — Bulk AI-Drafted WhatsApp Outreach — Design
+
+## Problem
+Merchant currently must click "Approve & Send" individually per customer in the Birthdays/Anniversaries tomorrow lists. Wants a "Send All" button that, in one click, sends every consenting customer in tomorrow's list their own personalized AI-drafted message — automatically, no per-customer manual WhatsApp tap.
+
+## Why this must go through Cloud API, not wa.me
+wa.me requires window.open() per send, and multiple window.open() calls in one click handler get popup-blocked after the first (confirmed via real browser activation-model research in a prior audit). A queued "tap once per customer" UI was considered and rejected for this specific feature since the whole point is one-click-sends-all. Cloud API sends are real server-side fetch calls (Convex action), with zero popup-blocking concern, confirmed via existing sendWhatsAppTemplateMessage's real code.
+
+## Why this can't be fully tested today
+WhatsApp Cloud API only allows sending pre-approved Meta templates, and live data confirms whatsapp_templates.birthday/.anniversary are both null right now — no approved template exists (D-17, still blocked on Ma'am's Meta Business approval). This feature is being built as correct, complete architecture now, so it activates immediately once a real template exists — but it cannot be live-send-tested until then.
+
+## Known open question — flag explicitly for whoever configures the real Meta template
+Option 1 (approved by Saidul) is for the FULL AI-drafted message text to go into the template as one large variable/parameter, rather than a small fixed-template-plus-name. This requires the real Meta-approved template to be DESIGNED with one large personalization slot — Meta's review process may push back on a template that's "mostly one big free-text variable," which is a real risk outside this codebase's control. Whoever submits the template for Meta approval needs to know this in advance. If Meta requires a different structure (e.g. multiple small fixed slots), this feature's bodyParams construction will need a follow-up adjustment to match — this build makes a best-effort, clearly-flagged placeholder assumption ([draftText] as the sole body param) that must be revisited once the real template's exact parameter structure is known.
+
+## Backend (new code only, zero changes to existing functions)
+1. Read the real, current signatures of: sendWhatsAppTemplateMessage (convex/whatsapp.ts), generateMessageDraft/generateCombinedMessageDraft (convex/ai.ts), getWhatsAppTemplates (convex/settings.ts or wherever it lives), getUpcomingBirthdays/getUpcomingAnniversaries (convex/customers.ts), and recordMessageAction (convex/customers.ts) — verbatim, before writing anything. Do not guess any signature.
+2. New action, e.g. convex/whatsapp.ts's sendAllUpcomingOccasionMessages(userId, token) — merchant-session-gated (same pattern as existing session checks in this file):
+   a. Fetch tomorrow's birthday and anniversary lists (days_until === 1, reusing the existing upcoming-window queries with days:1).
+   b. Filter to whatsapp_consent === true only.
+   c. Merge by customer_id: a customer appearing in BOTH lists for the same date is a combined-occasion customer (same detection logic already used for the Today View's isCombinedToday, adapted for tomorrow's date).
+   d. Check whatsapp_templates — if BOTH birthday and anniversary templates are null (today's real state), return early: { ok: false, reason: 'no_template', sent: 0, skipped: 0, failed: 0, results: [] } — no sends attempted, no crash, no partial state. This is the graceful "not yet available" path that keeps everything safe until Meta approval lands.
+   e. If a real template exists (future state): for each eligible customer, generate their AI draft (generateMessageDraft for single-occasion, generateCombinedMessageDraft for the combined case — reuse both exactly as they exist today, zero changes), then call sendWhatsAppTemplateMessage with the draft text as the body param (per the Option 1 placeholder noted above), then call ctx.runMutation(api.customers.recordMessageAction, { customer_id, occasion, occasion_date, action: 'sent', channel: 'cloud_api', userId, token }) — this is the EXACT existing, unmodified mutation, so tier-aware points-crediting and idempotency protection apply automatically with zero new logic.
+   f. Catch failures per-customer (a Graph API error, an "already decided" idempotency rejection from recordMessageAction, a missing name/tier, etc.) and continue to the next customer rather than aborting the whole batch — build a results array: [{ customerId, name, occasion, status: 'sent' | 'skipped' | 'failed', reason }].
+   g. Return { ok: true, sentCount, skippedCount, failedCount, results }.
+
+## Frontend (new code only)
+3. New bridge sendAllUpcomingOccasionMessagesRemote() in src/lib/db.js, mirroring the existing null/false-on-failure, never-throw bridge pattern used elsewhere in this file.
+4. New "Send All" button, placed near the existing Birthdays/Anniversaries tomorrow tab controls (do not modify the existing per-row Approve & Send/Cancel UI or its buttons at all) — opens a confirmation modal (reuse the existing Modal component) showing a live recipient-count breakdown (X birthday-only, Y anniversary-only, Z combined) fetched via the existing getUpcomingBirthdays/getUpcomingAnniversaries bridges before committing to the send.
+5. If getWhatsAppTemplates shows no real template configured (today's actual state), the button/modal shows a clear, honest "WhatsApp template pending Meta approval — Send All isn't available yet" message instead of a send option — inert but visible, not hidden, not crashing.
+6. On a real send completing (future state, once template exists): loop through the returned results and call the existing local pushEvent() helper once per successful send, so these sends appear in this merchant browser's Recent Activity feed exactly like every other locally-tracked action today — no new backend/Convex plumbing needed for this, reusing the exact existing local-activity mechanism.
+7. Separately (small, safe, additive fix per the audit's finding): add one pushEvent() call inside db.js's EXISTING recordMessageAction bridge function, right after its mutation call resolves successfully — this makes today's individual "Approve & Send" flow (which currently never shows up in Recent Activity at all) start appearing there too, going forward. This is purely additive to that function — do not change anything else about how it works.
+
+## Explicitly NOT touched
+convex/customers.ts's recordMessageAction itself (called, never modified), reviews.ts, the existing per-customer ApprovalModal and its send handlers, the Today View combined-single-customer flow, any tier-aware points logic (reused as-is).
+
+## Amendment — 2026-09-23 (as built)
+
+1. UI: no confirmation modal. A single inline row under the Birthdays tomorrow / Anniversaries tomorrow list in src/pages/merchant/Customers.jsx: a "Send All (N)" button (N = unique customers with whatsapp_consent true and days_until === 1), an inline Confirm/Cancel step, and an inline result line. While no Meta-approved template exists the button is disabled and a "WhatsApp template pending Meta approval" line is shown. Only existing classes are reused; CSS unchanged at 30.00 kB.
+2. Recent Activity: the recordMessageAction bridge in src/lib/db.js pushes a local 'message_action' event followed by emit() after every successful Approve & Send or Cancel. Labels: sent -> "wish sent", link_opened -> "wish opened in WhatsApp", cancelled -> "wish cancelled". Send All events are keyed by the customer's local id (Convex _id resolved via convexId). The feed is local to each browser and is not visible on other devices.
+3. src/pages/merchant/Dashboard.jsx ACTION map gains message_action with icon U+2709 (text presentation, same family as the existing heart icon, no variation selector). Protected-file edit approved by Saidul.
+4. Open items before live use: a real Meta-approved template and credentials (D-17); the single-variable template shape (Option 1) may be rejected by Meta; a customer whose Cloud API send succeeds but whose recordMessageAction then fails is currently counted as failed, and this must be fixed before activation.

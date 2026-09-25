@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl, getWhatsAppTemplates, getWhatsAppTemplateConfig, setWhatsAppTemplateConfig, sendWhatsAppTemplateMessage, sendWhatsAppServiceMessage } from '../../lib/db.js';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { getCustomers, uploadTemplateMedia, getTemplateCardUrls, setTemplateCardUrl, getWhatsAppTemplates, getWhatsAppTemplateConfig, setWhatsAppTemplateConfig, sendWhatsAppTemplateMessage, sendWhatsAppServiceMessage, generateMessageDraftRemote, generateMessageDraftManualRemote } from '../../lib/db.js';
 
 // Templates — Phase 1 (structure only). Design spec:
 // docs/superpowers/specs/2026-08-22-templates-section-phase1-design.md
@@ -33,6 +33,39 @@ const toWaPhone = (phone) => {
 const buildWaLink = (phone, message) =>
   `https://wa.me/${toWaPhone(phone)}?text=${encodeURIComponent(message)}`;
 
+// Fixed +5:30 IST offset (no daylight-saving) — same constant convex/customers.ts
+// and Customers.jsx use for their IST-shift-then-read-UTC-calendar-fields
+// technique.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * canonicalOccasionDate — turns a customer's year-less "M-D" birthday/anniversary
+ * string into a stable, year-bearing "YYYY-M-D" cache key for the AI-draft cache
+ * tuple (schema.ts ai_message_drafts.occasion_date). Mirrors Customers.jsx's
+ * canonicalTomorrowOccasionDate (Customers.jsx:617-621) — same IST-shift +
+ * Date.UTC arithmetic — but keys off the customer's REAL occasion month-day (not
+ * "tomorrow"), so Templates.jsx (which may send on any day) produces one stable
+ * key per customer+occasion. Uses the current IST year; if that occurrence has
+ * already passed this year, rolls to next year so the key still points at the
+ * next real occurrence (matching the "upcoming occurrence" semantics the rest of
+ * the codebase uses). Returns '' for a missing/malformed source so the caller
+ * (bridge resolves null on empty occasionDate) falls back to static text.
+ */
+function canonicalOccasionDate(rawMd) {
+  if (!rawMd) return '';
+  const parts = String(rawMd).split('-').map((n) => parseInt(n, 10));
+  if (parts.length !== 2 || parts.some((n) => Number.isNaN(n))) return '';
+  const [month, day] = parts;
+  const istNow = new Date(Date.now() + IST_OFFSET_MS);
+  const year = istNow.getUTCFullYear();
+  const thisYear = new Date(Date.UTC(year, month - 1, day));
+  const todayFloor = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+  const target = thisYear.getTime() < todayFloor.getTime()
+    ? new Date(Date.UTC(year + 1, month - 1, day))
+    : thisYear;
+  return `${target.getUTCFullYear()}-${target.getUTCMonth() + 1}-${target.getUTCDate()}`;
+}
+
 /**
  * Customer-select toggle, shared by all three cards: "Existing customer"
  * (populated from the existing getCustomers query, auto-fills name + mobile)
@@ -40,7 +73,7 @@ const buildWaLink = (phone, message) =>
  * manual field in both modes — no nickname field exists on the customer
  * record (confirmed via audit), so it's never auto-filled or persisted.
  */
-function CustomerSelect({ customers, name, setName, phone, setPhone }) {
+function CustomerSelect({ customers, name, setName, phone, setPhone, onSelectedCustomerChange }) {
   const [mode, setMode] = useState('existing'); // 'existing' | 'manual'
   const [selectedId, setSelectedId] = useState('');
 
@@ -51,6 +84,20 @@ function CustomerSelect({ customers, name, setName, phone, setPhone }) {
       setName(c.name || '');
       setPhone(c.mobile || '');
     }
+    // Lift the resolved customer (or null for the "Choose…" empty option) up to
+    // MomentCard so it can branch the AI-draft path (existing = cached, keyed on
+    // the customer's real tier + occasion date; manual = live/uncached).
+    onSelectedCustomerChange?.(c || null);
+  };
+
+  // Switching to manual mode = no customer record; clear the lifted selection so
+  // MomentCard takes the manual (typed-name, uncached) AI-draft path.
+  const switchMode = (next) => {
+    setMode(next);
+    if (next === 'manual') {
+      setSelectedId('');
+      onSelectedCustomerChange?.(null);
+    }
   };
 
   return (
@@ -58,14 +105,14 @@ function CustomerSelect({ customers, name, setName, phone, setPhone }) {
       <div className="flex items-center gap-2">
         <button
           type="button"
-          onClick={() => setMode('existing')}
+          onClick={() => switchMode('existing')}
           className={mode === 'existing' ? 'btn-ink !py-1 !px-2 text-[9px] flex-1' : 'btn-ghost !py-1 !px-2 text-[9px] flex-1'}
         >
           Existing customer
         </button>
         <button
           type="button"
-          onClick={() => setMode('manual')}
+          onClick={() => switchMode('manual')}
           className={mode === 'manual' ? 'btn-ink !py-1 !px-2 text-[9px] flex-1' : 'btn-ghost !py-1 !px-2 text-[9px] flex-1'}
         >
           New / manual
@@ -116,6 +163,17 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
   const [message, setMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [sendMsg, setSendMsg] = useState('');
+
+  // Selected existing-customer record (null in manual mode / no selection) —
+  // lifted from CustomerSelect so this card can branch the AI-draft path.
+  const [selectedCustomer, setSelectedCustomer] = useState(null);
+  const [aiDraftLoading, setAiDraftLoading] = useState(false);
+  // Monotonic request id — the same "live"/latest-request guard Customers.jsx's
+  // ApprovalModal uses (via a per-effect `live` flag): a stale in-flight draft
+  // response must never overwrite a newer selection, a newer manual-name settle,
+  // or text the merchant has since hand-edited. Every draft call captures the id
+  // it was issued under and only applies its result if still current.
+  const draftReqRef = useRef(0);
 
   // Merchant-configured promo copy (Discount%, Coupon Code, Valid Days) —
   // local controlled state synced from the parent-fetched templateConfig
@@ -172,13 +230,79 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
     }
   };
 
-  // Auto-fills the message textarea from the hardcoded Phase-1 placeholder
-  // whenever name/nickname changes; merchant can still hand-edit it before
-  // sending (plain controlled textarea, not locked).
+  // Static fallback base — auto-fills the message textarea from the hardcoded
+  // Phase-1 placeholder whenever name/nickname changes. This is the graceful
+  // fallback the AI-draft paths below fall back TO on any null result (no key /
+  // Gemini failure / rate-limit): the box is never left blank. Merchant can
+  // still hand-edit it (plain controlled textarea, not locked). Unchanged from
+  // before this task.
   useEffect(() => {
     const who = nickname.trim() || name.trim() || '{name}';
     setMessage(template.replace('{name}', who));
   }, [name, nickname, template]);
+
+  // Existing-customer AI draft (cache-backed) — fires when a real customer is
+  // selected. Keys the cache on the customer's REAL occasion date (canonicalized
+  // to a stable year-bearing key per §3 of the design spec), never today's date.
+  // On a non-null result AND still-latest request, overwrites the static message
+  // with the AI draft; on null (Gemini/no-key/rate-limit) the static fallback
+  // already set above stands. The draftReqRef guard discards stale responses.
+  useEffect(() => {
+    if (!selectedCustomer) return;
+    const occasionRaw = cardType === 'birthday' ? selectedCustomer.birthday : selectedCustomer.anniversary;
+    const occasionDate = canonicalOccasionDate(occasionRaw);
+    const customerId = selectedCustomer.id || selectedCustomer._id;
+    const reqId = ++draftReqRef.current;
+    setAiDraftLoading(true);
+    generateMessageDraftRemote(customerId, selectedCustomer.name, selectedCustomer.tier, cardType, occasionDate)
+      .then((draftText) => {
+        if (draftReqRef.current === reqId && draftText) setMessage(draftText);
+      })
+      .finally(() => { if (draftReqRef.current === reqId) setAiDraftLoading(false); });
+  }, [selectedCustomer, cardType]);
+
+  // Manual-entry AI draft (uncached, live) — fires ~600ms after the merchant
+  // stops typing a name in manual mode (no selected customer record). Same
+  // null-safe fallback + stale-response guard as the existing-customer path.
+  useEffect(() => {
+    if (selectedCustomer) return; // existing-customer path owns drafts when a record is selected
+    const who = name.trim();
+    if (!who) return;
+    const timer = setTimeout(() => {
+      const reqId = ++draftReqRef.current;
+      setAiDraftLoading(true);
+      generateMessageDraftManualRemote(who, cardType)
+        .then((draftText) => {
+          if (draftReqRef.current === reqId && draftText) setMessage(draftText);
+        })
+        .finally(() => { if (draftReqRef.current === reqId) setAiDraftLoading(false); });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [name, cardType, selectedCustomer]);
+
+  // Regenerate — force a fresh draft, bypassing/overwriting the cache for the
+  // existing-customer path; manual path re-runs the always-live call. Kept enabled
+  // in both modes: the manual call is idempotent-safe to re-run (see report). Uses
+  // the same draftReqRef guard so a slow regenerate can't clobber a newer action.
+  const regenerate = () => {
+    const reqId = ++draftReqRef.current;
+    setAiDraftLoading(true);
+    const call = selectedCustomer
+      ? generateMessageDraftRemote(
+          selectedCustomer.id || selectedCustomer._id,
+          selectedCustomer.name,
+          selectedCustomer.tier,
+          cardType,
+          canonicalOccasionDate(cardType === 'birthday' ? selectedCustomer.birthday : selectedCustomer.anniversary),
+          true,
+        )
+      : generateMessageDraftManualRemote(name.trim(), cardType);
+    call
+      .then((draftText) => {
+        if (draftReqRef.current === reqId && draftText) setMessage(draftText);
+      })
+      .finally(() => { if (draftReqRef.current === reqId) setAiDraftLoading(false); });
+  };
 
   // Card-image URL — same-origin OG-preview path (middleware.js resolves it
   // to the current live card at request time), unchanged by this task.
@@ -229,13 +353,24 @@ function MomentCard({ eyebrow, title, template, customers, cardOptions, cardType
       <div className="eyebrow mb-1">{eyebrow}</div>
       <h3 className="luxe-title text-lg mb-3">{title}</h3>
       <div className="space-y-3">
-        <CustomerSelect customers={customers} name={name} setName={setName} phone={phone} setPhone={setPhone} />
+        <CustomerSelect customers={customers} name={name} setName={setName} phone={phone} setPhone={setPhone} onSelectedCustomerChange={setSelectedCustomer} />
         <div>
           <label className="label">Nickname</label>
           <input className="input" value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="Optional — used in the message" />
         </div>
         <div>
-          <label className="label">Message</label>
+          <div className="flex items-center justify-between">
+            <label className="label">Message</label>
+            <button
+              type="button"
+              onClick={regenerate}
+              disabled={aiDraftLoading || (!selectedCustomer && !name.trim())}
+              className="btn-ghost !py-1 !px-2 text-[9px]"
+            >
+              Regenerate
+            </button>
+          </div>
+          {aiDraftLoading && <div className="text-xs text-gold mb-1">Generating AI draft…</div>}
           <textarea className="input" rows={3} value={message} onChange={(e) => setMessage(e.target.value)} />
         </div>
         <div>

@@ -35,6 +35,7 @@ export default function Catalogue() {
   const [newLookbookName, setNewLookbookName] = useState('');
   const [igImg, setIgImg] = useState('');
   const [igUrl, setIgUrl] = useState('');
+  const [igMsg, setIgMsg] = useState('');
   const [bulkMsg, setBulkMsg] = useState('');
     const [csvPreview, setCsvPreview] = useState(null);
     const [pdfUploading, setPdfUploading] = useState(false);
@@ -120,7 +121,10 @@ export default function Catalogue() {
     } else if (addTo !== 'all') {
       lookbook_id = addTo;
     }
-    addCatalogueItem({ ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) });
+    const res = addCatalogueItem({ ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) });
+    // Missing-session case: surface the error (via the Manual-entry mediaMsg line)
+    // and do NOT clear the form / show success — the item was never saved.
+    if (res && res.ok === false) { setMediaMsg(res.error); return; }
     setManual({ title: '', price: '', image_url: '', instagram_link: '' });
     setAddTo('all');
     setNewLookbookName('');
@@ -153,7 +157,10 @@ export default function Catalogue() {
 
   const addIg = () => {
     if (!igImg) return;
-    addCatalogueItem({ title: 'Instagram Style Post', price: 0, image_url: igImg, instagram_link: igUrl || '#', source: 'instagram' });
+    const res = addCatalogueItem({ title: 'Instagram Style Post', price: 0, image_url: igImg, instagram_link: igUrl || '#', source: 'instagram' });
+    // Missing-session case: surface the error and don't clear the form / show success.
+    if (res && res.ok === false) { setIgMsg(res.error); return; }
+    setIgMsg('');
     setIgImg(''); setIgUrl('');
   };
   const onCsvParse = (f) => {
@@ -163,9 +170,15 @@ export default function Catalogue() {
       const rows = String(r.result).split(/\r?\n/).map((l) => l.split(',')).filter((r2) => r2.length >= 3 && r2[1].trim());
       setCsvPreview(rows.slice(0, 5));
       let added = 0;
-      rows.forEach(([title, price, url]) => {
-        if (title && price && url && url.startsWith('http')) { addCatalogueItem({ title: title.trim(), price: Number(price), image_url: url.trim(), source: 'csv' }); added++; }
-      });
+      for (const [title, price, url] of rows) {
+        if (title && price && url && url.startsWith('http')) {
+          const res = addCatalogueItem({ title: title.trim(), price: Number(price), image_url: url.trim(), source: 'csv' });
+          // Missing-session check is consistent for the whole batch — stop on the
+          // first failure and surface the error instead of a false success count.
+          if (res && res.ok === false) { setBulkMsg(res.error); return; }
+          added++;
+        }
+      }
       setBulkMsg(`Imported ${added} items from ${f.name}.`);
     };
     r.readAsText(f);
@@ -285,6 +298,7 @@ export default function Catalogue() {
           <label className="label mt-4">Instagram post URL</label>
           <input className="input mb-3" placeholder="https://instagram.com/p/…" value={igUrl} onChange={(e) => setIgUrl(e.target.value)} />
           <button onClick={addIg} className="btn-ink w-full" disabled={!igImg}>Add to lookbook feed</button>
+          {igMsg && <div className="text-xs text-gold mt-2">{igMsg}</div>}
         </section>
 
         <section className="card p-6">

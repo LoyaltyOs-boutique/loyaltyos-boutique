@@ -46,6 +46,10 @@ export const createOrder = mutation({
     // 1. Verify User
     const user = await ctx.db.get(customerId);
     if (!user) return { ok: false, error: "User not found" };
+    // Soft-delete rejection (2026-09-14 design, section c.6) — a merchant
+    // must not be able to create new orders/points for a deleted customer.
+    // Same {ok:false, error} shape as the other validation failures below.
+    if (user.is_deleted === true) return { ok: false, error: "Customer not found." };
 
     // 2. Validate Inputs
     if (subtotal_paise <= 0) return { ok: false, error: "Invalid subtotal" };
@@ -126,12 +130,19 @@ export const getOrdersByUser = query({
   },
 });
 
-/** Internal helper to fetch orders created today. */
+/**
+ * Internal helper to fetch orders created today.
+ *
+ * Scaling Fix 2 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md
+ * Addendum 2026-09-04): previously a full-table .filter() scan of every order
+ * ever placed. Now an indexed range read via by_created_at — only orders with
+ * created_at >= startOfToday are pulled from the database.
+ */
 async function getTodayOrdersInternal(ctx: QueryCtx) {
   const startOfToday = getStartOfToday();
   return await ctx.db
     .query("orders")
-    .filter((q) => q.gte(q.field("created_at"), startOfToday))
+    .withIndex("by_created_at", (q) => q.gte("created_at", startOfToday))
     .order("desc")
     .collect();
 }

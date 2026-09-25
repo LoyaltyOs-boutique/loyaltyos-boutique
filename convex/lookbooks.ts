@@ -93,6 +93,101 @@ export const getLookbookById = query({
 });
 
 /**
+ * Customer-facing global catalogue feed (design spec 2026-09-17).
+ * Source: docs/superpowers/specs/2026-09-17-customer-catalogue-pipe-design.md
+ *
+ * PUBLIC (customer magic-link gated, NOT merchant-session gated) — this is the
+ * missing piece that lets a real customer's own browser (which never carries
+ * a merchant session — customers authenticate via a completely separate
+ * magic-link mechanism) see live merchant-added products instead of the
+ * hardcoded src/data/seed.js demo catalogue.
+ *
+ * Validation deliberately MIRRORS validateMagicToken's read-only checks
+ * (convex/auth.ts:296-319) inline rather than calling it directly: that
+ * function is a mutation with no side effects today, but a pure catalogue
+ * read must never be coupled to it (or to any future token-rotation logic
+ * added there) — so the same by_magic_token lookup, role check, id-match
+ * check, and 180-day expiry math are duplicated here on purpose, kept
+ * byte-for-byte equivalent to auth.ts. Do not let the two drift apart.
+ *
+ * Architecture (confirmed, see spec): the catalogue is ONE shared global
+ * list — every merchant-added product is visible to every customer, no
+ * per-customer filtering, no kind-based filtering (catalogue/designer/pdf
+ * are all included). A future "personalized lookbook" AI feature may
+ * re-order this list per customer later, but must never restrict it.
+ *
+ * Returns null (never throws) on any invalid/expired/non-customer caller,
+ * matching Lookbook.jsx's existing null-handling convention (null = "show
+ * nothing real, fall back to local state").
+ *
+ * On success, returns a flat array shaped IDENTICALLY to what
+ * src/lib/db.js's hydrateCatalogue() already builds client-side, because a
+ * later frontend task will merge this array directly into
+ * state.catalogueItems and every existing reader (cart/likes/checkout)
+ * expects this exact shape.
+ */
+export const getCustomerCatalogue = query({
+  args: {
+    id: v.string(),
+    token: v.string(),
+  },
+  handler: async (ctx, { id, token }) => {
+    // --- Inline magic-link validation (mirrors auth.ts validateMagicToken) ---
+    const customer = await ctx.db
+      .query("users")
+      .withIndex("by_magic_token", (q) => q.eq("magic_token", token))
+      .first();
+    if (!customer || customer.role !== "customer") return null;
+    if (String(customer._id) !== id) return null;
+
+    const createdAt = customer.magic_token_created_at;
+    if (!createdAt || Number.isNaN(createdAt)) return null;
+
+    const MAGIC_LINK_DAYS = 180; // PRD §3.2 — same lifespan as auth.ts's MAGIC_LINK_DAYS
+    const DAY_MS = 86_400_000;
+    const expiresAt = createdAt + MAGIC_LINK_DAYS * DAY_MS;
+    if (Date.now() > expiresAt) return null;
+
+    // --- Validated: aggregate the full shared global catalogue ---
+    // Same aggregation hydrateCatalogue() does client-side (multi round-trip),
+    // done here server-side in one query call. No kind/lookbook filtering —
+    // every lookbook's items are included (catalogue/designer/pdf all count).
+    const lookbooks = await ctx.db.query("lookbooks").collect();
+    const allItems: Array<{
+      id: Id<"catalogue_items">;
+      convexId: Id<"catalogue_items">;
+      title: string;
+      price: number; // INR (converted from paise)
+      image_url: string;
+      instagram_link: string;
+      source: string;
+      lookbook_id: Id<"lookbooks">;
+    }> = [];
+
+    for (const lb of lookbooks) {
+      const items = await ctx.db
+        .query("catalogue_items")
+        .withIndex("by_lookbook", (q) => q.eq("lookbook_id", lb._id))
+        .collect();
+      for (const item of items) {
+        allItems.push({
+          id: item._id,
+          convexId: item._id,
+          title: item.title,
+          price: (item.price || 0) / 100, // Paise to INR — same conversion hydrateCatalogue() uses
+          image_url: item.image_url,
+          instagram_link: item.instagram_link || "",
+          source: lb.source || "manual",
+          lookbook_id: lb._id,
+        });
+      }
+    }
+
+    return allItems;
+  },
+});
+
+/**
  * Get a single catalogue item by id (O(1) lookup).
  * Server-side counterpart to src/lib/db.js's getCatalogueItemById() client
  * helper (which scans all lookbooks) — needed by the OG-preview middleware,

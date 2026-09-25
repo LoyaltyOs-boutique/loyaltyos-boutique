@@ -7,6 +7,7 @@ import {
   allCatalogue, likeItem, checkout, submitGmbReview, submitProductReview,
   getData, subscribe, customerLedger,
   validateMagicToken, syncMagicLinkCustomer,
+  trackCartAdd, trackLookbookView, hydrateCustomerCatalogue,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import AccessDenied from './AccessDenied.jsx';
@@ -46,8 +47,50 @@ export default function Lookbook() {
   const [points, setPoints] = useState(0);
   const [payMethod, setPayMethod] = useState('online');
   const [likeAnim, setLikeAnim] = useState(null);
+  // Race-condition fix (2026-09-17), upgraded 2026-09-19 (see
+  // docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md):
+  // was a bare boolean that flipped true on ANY hydrateCustomerCatalogue
+  // outcome (success or silent failure), so the grid rendered normally even
+  // when the real fetch had failed — no error, no retry, just stale/seed
+  // data shown forever. Now a 3-state machine driven by db.js's
+  // onSettled({ ok, reason }) contract:
+  //   'loading' — fetch attempt in flight, grid shows the loading message
+  //   'ready'   — genuine success (items.length > 0), render the real grid
+  //   'error'   — a true failure (no-client/no-array/thrown error) — NOT an
+  //               empty catalogue, which is its own honest state below
+  //   'empty'   — genuine success but the merchant has 0 items — distinct
+  //               from 'error' so we never show a false "retry" prompt for
+  //               a perfectly normal empty-catalogue merchant
+  const [catalogueState, setCatalogueState] = useState('loading');
 
   const navigate = useNavigate();
+
+  // Customer catalogue hydration (parallel to Customer Activity Intelligence's
+  // viewTrackedRef below): guards hydrateCustomerCatalogue() to fire exactly
+  // once per real page load, even though it's reachable from two different
+  // auth-resolution branches below (local-success and Convex-success) and
+  // regardless of unrelated re-renders. A separate ref from viewTrackedRef
+  // since it tracks a different concern (catalogue fetch vs view tracking).
+  const catalogueHydratedRef = useState(() => ({ done: false }))[0];
+  // Retry support: remember the last (id, token) pair a hydration attempt
+  // used, so the "tap to retry" button (error state only) can re-invoke
+  // hydrateCustomerCatalogue without re-running the whole auth effect.
+  const lastAuthRef = useState(() => ({ id: null, token: null }))[0];
+
+  // Maps db.js's onSettled outcome onto the 3-state machine above. Shared by
+  // every call site below (magic-link first-visit, Convex fallback,
+  // retry button) so the mapping logic lives in exactly one place.
+  const handleCatalogueSettled = (result) => {
+    if (result && result.ok) { setCatalogueState('ready'); return; }
+    if (result && result.reason === 'empty') { setCatalogueState('empty'); return; }
+    setCatalogueState('error');
+  };
+  const retryCatalogueHydration = () => {
+    const { id, token } = lastAuthRef;
+    if (!id || !token) return;
+    setCatalogueState('loading');
+    hydrateCustomerCatalogue(id, token, handleCatalogueSettled);
+  };
 
   // Authenticate via magic link (query) or 180-day session
   useEffect(() => {
@@ -61,12 +104,17 @@ export default function Lookbook() {
     }
     if (id && token) {
       const u = validateLookbook(id, token);
-      if (u) { 
-        saveCustomerSession(id, token); 
-        setCustomer(u); 
-        return; 
+      if (u) {
+        saveCustomerSession(id, token);
+        setCustomer(u);
+        if (!catalogueHydratedRef.done) {
+          catalogueHydratedRef.done = true;
+          lastAuthRef.id = id; lastAuthRef.token = token;
+          hydrateCustomerCatalogue(id, token, handleCatalogueSettled);
+        }
+        return;
       }
-      
+
       // Fallback: Validate against Convex for merchant-created clients (local-only
       // check above may fail because the client exists in the Convex users table,
       // not in this browser's localStorage). Convex validateMagicToken checks the
@@ -78,6 +126,11 @@ export default function Lookbook() {
           const synced = syncMagicLinkCustomer(res.user, token, res.user.id);
           saveCustomerSession(id, token);
           setCustomer(synced || res.user);
+          if (!catalogueHydratedRef.done) {
+            catalogueHydratedRef.done = true;
+            lastAuthRef.id = id; lastAuthRef.token = token;
+            hydrateCustomerCatalogue(id, token, handleCatalogueSettled);
+          }
         } else {
           // Truly invalid token (id doesn't exist in Convex OR local) → join form
           navigate(`/join?id=${id}&token=${token}`, { replace: true });
@@ -92,6 +145,18 @@ export default function Lookbook() {
       const u = validateLookbook(s.id, s.token);
       if (u) {
         setCustomer(u);
+        // Returning-session catalogue hydration (gap fix, 2026-09-22): this
+        // branch previously only set auth state and relied on the background
+        // refresh below — it never called hydrateCustomerCatalogue, so a
+        // returning customer (bookmarked page, no fresh magic-link URL) had
+        // catalogueState stuck on 'loading' forever. Same 3-line pattern as
+        // branches A/B above, using this branch's resolved s.id/s.token
+        // (the outer id/token params are null here — no URL params).
+        if (!catalogueHydratedRef.done) {
+          catalogueHydratedRef.done = true;
+          lastAuthRef.id = s.id; lastAuthRef.token = s.token;
+          hydrateCustomerCatalogue(s.id, s.token, handleCatalogueSettled);
+        }
         // Background refresh: local cache may be stale (e.g. points credited via
         // a review approval since this browser's last visit). Re-validate against
         // Convex in the background and merge in the live data once resolved —
@@ -110,7 +175,28 @@ export default function Lookbook() {
     setDenied(true);
   }, [params, navigate]);
 
-  const catalogue = useMemo(() => allCatalogue(), [db]);
+  // Customer Activity Intelligence (Part 1): fire exactly one lookbook_view
+  // per real visit, once `customer` first resolves (auth is async — magic
+  // link / session validation both resolve later than mount). The ref guard
+  // ensures this fires once per page load even though `customer` may be
+  // re-set by the background Convex refresh (lines ~99-104) or by unrelated
+  // re-renders — NOT once per re-render.
+  const viewTrackedRef = useState(() => ({ done: false }))[0];
+  useEffect(() => {
+    if (customer && !viewTrackedRef.done) {
+      viewTrackedRef.done = true;
+      trackLookbookView(customer.id);
+    }
+  }, [customer]);
+
+  // `db` is a referentially-stable, mutated-in-place singleton (see src/lib/db.js
+  // load()) — its object identity never changes, so React's Object.is dep check
+  // would never see it as "changed" and this memo would never recompute after
+  // mount even once the real Convex catalogue lands. `catalogueState` is a real
+  // useState that flips to 'ready' at exactly the moment fresh data is
+  // available, so it's the genuinely-changing second dependency that makes
+  // this memo recompute at the right time.
+  const catalogue = useMemo(() => allCatalogue(), [db, catalogueState]);
   const reviewedItemIds = useMemo(
     () => customer ? db.reviews.filter((r) => r.userId === customer.id && r.platform === 'in-app').map((r) => r.catalogueItemId) : [],
     [db, customer]
@@ -136,6 +222,10 @@ export default function Lookbook() {
       const ex = c.find((i) => i.id === item.id);
       return ex ? c.map((i) => (i.id === item.id ? { ...i, qty: i.qty + 1 } : i)) : [...c, { id: item.id, title: item.title, price: item.price, image_url: item.image_url, qty: 1 }];
     });
+    // Customer Activity Intelligence (Part 1): fire-and-forget tracking
+    // side-effect, sequential but independent of setCart above — never
+    // awaited, never gates or rolls back the actual cart add.
+    trackCartAdd(customer.id, item.id);
   };
   const setQty = (id, q) => setCart((c) => c.map((i) => (i.id === id ? { ...i, qty: Math.max(0, q) } : i)).filter((i) => i.qty > 0));
   const doCheckout = (method) => {
@@ -206,35 +296,66 @@ export default function Lookbook() {
               <span className="btn-gold !py-2">Write review</span>
             </button>
 
-            {/* Lookbook grid */}
-            <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-10">
-              {catalogue.map((item) => (
-                <article key={item.id} className="animate-fadeUp group">
-                  <div className="relative bg-mist overflow-hidden border border-line">
-                    <img src={item.image_url} alt={item.title} loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
-                    <button
-                      onClick={() => { likeItem(customer.id, item.id); setLikeAnim(item.id); setTimeout(() => setLikeAnim(null), 400); }}
-                      className={cls('absolute top-3 right-3 h-9 w-9 bg-white/90 border border-line flex items-center justify-center text-lg transition-transform cursor-pointer hover:scale-110', likeAnim === item.id && 'animate-pop')}
-                      aria-label="Like"
-                    >
-                      <span className={cls('text-gold', item.likes > 0 && 'drop-shadow')}>♥</span>
-                    </button>
-                    {item.likes > 0 && <div className="absolute bottom-3 left-3 bg-white/90 border border-line px-2 py-0.5 text-[10px] tracking-wide2 uppercase text-steel">{item.likes} loved</div>}
-                  </div>
-                  <div className="pt-4">
-                    <div className="eyebrow text-[9px] mb-1">85 Lansdowne Atelier</div>
-                    <h3 className="luxe-title text-lg leading-snug">{item.title}</h3>
-                    <div className="flex items-center justify-between mt-2">
-                      <span className="text-sm font-medium">{inr(item.price)}</span>
-                      <button onClick={() => addToCart(item)} className="btn-outline !py-1.5 !px-3 text-[9px]">Add to bag</button>
+            {/* Lookbook grid — gated on catalogueState (race-condition fix,
+                2026-09-17; upgraded to a real success/failure/empty
+                distinction 2026-09-19, see
+                docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md)
+                so a like/add-to-bag click can never target a seed-data id
+                right before hydrateCustomerCatalogue swaps the real Convex
+                catalogue in mid-session, AND so a genuine fetch failure is
+                never silently masked by stale/seed data — the customer sees
+                an explicit retry prompt instead. Only this grid waits; the
+                membership card, Google review banner, and everything else
+                above/below render unconditionally once customer resolves. */}
+            {catalogueState === 'loading' && (
+              <div className="py-16 text-center">
+                <div className="eyebrow mb-3">Loading your lookbook…</div>
+                <div className="luxe-title text-2xl text-gold animate-pulse">85 Lansdowne</div>
+              </div>
+            )}
+            {catalogueState === 'error' && (
+              <div className="py-16 text-center">
+                <div className="eyebrow mb-3 text-gold">Couldn't load your lookbook right now</div>
+                <p className="text-sm text-steel mb-5">Please check your connection and try again.</p>
+                <button onClick={retryCatalogueHydration} className="btn-ink">Tap to retry</button>
+              </div>
+            )}
+            {catalogueState === 'empty' && (
+              <div className="py-16 text-center">
+                <div className="eyebrow mb-3">No pieces added yet</div>
+                <p className="text-sm text-steel">Your boutique is curating your lookbook — check back soon.</p>
+              </div>
+            )}
+            {catalogueState === 'ready' && (
+              <div className="grid grid-cols-2 lg:grid-cols-3 gap-x-6 gap-y-10">
+                {catalogue.map((item) => (
+                  <article key={item.id} className="animate-fadeUp group">
+                    <div className="relative bg-mist overflow-hidden border border-line">
+                      <img src={item.image_url} alt={item.title} loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
+                      <button
+                        onClick={() => { likeItem(customer.id, item.id); setLikeAnim(item.id); setTimeout(() => setLikeAnim(null), 400); }}
+                        className={cls('absolute top-3 right-3 h-9 w-9 bg-white/90 border border-line flex items-center justify-center text-lg transition-transform cursor-pointer hover:scale-110', likeAnim === item.id && 'animate-pop')}
+                        aria-label="Like"
+                      >
+                        <span className={cls('text-gold', item.likes > 0 && 'drop-shadow')}>♥</span>
+                      </button>
+                      {item.likes > 0 && <div className="absolute bottom-3 left-3 bg-white/90 border border-line px-2 py-0.5 text-[10px] tracking-wide2 uppercase text-steel">{item.likes} loved</div>}
                     </div>
-                    <a href={waLink(item)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
-                      Inquire via WhatsApp ✆
-                    </a>
-                  </div>
-                </article>
-              ))}
-            </div>
+                    <div className="pt-4">
+                      <div className="eyebrow text-[9px] mb-1">85 Lansdowne Atelier</div>
+                      <h3 className="luxe-title text-lg leading-snug">{item.title}</h3>
+                      <div className="flex items-center justify-between mt-2">
+                        <span className="text-sm font-medium">{inr(item.price)}</span>
+                        <button onClick={() => addToCart(item)} className="btn-outline !py-1.5 !px-3 text-[9px]">Add to bag</button>
+                      </div>
+                      <a href={waLink(item)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
+                        Inquire via WhatsApp ✆
+                      </a>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
 
             {/* Product review block */}
             <section className="mt-16">

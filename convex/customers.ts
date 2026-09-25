@@ -1,7 +1,10 @@
-import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
-import { v } from "convex/values";
+import { mutation, query, internalQuery, type MutationCtx, type QueryCtx } from "./_generated/server";
+import { v, ConvexError } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
-import { requireMerchantSession } from "./auth";
+import { requireMerchantSession, issueMagicToken } from "./auth";
+import { rateLimiter } from "./rateLimits";
+import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -60,14 +63,46 @@ function toMerchantCustomer(doc: UserDoc) {
     magic_token_created_at: doc.magic_token_created_at ?? null,
     // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it).
     whatsapp_consent: doc.whatsapp_consent ?? false,
+    // Phase 5 (Feature C) — VVIP flag drives dispatchEvent's vvip-only recipient filter.
+    vvip: doc.vvip ?? false,
     // CONFIDENTIAL — merchant-only: body-fit measurements + internal staff notes.
     measurements: doc.measurements ?? {},
     staff_notes: doc.staff_notes ?? [],
   };
 }
 
-/** Fetch a single customer doc by _id, or null if missing / not a customer. */
+/**
+ * Fetch a single customer doc by _id, or null if missing / not a customer /
+ * soft-deleted.
+ *
+ * Soft-delete design (docs/superpowers/specs/2026-09-14-customer-soft-delete-design.md
+ * section c.3): this is the SHARED existence-check helper used by
+ * getCustomerById, getCustomerIntelligenceProfile, updateMeasurements,
+ * addStaffNote, updateCustomTags, updateCustomerProfile, and awardPoints —
+ * adding the is_deleted filter ONCE here fixes all of those call sites at
+ * once (single source of truth), rather than patching each one individually.
+ *
+ * NOTE — deleteCustomer does NOT call this filtered version to look up the
+ * customer it is about to delete. It needs to distinguish "not found" from
+ * "found but already deleted" (to return a clear idempotency error), which
+ * this helper can't do once it hides is_deleted:true rows. deleteCustomer
+ * uses getCustomerDocIncludingDeleted (below) instead.
+ */
 async function getCustomerDoc(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
+  const doc = await ctx.db.get(id);
+  if (!doc || doc.role !== "customer" || doc.is_deleted === true) return null;
+  return doc;
+}
+
+/**
+ * Unfiltered variant of getCustomerDoc — returns the doc regardless of its
+ * is_deleted flag (still requires role==="customer"). Used ONLY by
+ * deleteCustomer, which needs to see an already-deleted row in order to
+ * return its "already deleted" idempotency error instead of the generic
+ * "Customer not found." that the filtered getCustomerDoc would otherwise
+ * produce (since it hides is_deleted:true rows from every other caller).
+ */
+async function getCustomerDocIncludingDeleted(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
   const doc = await ctx.db.get(id);
   if (!doc || doc.role !== "customer") return null;
   return doc;
@@ -82,6 +117,20 @@ function parseMD(s: string | null | undefined): [number, number] | null {
   const day = Number(m[2]);
   if (month < 1 || month > 12 || day < 1 || day > 31) return null;
   return [month, day];
+}
+
+/**
+ * Scaling Fix 3 — normalize a birthday/anniversary string to zero-padded
+ * "MM-DD" (e.g. "8-1" and "08-01" both become "08-01"), for storage in the
+ * birthday_md/anniversary_md sort-mirror fields. Returns undefined when the
+ * input is missing/unparseable, so callers can spread it away (never write
+ * an explicit undefined field into Convex).
+ */
+function toMD(s: string | null | undefined): string | undefined {
+  const parsed = parseMD(s);
+  if (!parsed) return undefined;
+  const [month, day] = parsed;
+  return `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
 /**
@@ -103,10 +152,26 @@ function parseMD(s: string | null | undefined): [number, number] | null {
  */
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
-/** Build the set of "M-D" keys for the next `days` days (inclusive of today, IST calendar), with day offset. */
+/**
+ * Build the set of "M-D" keys for the next `days` days (inclusive of today,
+ * IST calendar), with day offset AND the real matched calendar Date object
+ * per key.
+ *
+ * P0-1 fix (2026-09-09, dedup-never-expires bug): `dateByKey` is new here —
+ * it hands back the actual `Date` object used to derive each "M-D" key, so
+ * callers (findUpcoming, below) can read off the REAL matched year for that
+ * occurrence instead of assuming "this year". This is the single source of
+ * truth for the year component: reusing THIS Date object (not constructing a
+ * fresh `new Date()` elsewhere) is what makes the Dec 31 -> Jan 1 wraparound
+ * correct — day i in this loop already carries the correct following year
+ * once the loop crosses a Dec 31 boundary (Date.UTC's month/day rollover
+ * handles that arithmetic natively), so there is no separate "is this a
+ * wraparound" branch to get wrong.
+ */
 function upcomingWindow(days: number, now = new Date()) {
   const keys = new Set<string>();
   const offset = new Map<string, number>();
+  const dateByKey = new Map<string, Date>();
   // Shift the UTC instant into IST before reading Y/M/D, so "today" reflects
   // the boutique's real local calendar day (see IST fix note above).
   const istNow = new Date(now.getTime() + IST_OFFSET_MS);
@@ -117,13 +182,58 @@ function upcomingWindow(days: number, now = new Date()) {
     const key = `${m}-${day}`;
     keys.add(key);
     if (!offset.has(key)) offset.set(key, i);
+    if (!dateByKey.has(key)) dateByKey.set(key, d);
   }
-  return { keys, offset };
+  return { keys, offset, dateByKey };
+}
+
+/**
+ * Scaling Fix 3 — the zero-padded "MM-DD" range(s) covering the same window
+ * upcomingWindow() describes (today..today+days, IST calendar, inclusive),
+ * for use as index-range bounds against birthday_md/anniversary_md.
+ *
+ * Returns ONE range [todayMD, endMD] when the window stays within the same
+ * calendar year, or TWO ranges when it crosses year-end: [todayMD, "12-31"]
+ * and ["01-01", wrappedEndMD]. Callers run one .withIndex(...) query per
+ * range and merge the results — a single range query cannot express "wraps
+ * past Dec 31 back to Jan 1" because index ranges are contiguous.
+ */
+function upcomingMDRanges(days: number, now = new Date()): Array<[string, string]> {
+  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
+  const startDay = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()));
+  const endDay = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + days));
+
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const toMDKey = (d: Date) => `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+
+  const startMD = toMDKey(startDay);
+  const endMD = toMDKey(endDay);
+
+  if (startDay.getUTCFullYear() === endDay.getUTCFullYear()) {
+    // Same calendar year — one contiguous range.
+    return [[startMD, endMD]];
+  }
+  // Crosses year-end — two contiguous ranges: today..Dec 31, and Jan 1..wrapped end.
+  return [
+    [startMD, "12-31"],
+    ["01-01", endMD],
+  ];
 }
 
 interface QueueHit {
   doc: UserDoc;
   daysUntil: number;
+  /**
+   * P0-1 fix (2026-09-09) — canonical "YYYY-M-D" dedup key for this exact
+   * matched occurrence (real calendar year + unpadded month + unpadded day),
+   * e.g. "2026-8-27". Derived from upcomingWindow()'s dateByKey Date object —
+   * the SAME Date already used to find this hit, so the year is always the
+   * REAL matched year (correctly the following year across a Dec 31 -> Jan 1
+   * wraparound), never a blind `new Date().getFullYear()`. This is now the
+   * single source of truth for message_actions/ai_message_drafts occasion_date
+   * keys — see hasDecidedAction below and findUpcomingInternal's projection.
+   */
+  occasionDate: string;
 }
 
 /**
@@ -134,6 +244,14 @@ interface QueueHit {
  * reappear in the Delight Queue tomorrow-tabs.
  *
  * Uses the by_customer_occasion_date index (no full-table scan).
+ *
+ * P0-1 fix (2026-09-09): `occasionDate` is now the canonical "YYYY-M-D" key
+ * (see QueueHit.occasionDate above) — a full calendar year is included, so a
+ * decision recorded for THIS year's occurrence no longer falsely matches
+ * NEXT year's occurrence of the same month-day (the old "M-D"-only key never
+ * changed across years, so dedup never expired — this is the actual bug
+ * fix). This function's own logic is unchanged; only the shape of the string
+ * callers pass in has changed.
  */
 async function hasDecidedAction(
   ctx: QueryCtx,
@@ -157,29 +275,101 @@ async function hasDecidedAction(
  *
  * Excludes any customer already decided (sent/cancelled) for that exact
  * occasion_date via message_actions — see hasDecidedAction above.
+ *
+ * Scaling Fix 3 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md
+ * Addendum 2026-09-04): previously scanned EVERY customer row and parsed
+ * their raw birthday/anniversary string one by one. Now runs one or two
+ * indexed range reads on birthday_md/anniversary_md (via
+ * by_role_birthday_md / by_role_anniversary_md) covering exactly the
+ * requested window — only customers whose occasion falls in-window are
+ * fetched from the database at all. Two ranges are needed when the window
+ * crosses a year boundary (e.g. Dec 29 + 7 days reaches Jan 5); see
+ * upcomingMDRanges. Matching, exclusion, and sort behavior are byte-identical
+ * to the prior full-scan version — this is a fetch-strategy change only.
  */
 async function findUpcoming(
   ctx: QueryCtx,
   days: number,
   field: "birthday" | "anniversary",
 ): Promise<QueueHit[]> {
-  const customers = await ctx.db
-    .query("users")
-    .filter((q) => q.eq(q.field("role"), "customer"))
-    .collect();
-  const { keys, offset } = upcomingWindow(Math.max(0, Math.floor(days)));
+  const clampedDays = Math.max(0, Math.floor(days));
+  const { keys, offset, dateByKey } = upcomingWindow(clampedDays);
+  const ranges = upcomingMDRanges(clampedDays);
+
+  // Fetch one page of candidate customers per MD range (1 range in the
+  // common case, 2 when the window wraps year-end), using the matching
+  // typed index per field — Convex's index query builder needs the field
+  // name as a literal, not a dynamic string, so branch per field rather
+  // than parameterizing the index/field name.
+  const seen = new Map<string, UserDoc>();
+  for (const [lo, hi] of ranges) {
+    const rows =
+      field === "birthday"
+        ? await ctx.db
+            .query("users")
+            .withIndex("by_role_birthday_md", (q) =>
+              q.eq("role", "customer").gte("birthday_md", lo).lte("birthday_md", hi),
+            )
+            .collect()
+        : await ctx.db
+            .query("users")
+            .withIndex("by_role_anniversary_md", (q) =>
+              q.eq("role", "customer").gte("anniversary_md", lo).lte("anniversary_md", hi),
+            )
+            .collect();
+    for (const row of rows) seen.set(row._id, row);
+  }
+
   const hits: QueueHit[] = [];
-  for (const c of customers) {
+  for (const c of seen.values()) {
+    // Soft-delete exclusion (schema.ts:74 — "Gate 1 — soft-delete flag;
+    // missing/false = active"): a customer marked is_deleted:true must never
+    // appear in the Delight Queue / AI-drafts cron / Dashboard Notifications,
+    // all three of which share this function. Strict === true check so
+    // missing/undefined/false rows (the vast majority) are unaffected.
+    if (c.is_deleted === true) continue;
     const raw = field === "birthday" ? c.birthday : c.anniversary;
     const parsed = parseMD(raw);
     if (!parsed) continue;
     const key = `${parsed[0]}-${parsed[1]}`;
-    if (!keys.has(key)) continue;
-    if (await hasDecidedAction(ctx, c._id, field, key)) continue; // already sent/cancelled this year
-    hits.push({ doc: c, daysUntil: offset.get(key) ?? 0 });
+    if (!keys.has(key)) continue; // index range can include the same MM-DD across two years' worth of edge dates; keys is the exact-match filter
+
+    // P0-1 fix — canonical "YYYY-M-D" dedup key, real matched year reused
+    // from the SAME Date object upcomingWindow() used to build this "M-D"
+    // key (dateByKey), not a freshly-constructed `new Date()`. This is what
+    // makes the Dec 31 -> Jan 1 wraparound produce the FOLLOWING year.
+    const matchedDate = dateByKey.get(key);
+    // Defensive — matchedDate is guaranteed present whenever `key` passed the
+    // keys.has(key) check just above, since both maps are built from the
+    // same upcomingWindow() loop over the same key set. Should never be hit.
+    if (!matchedDate) continue;
+    const occasionDate = `${matchedDate.getUTCFullYear()}-${parsed[0]}-${parsed[1]}`;
+
+    if (await hasDecidedAction(ctx, c._id, field, occasionDate)) continue; // already sent/cancelled this specific occurrence
+    hits.push({ doc: c, daysUntil: offset.get(key) ?? 0, occasionDate });
   }
   hits.sort((a, b) => a.daysUntil - b.daysUntil);
   return hits;
+}
+
+/**
+ * Single-customer occasion check — reuses the SAME upcomingWindow() date-math
+ * that powers findUpcoming()'s Delight Queue (birthdays/anniversaries) list,
+ * but for exactly one customer's raw birthday/anniversary string instead of
+ * scanning/filtering a whole table. Returns the days-until (0..days) if the
+ * given "M-D"/"MM-DD" string falls within the window, or null otherwise.
+ *
+ * Factored out so getCustomerIntelligenceProfile (below) can determine ONE
+ * customer's upcoming-occasion status without duplicating the window-building
+ * logic in upcomingWindow()/findUpcoming().
+ */
+function checkUpcoming(raw: string | null | undefined, days: number): number | null {
+  const parsed = parseMD(raw);
+  if (!parsed) return null;
+  const { keys, offset } = upcomingWindow(Math.max(0, Math.floor(days)));
+  const key = `${parsed[0]}-${parsed[1]}`;
+  if (!keys.has(key)) return null;
+  return offset.get(key) ?? 0;
 }
 
 /** All customers — merchant CRM list view (all fields, no auth secrets). */
@@ -190,10 +380,63 @@ export const getCustomers = query({
     const customers = await ctx.db
       .query("users")
       .filter((q) => q.eq(q.field("role"), "customer"))
+      // Soft-delete exclusion (2026-09-14 design, section c.1) — a deleted
+      // customer must not show in the CRM full list.
+      .filter((q) => q.neq(q.field("is_deleted"), true))
       .collect();
     return customers
       .map(toMerchantCustomer)
       .sort((a, b) => a.name.localeCompare(b.name));
+  },
+});
+
+/**
+ * Scaling Fix 1 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md):
+ * cursor-paginated customer list for the CRM view.
+ *
+ * getCustomers (above) collects the WHOLE users table on every load even
+ * though the Customers.jsx grid only shows 6 rows at a time — an O(n) full
+ * pull that degrades as the boutique's customer base grows. This function is
+ * the paginated equivalent: SAME underlying query (users, role="customer"
+ * filter) but returns one cursor page via Convex's built-in .paginate()
+ * instead of .collect(), so the frontend can fetch pages on demand.
+ *
+ * Added as a NEW function so the live getCustomers path is untouched — the
+ * frontend switch-over to this is a separate, later task.
+ *
+ * Merchant-only: guarded with requireMerchantSession(userId, token), the
+ * SAME auth pattern as getCustomers. Returns Convex's native paginated shape
+ * { page, isDone, continueCursor }; each page row is projected through
+ * toMerchantCustomer (no auth secrets, confidential fields merchant-only).
+ */
+export const getCustomersPaginated = query({
+  args: {
+    paginationOpts: paginationOptsValidator,
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { paginationOpts, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+    const result = await ctx.db
+      .query("users")
+      .withIndex("by_role_name_lower", (q) => q.eq("role", "customer"))
+      .order("asc")
+      // Soft-delete exclusion (2026-09-14 design, section c.2) — a post-index
+      // .filter() here (rather than a second index) is the deliberate,
+      // non-over-engineered fix: it means a page can legitimately return
+      // FEWER than the requested page size when it contains deleted rows
+      // (Convex's own documented behavior for a filtered/paginated query —
+      // isDone/continueCursor still work correctly, the frontend just may see
+      // a short page). Junk-data volume here (~46 rows total, per the audit)
+      // is small enough that this is a fine trade for not introducing a
+      // second compound index just for this. If deleted-row volume grows
+      // much larger, revisit with a dedicated index instead.
+      .filter((q) => q.neq(q.field("is_deleted"), true))
+      .paginate(paginationOpts);
+    return {
+      ...result,
+      page: result.page.map(toMerchantCustomer),
+    };
   },
 });
 
@@ -295,9 +538,21 @@ export const updateCustomerProfile = mutation({
     const doc = await getCustomerDoc(ctx, customerId);
     if (!doc) return null;
     const update: any = {};
-    if (patch.name !== undefined) update.name = patch.name.trim();
-    if (patch.birthday !== undefined) update.birthday = patch.birthday.trim();
-    if (patch.anniversary !== undefined) update.anniversary = patch.anniversary.trim();
+    if (patch.name !== undefined) {
+      update.name = patch.name.trim();
+      // Keep the sort mirror in sync (Scaling Fix 1) — same trim as `name`.
+      update.name_lower = update.name.toLowerCase();
+    }
+    if (patch.birthday !== undefined) {
+      update.birthday = patch.birthday.trim();
+      // Scaling Fix 3 — keep the zero-padded sort mirror in sync. A blank
+      // string clears birthday_md too (toMD returns undefined for "").
+      update.birthday_md = toMD(update.birthday);
+    }
+    if (patch.anniversary !== undefined) {
+      update.anniversary = patch.anniversary.trim();
+      update.anniversary_md = toMD(update.anniversary);
+    }
     if (patch.tier !== undefined) update.tier = patch.tier;
     if (patch.custom_tags !== undefined) update.custom_tags = patch.custom_tags.map((t: string) => t.trim()).filter(Boolean);
     await ctx.db.patch(customerId, update);
@@ -346,12 +601,103 @@ export const getUpcomingAnniversaries = query({
 });
 
 /**
+ * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md §b
+ *
+ * findUpcomingInternal — internal-query variant of getUpcomingBirthdays /
+ * getUpcomingAnniversaries for callers with NO live merchant session (i.e.
+ * the daily drafts cron in crons.ts). A cron fires on a schedule with no
+ * human in the loop supplying userId/token, so it cannot call
+ * requireMerchantSession — this function is the same underlying read,
+ * exposed via `internalQuery` (private, callable only from other Convex
+ * functions via ctx.runQuery(internal.customers.findUpcomingInternal, ...)),
+ * with the session-guard line simply omitted.
+ *
+ * REUSES, does not duplicate, the existing date-window/index logic:
+ * delegates straight to findUpcoming() (same function that powers both
+ * public queries above), which itself runs indexed range reads via
+ * by_role_birthday_md / by_role_anniversary_md — no new scanning path.
+ *
+ * Returns the SAME fields getUpcomingBirthdays/getUpcomingAnniversaries
+ * return (including whatsapp_consent, the gate the cron filters on before
+ * ever calling Gemini — see crons.ts).
+ */
+export const findUpcomingInternal = internalQuery({
+  args: {
+    days: v.optional(v.number()),
+    field: v.union(v.literal("birthday"), v.literal("anniversary")),
+  },
+  handler: async (ctx, { days, field }) => {
+    const hits = await findUpcoming(ctx, days ?? 7, field);
+    // P0-1 fix (2026-09-09): occasion_date now comes straight from
+    // findUpcoming()'s own QueueHit.occasionDate — the canonical "YYYY-M-D"
+    // key (real matched year + unpadded month/day) computed ONCE, at the
+    // exact point findUpcoming() already has the matched Date object on
+    // hand. No re-derivation here (previously this handler re-ran parseMD()
+    // itself, throwing away the year) — single source of truth.
+    return hits.map(({ doc, daysUntil, occasionDate }) => ({
+      _id: doc._id,
+      name: doc.name,
+      birthday: doc.birthday ?? null,
+      anniversary: doc.anniversary ?? null,
+      mobile: doc.mobile,
+      tier: doc.tier ?? "silver",
+      points: doc.points ?? 0,
+      // Consent flag drives the Approve & Send gate (WhatsApp wishes cannot fire without it) —
+      // and, for the AI drafts cron, the gate on whether Gemini is ever called at all.
+      whatsapp_consent: doc.whatsapp_consent ?? false,
+      days_until: daysUntil,
+      // Canonical "YYYY-M-D" string, e.g. "2026-8-27" — see QueueHit.occasionDate.
+      occasion_date: occasionDate,
+    }));
+  },
+});
+
+/**
+ * Validate the canonical dedup-key shape: "YYYY-M-D" — a real numeric year
+ * (4 digits, sane range), then unpadded month 1-12, then unpadded day 1-31.
+ *
+ * P1-3 fix (2026-09-09): occasion_date used to be validated (and stored) as
+ * bare "M-D" (see the old parseMD-only check this replaces). That format has
+ * NO year, which is the root cause of P0-1 (dedup never expires). Callers
+ * (findUpcoming via getUpcomingBirthdays/getUpcomingAnniversaries/
+ * findUpcomingInternal, and Customers.jsx's own IST "tomorrow" computation)
+ * now always compute a full "YYYY-M-D" string BEFORE calling this mutation —
+ * this function stays a pure validate-and-store step, it does NOT compute the
+ * year itself (see design note above: "This function should NOT compute the
+ * year itself").
+ *
+ * Deliberately does not reuse the M-D-only parseMD() above (that regex has no
+ * year group and would accept a bare "8-27" as valid, which is exactly the
+ * bug this fixes) — a small dedicated check instead.
+ */
+function parseYMD(s: string): [number, number, number] | null {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s.trim());
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  // Sane year bound — not a strict calendar check (no need to validate
+  // month-length/leap-year here, callers only ever produce real Date-derived
+  // values), just a guard against garbage input reaching storage.
+  if (year < 2000 || year > 2100) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return [year, month, day];
+}
+
+/**
  * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
  *
  * recordMessageAction — admin decision-log write for the Delight Queue's
  * tomorrow-tabs. Called by:
- *   - Approve & Send button (existing) — after a successful/attempted send,
- *     action:"sent" (+ channel: "cloud_api" | "wa_fallback")
+ *   - Approve & Send button (existing) — after a send:
+ *       action:"sent" ONLY for a genuinely-confirmed Cloud API success
+ *         (channel: "cloud_api")
+ *       action:"link_opened" for a wa.me link-open — primary path, or the
+ *         Cloud-API-fails-and-falls-back-to-wa.me branch (channel: "wa_fallback")
+ *         — P2-4 fix (2026-09-09): opening wa.me only proves the merchant was
+ *         handed a pre-filled draft, not that they actually pressed Send
+ *         inside WhatsApp, so it must not be recorded as the same "sent"
+ *         confirmation level as a real Cloud API success.
  *   - Cancel button (new, Customers.jsx follow-up) — action:"cancelled",
  *     no send attempted
  *
@@ -361,14 +707,15 @@ export const getUpcomingAnniversaries = query({
  *
  * Out of scope (per spec): no cron, no change to the Cloud-API-then-fallback
  * send mechanism itself, no "cancel forever" — this only ever records ONE
- * decision per occasion_date, and next year's differing M-D naturally resets it.
+ * decision per occasion_date, and next year's differing YYYY-M-D naturally
+ * resets it (P0-1 fix, 2026-09-09 — see parseYMD above).
  */
 export const recordMessageAction = mutation({
   args: {
     customer_id: v.id("users"),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasion_date: v.string(),
-    action: v.union(v.literal("sent"), v.literal("cancelled")),
+    action: v.union(v.literal("sent"), v.literal("link_opened"), v.literal("cancelled")),
     channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))),
     userId: v.id("users"),
     token: v.string(),
@@ -379,8 +726,8 @@ export const recordMessageAction = mutation({
     if (!doc) throw new Error("Customer not found.");
 
     const trimmedDate = occasion_date.trim();
-    if (!parseMD(trimmedDate)) {
-      throw new Error(`occasion_date must be an "M-D" string (e.g. "8-27"), got "${occasion_date}".`);
+    if (!parseYMD(trimmedDate)) {
+      throw new Error(`occasion_date must be a "YYYY-M-D" string (e.g. "2026-8-27"), got "${occasion_date}".`);
     }
 
     // IDEMPOTENCY — same tuple already decided → reject, don't insert a duplicate.
@@ -398,6 +745,70 @@ export const recordMessageAction = mutation({
       decided_at: Date.now(),
       ...(channel ? { channel } : {}),
     });
+
+    // ------------------------------------------------------------------
+    // Birthday/Anniversary automatic points crediting (2026-09-18 fix).
+    // Design spec: docs/superpowers/specs/2026-09-18-birthday-anniversary-points-design.md
+    //
+    // Gate: only a genuine send outcome credits points — never "cancelled".
+    // Reuses the EXACT tier-aware, live-settings-read pattern reviews.ts's
+    // approveReview now uses (2026-09-17 fix): read the real settings doc at
+    // its correct FLAT path (settingsDoc.value, no ".tiers" wrapper — that
+    // wrapper only exists in getSettings' read-side merge output), then
+    // resolve the customer's own tier override only when that tier's "on"
+    // toggle is true, else fall back to global's rate. See approveReview's
+    // resolveRuleValue for the same shape.
+    // ------------------------------------------------------------------
+    if (action === "sent" || action === "link_opened") {
+      const settingsDoc = await ctx.db
+        .query("settings")
+        .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
+        .first();
+
+      // Same flat-path read as approveReview — settingsDoc.value is stored
+      // FLAT as { global, silver, gold, platinum }, never `.tiers`.
+      const rules = settingsDoc?.value || DEFAULT_SETTINGS.tiers;
+      const globalRules = rules.global;
+
+      const customerTier = doc.tier as "silver" | "gold" | "platinum" | undefined;
+      const tierRules = customerTier ? rules[customerTier] : undefined;
+      const tierOverrideActive = Boolean(tierRules && tierRules.on === true);
+
+      // occasion selects the field name: "birthdayBonus" | "anniversaryBonus".
+      const field = occasion === "birthday" ? "birthdayBonus" : "anniversaryBonus";
+      const bonus =
+        tierOverrideActive && typeof tierRules?.[field] === "number"
+          ? (tierRules[field] as number)
+          : globalRules[field];
+
+      // Judgment call: a resolved bonus of 0 (tier off with no configured
+      // global fallback amount, or merchant explicitly zeroed the rate) is
+      // harmless to "credit" but pointless to log — skip the points_ledger
+      // insert entirely rather than writing a delta:0 row. This keeps the
+      // Activity Ledger free of no-op noise while still fully crediting any
+      // genuinely configured bonus, however small.
+      if (bonus > 0) {
+        const resulting_balance = Math.max(0, (doc.points ?? 0) + bonus);
+        await ctx.db.patch(customer_id, { points: resulting_balance });
+
+        await ctx.db.insert("points_ledger", {
+          customer_id,
+          delta: bonus,
+          reason_type: occasion, // "birthday" | "anniversary" — valid awardPoints literals
+          note: `Auto-credited on Approve & Send (${trimmedDate})`,
+          resulting_balance,
+          // points_ledger.created_by is schema-restricted to "admin" | "system"
+          // (convex/schema.ts) — "admin" means a human typed a number into the
+          // manual Points Tool; this credit is automatic, fired from the
+          // Approve & Send flow with no human-entered amount, so "system" is
+          // the correct, already-valid, honest value (never "admin" — that
+          // would make this indistinguishable from a manual award).
+          created_by: "system",
+          created_at: Date.now(),
+        });
+      }
+    }
+
     return { ok: true, id };
   },
 });
@@ -543,6 +954,9 @@ export const findCustomerByMobile = query({
       .query("users")
       .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
       .filter((q) => q.eq(q.field("role"), "customer"))
+      // Soft-delete exclusion (2026-09-14 design, section c.4) — doesn't go
+      // through getCustomerDoc, so needs its own explicit filter.
+      .filter((q) => q.neq(q.field("is_deleted"), true))
       .first();
     return doc ? toMerchantCustomer(doc) : null;
   },
@@ -567,13 +981,47 @@ export const createCustomer = mutation({
     anniversary: v.optional(v.string()),
     custom_tags: v.optional(v.array(v.string())),
     whatsapp_consent: v.optional(v.boolean()),
+    // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
+    // optional-boolean, upgrade-only shape below (never silently downgraded).
+    vvip: v.optional(v.boolean()),
+    // Merchant session — only required to set vvip:true (see VVIP guard below).
+    userId: v.optional(v.id("users")),
+    token: v.optional(v.string()),
   },
-  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent }) => {
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent, vvip, userId, token }) => {
+    // VVIP guard — docs/superpowers/specs/2026-09-24-createcustomer-vvip-guard-design.md
+    // Marking a customer VVIP unlocks VVIP-only events (events.ts getEventAccess
+    // + dispatch recipients), so it MUST require a valid merchant session. This
+    // runs FIRST — before the rate limiter or any ctx.db read/write — so an
+    // unauthenticated vvip:true attempt is rejected with no side effects.
+    // When vvip is not true, userId/token are ignored (unauthenticated /join
+    // path is unchanged).
+    if (vvip === true) {
+      if (!userId || !token) {
+        throw new ConvexError("Only the boutique can mark a customer as VVIP. Please sign in again.");
+      }
+      await requireMerchantSession(ctx, userId, token);
+    }
+
     const digits = mobile.replace(/\D/g, '');
     if (digits.length !== 10) {
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };
     }
     const normalized = digits;
+
+    // Rate limit (design spec 2026-09-05, Part A4/B) — defense-in-depth
+    // against Critical #2's duplicate-mobile leak vector (see rateLimits.ts).
+    // Non-throwing form ONLY: src/lib/db.js's onboardCustomerRemote wraps
+    // this whole call in a bare `catch { return createLocalCustomer(f) }` —
+    // a thrown rejection would be silently swallowed into a fake local-only
+    // phantom customer with no error shown. Returns the SAME {ok:false,
+    // error} shape as the invalid-mobile check just above, which Join.jsx's
+    // existing res.error / setMobileError handling already renders inline —
+    // zero frontend changes needed.
+    const rl = await rateLimiter.limit(ctx, "createCustomerByMobile", { key: normalized });
+    if (!rl.ok) {
+      return { ok: false, error: "Too many attempts — please try again in a few minutes." };
+    }
     const customerName = name.trim();
     if (!customerName) throw new Error("Customer name is required.");
 
@@ -588,9 +1036,29 @@ export const createCustomer = mutation({
       // customer who consented on a prior visit — clearing consent is a
       // separate, more sensitive action outside this flow's scope.
       let record = existing;
+
+      // Decision 2 (2026-09-14 soft-delete design) — re-onboarding a
+      // soft-deleted customer's mobile number REACTIVATES the same row
+      // (clears is_deleted) instead of blocking the signup or creating a
+      // second row for the same phone number. This deliberately fires
+      // BEFORE the consent/vvip upgrade patches below so a reactivated
+      // customer also picks up any new consent/vvip flag from this same
+      // re-onboarding submission, all as one logical "welcome back" patch.
+      if (existing.is_deleted === true) {
+        await ctx.db.patch(existing._id, { is_deleted: false });
+        record = { ...existing, is_deleted: false };
+      }
+
       if (whatsapp_consent === true && existing.whatsapp_consent !== true) {
         await ctx.db.patch(existing._id, { whatsapp_consent: true });
-        record = { ...existing, whatsapp_consent: true };
+        record = { ...record, whatsapp_consent: true };
+      }
+      // Same upgrade-only shape as whatsapp_consent above — re-onboarding a
+      // customer can mark them VVIP, but a resubmission without the flag
+      // must never silently downgrade an already-VVIP customer.
+      if (vvip === true && existing.vvip !== true) {
+        await ctx.db.patch(existing._id, { vvip: true });
+        record = { ...record, vvip: true };
       }
       return {
         ok: true,
@@ -604,13 +1072,18 @@ export const createCustomer = mutation({
     const id = await ctx.db.insert("users", {
       mobile: normalized,
       name: customerName,
+      name_lower: customerName.toLowerCase(), // Scaling Fix 1 — sort mirror
       role: "customer",
       points: 0,
       tier: "silver",
       ...(birthday ? { birthday: birthday.trim() } : {}),
+      ...(toMD(birthday) ? { birthday_md: toMD(birthday) } : {}),
       ...(anniversary ? { anniversary: anniversary.trim() } : {}),
+      ...(toMD(anniversary) ? { anniversary_md: toMD(anniversary) } : {}),
       // Only set consent when explicitly opted in — never persist an explicit false.
       ...(whatsapp_consent ? { whatsapp_consent: true } : {}),
+      // Same "only set when true" shape — never persist an explicit false.
+      ...(vvip ? { vvip: true } : {}),
       custom_tags: custom_tags ?? [],
     });
     const created = await ctx.db.get(id);
@@ -623,15 +1096,143 @@ export const createCustomer = mutation({
 });
 
 /**
- * Gate 1 — Bulk CSV customer import.
- * Reuses createCustomer's exact validation + duplicate-mobile-check logic
- * (10-digit mobile required, by_mobile index lookup) row by row, so a bad
- * or duplicate row is SKIPPED (reported back) rather than crashing the batch.
- * Also skips duplicate mobiles appearing more than once within the same file.
+ * Design spec: docs/superpowers/specs/2026-09-14-customer-soft-delete-design.md
+ * section (a).
+ *
+ * deleteCustomer — single-customer soft delete. Sets is_deleted:true rather
+ * than removing the row, so points/order/review history stays intact (Gate 8
+ * DPDP "right to erasure" groundwork — see design doc "Known gap" note:
+ * magic-link access is intentionally NOT revoked by this, per Decision 1).
+ *
+ * Merchant-session-guarded via requireMerchantSession, same pattern as every
+ * other merchant-only mutation in this file. Reuses the unfiltered
+ * getCustomerDocIncludingDeleted helper (not the is_deleted-filtered
+ * getCustomerDoc) so an already-deleted customer is still found here and
+ * reported as a clear "already deleted" error, instead of a misleading
+ * "not found".
+ */
+export const deleteCustomer = mutation({
+  args: {
+    customerId: v.id("users"),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { customerId, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const doc = await getCustomerDocIncludingDeleted(ctx, customerId);
+    if (!doc) return { ok: false, error: "Customer not found." };
+    if (doc.is_deleted === true) {
+      return { ok: false, error: "Customer is already deleted." };
+    }
+
+    await ctx.db.patch(customerId, { is_deleted: true });
+    return { ok: true, id: customerId };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-14-customer-soft-delete-design.md
+ * section (b).
+ *
+ * bulkDeleteCustomers — batch soft delete for an explicit, human-reviewed
+ * list of customer ids (e.g. the 46-record legacy junk-data cleanup found in
+ * the 2026-09-14 audit). Deliberately has NO "looks like test data"
+ * heuristic — it only ever acts on ids the caller supplies; a human decides
+ * what's junk, this mutation just safely applies that decision.
+ *
+ * Same fetch-and-verify-before-mutate safety pattern as bulkCreateCustomers's
+ * skip-list (above): every id is checked (exists, role==="customer", not
+ * already deleted) before being patched, and a bad id is skipped with a
+ * reason rather than aborting or crashing the whole batch.
+ *
+ * NOTE: this reads via ctx.db.get directly (not getCustomerDoc), because it
+ * needs to distinguish "not found" / "not a customer" / "already deleted" as
+ * three separate skip reasons — the is_deleted-filtered getCustomerDoc would
+ * collapse the last two into one indistinguishable "not found".
+ */
+export const bulkDeleteCustomers = mutation({
+  args: {
+    customerIds: v.array(v.id("users")),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { customerIds, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const deleted: Array<{ id: string; name: string }> = [];
+    const skipped: Array<{ id: string; reason: string }> = [];
+
+    for (const id of customerIds) {
+      const doc = await ctx.db.get(id);
+      if (!doc) {
+        skipped.push({ id: String(id), reason: "not_found" });
+        continue;
+      }
+      if (doc.role !== "customer") {
+        skipped.push({ id: String(id), reason: "not_a_customer" });
+        continue;
+      }
+      if (doc.is_deleted === true) {
+        skipped.push({ id: String(id), reason: "already_deleted" });
+        continue;
+      }
+      await ctx.db.patch(id, { is_deleted: true });
+      deleted.push({ id: String(id), name: doc.name });
+    }
+
+    return {
+      ok: true,
+      deleted,
+      skipped,
+      deletedCount: deleted.length,
+      skippedCount: skipped.length,
+    };
+  },
+});
+
+/**
+ * Gate 1 + CSV Bulk Onboarding first-class-customers fix (2026-09-23).
+ * Design spec: docs/superpowers/specs/2026-09-23-csv-bulk-onboarding-design.md
+ * ("Backend" section).
+ *
+ * Bulk CSV customer import — brought up to parity with single-client
+ * onboarding (createCustomer above). Reuses createCustomer's exact
+ * validation + duplicate-mobile-check logic (10-digit mobile required,
+ * by_mobile index lookup) row by row, so a bad or duplicate row is SKIPPED
+ * (reported back) rather than crashing the batch. Also skips duplicate
+ * mobiles appearing more than once within the same file.
+ *
+ * Three outcomes per row (mirrors createCustomer's own branches):
+ *  - New mobile: inserted with custom_tags: [], whatsapp_consent/vvip set
+ *    ONLY when explicitly true (never an explicit false — same conditional-
+ *    spread shape createCustomer uses), then a real magic link is minted via
+ *    the SHARED issueMagicToken helper (convex/auth.ts) — the exact same
+ *    token issuance the merchant "resend link" path (generateMagicTokenForCustomer)
+ *    uses. This closes the prior gap where bulk-imported customers had
+ *    magic_token: null (CRM eye/copy buttons broken, no usable lookbook link).
+ *  - Existing mobile, soft-deleted (is_deleted === true): reactivated using
+ *    the SAME is_deleted:false patch + consent/vvip upgrade-only logic as
+ *    createCustomer's reactivation branch (see createCustomer above,
+ *    "Decision 2 (2026-09-14 soft-delete design)"). A magic token is minted
+ *    ONLY if the row doesn't already have one (existing valid links are
+ *    never rotated out from under an already-active session).
+ *  - Existing mobile, active: skipped with reason duplicate_existing — NO
+ *    writes, no data about the existing customer is returned (never
+ *    overwrites live customer data via a bulk import).
+ *
+ * Batch limit: rows.length > 100 throws BEFORE any read/write (design spec
+ * decision — chunked imports of 100 rows at a time from the frontend).
  *
  * NOTE: city/country are accepted (CSV column parity with the onboarding
  * form) but — matching createCustomer today — are not persisted; the users
- * schema has no city/country fields yet.
+ * schema has no city/country fields yet. Staff notes and updating existing
+ * ACTIVE customers are explicitly out of scope per the design spec.
+ *
+ * No magic tokens are ever included in this mutation's response — the
+ * merchant reads them back out via the existing getCustomers/getCustomerById
+ * projections (toMerchantCustomer already includes magic_token), the same
+ * path the CRM eye/copy buttons already use for single-onboarded customers.
  */
 export const bulkCreateCustomers = mutation({
   args: {
@@ -643,6 +1244,8 @@ export const bulkCreateCustomers = mutation({
         anniversary: v.optional(v.string()),
         city: v.optional(v.string()),
         country: v.optional(v.string()),
+        whatsapp_consent: v.optional(v.boolean()),
+        vvip: v.optional(v.boolean()),
       }),
     ),
     userId: v.id("users"),
@@ -650,7 +1253,15 @@ export const bulkCreateCustomers = mutation({
   },
   handler: async (ctx, { rows, userId, token }) => {
     await requireMerchantSession(ctx, userId, token);
+
+    // Batch limit — checked BEFORE any read or write (design spec: "rows.length
+    // above 100 throws a clear error before any write").
+    if (rows.length > 100) {
+      throw new Error(`bulkCreateCustomers accepts at most 100 rows per call (got ${rows.length}).`);
+    }
+
     const created: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
+    const reactivated: Array<{ id: Id<"users">; name: string; mobile: string }> = [];
     const skipped: Array<{ name: string; whatsapp: string; reason: string }> = [];
     const seenInFile = new Set<string>();
 
@@ -676,29 +1287,316 @@ export const bulkCreateCustomers = mutation({
         .query("users")
         .withIndex("by_mobile", (q) => q.eq("mobile", digits))
         .first();
+
       if (existing) {
+        if (existing.is_deleted === true) {
+          // Reactivation branch — mirrors createCustomer's exact logic
+          // (convex/customers.ts createCustomer, "Decision 2" block above):
+          // clear is_deleted, then apply consent/vvip strictly upgrade-only
+          // (only ever patch true, never clear an existing true back to
+          // false/absent).
+          seenInFile.add(digits);
+          let record = existing;
+
+          await ctx.db.patch(existing._id, { is_deleted: false });
+          record = { ...existing, is_deleted: false };
+
+          if (row.whatsapp_consent === true && existing.whatsapp_consent !== true) {
+            await ctx.db.patch(existing._id, { whatsapp_consent: true });
+            record = { ...record, whatsapp_consent: true };
+          }
+          if (row.vvip === true && existing.vvip !== true) {
+            await ctx.db.patch(existing._id, { vvip: true });
+            record = { ...record, vvip: true };
+          }
+
+          // Mint a magic token ONLY if this row currently has none — an
+          // already-valid link/session is never rotated out from under the
+          // customer just because they were re-imported.
+          if (!record.magic_token) {
+            await issueMagicToken(ctx, record);
+          }
+
+          reactivated.push({ id: existing._id, name: record.name, mobile: digits });
+          continue;
+        }
+
+        // Active existing customer — skip, NO writes, nothing about the
+        // existing customer is returned (design spec decision 5).
         skipped.push({ name: customerName, whatsapp: digits, reason: "duplicate_existing" });
         continue;
       }
 
+      // Genuinely new row — insert, then mint a real magic link via the
+      // SAME shared helper generateMagicTokenForCustomer uses (never
+      // hand-rolled token logic, never generateMagicTokenSelf).
       seenInFile.add(digits);
       const id = await ctx.db.insert("users", {
         mobile: digits,
         name: customerName,
+        name_lower: customerName.toLowerCase(), // Scaling Fix 1 — sort mirror
         role: "customer",
         points: 0,
         tier: "silver",
+        custom_tags: [],
         ...(row.birthday ? { birthday: row.birthday.trim() } : {}),
+        ...(toMD(row.birthday) ? { birthday_md: toMD(row.birthday) } : {}),
         ...(row.anniversary ? { anniversary: row.anniversary.trim() } : {}),
+        ...(toMD(row.anniversary) ? { anniversary_md: toMD(row.anniversary) } : {}),
+        // Only set consent/vvip when explicitly true — never persist an
+        // explicit false (same conditional-spread shape as createCustomer).
+        ...(row.whatsapp_consent ? { whatsapp_consent: true } : {}),
+        ...(row.vvip ? { vvip: true } : {}),
       });
+      const newDoc = await ctx.db.get(id);
+      if (newDoc) {
+        await issueMagicToken(ctx, newDoc);
+      }
       created.push({ id, name: customerName, mobile: digits });
     }
 
     return {
       created,
+      reactivated,
       skipped,
       createdCount: created.length,
+      reactivatedCount: reactivated.length,
       skippedCount: skipped.length,
+    };
+  },
+});
+
+/**
+ * CSV Bulk Onboarding — preview-accuracy fix (2026-09-23).
+ * Design spec: docs/superpowers/specs/2026-09-23-csv-bulk-onboarding-design.md
+ * ("Amendment — 2026-09-23 (after end-to-end test)", point 1).
+ *
+ * checkMobilesStatus — merchant-only, read-only status check for a batch of
+ * mobile numbers, used by the CSV import preview INSTEAD OF the browser's
+ * local customer list (which never drops a customer deleted elsewhere — a
+ * separate, pre-existing staleness bug in src/lib/db.js's mergeConvexCustomer,
+ * out of scope here). Without this, the preview could mark a soft-deleted
+ * customer as "Already a customer", so reactivation — already correct at the
+ * bulkCreateCustomers level above — could never be triggered from the real UI.
+ *
+ * Reuses, byte-for-byte, the SAME lookup bulkCreateCustomers already performs
+ * per row: normalize digits, by_mobile index .first(), then branch on
+ * is_deleted. This function only READS — it never inserts, patches, or
+ * reactivates anything; the actual reactivate/skip decision still happens
+ * inside bulkCreateCustomers when the merchant confirms the import.
+ *
+ * DATA MINIMIZATION (explicit requirement): the response contains ONLY
+ * mobile number strings, grouped by status — never a name, _id, or any other
+ * customer field. The frontend wiring that calls this from the CSV preview
+ * is a separate, later task (not part of this change).
+ */
+export const checkMobilesStatus = query({
+  args: {
+    mobiles: v.array(v.string()),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { mobiles, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    // Batch limit — checked BEFORE any database read (same "fail fast"
+    // pattern as bulkCreateCustomers's rows.length > 100 guard above).
+    if (mobiles.length > 500) {
+      throw new Error(`checkMobilesStatus accepts at most 500 mobiles per call (got ${mobiles.length}).`);
+    }
+
+    // Same digit-stripping normalization as bulkCreateCustomers (line 1252
+    // above: `row.whatsapp.replace(/\D/g, "")`), then de-duplicate the
+    // normalized set so a repeated/formatted-differently mobile in the input
+    // is only looked up once. Anything that isn't exactly 10 digits after
+    // normalization is silently ignored (matches bulkCreateCustomers's own
+    // invalid_mobile skip — this preview-only helper has no "reason" channel
+    // to report it through, so it simply never appears in either output list).
+    const normalized = new Set<string>();
+    for (const raw of mobiles) {
+      const digits = raw.replace(/\D/g, "");
+      if (digits.length === 10) normalized.add(digits);
+    }
+
+    const active: string[] = [];
+    const deleted: string[] = [];
+
+    for (const digits of normalized) {
+      // Same by_mobile lookup as bulkCreateCustomers (line 1269-1272 above).
+      const existing = await ctx.db
+        .query("users")
+        .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+        .first();
+
+      if (!existing) continue; // no row — neither list (frontend treats as "New")
+
+      // Same is_deleted branch as bulkCreateCustomers (line 1275 above).
+      if (existing.is_deleted === true) {
+        deleted.push(digits);
+      } else {
+        active.push(digits);
+      }
+    }
+
+    return { active, deleted };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-04-phase1-customer-intelligence-design.md
+ * Addendum 2026-09-04 (cart/likes deferred — out of scope, see bottom of spec).
+ *
+ * getCustomerIntelligenceProfile — Phase 1 "Customer Intelligence Foundation".
+ * Combines three data paths that ALREADY exist and are indexed (no new
+ * scanning/joins invented here) into one call, so future AI features (draft
+ * generation, personalization) don't have to re-assemble the same joins:
+ *
+ *   1. Core customer row       — same safe projection as getCustomerById
+ *                                 (toMerchantCustomer; measurements/staff_notes
+ *                                 stay merchant-only, same as today).
+ *   2. Full order history      — same rows/shape as getOrdersByUser, via the
+ *                                 existing by_user index. Not truncated.
+ *   3. Full points ledger      — same rows/shape as getPointsHistory, via the
+ *                                 existing by_customer index. Not truncated.
+ *   4. upcoming_occasion       — reuses checkUpcoming() (which itself reuses
+ *                                 upcomingWindow(), the SAME date-window math
+ *                                 that drives the Delight Queue) against this
+ *                                 one customer's birthday/anniversary — zero
+ *                                 duplicated date logic.
+ *
+ * ADDITIVE ONLY: this is a brand-new query. getCustomerById, getOrdersByUser,
+ * getPointsHistory, getUpcomingBirthdays, getUpcomingAnniversaries are all
+ * untouched — every existing call site keeps working exactly as before.
+ *
+ * Guarded with requireMerchantSession, same pattern as every other
+ * merchant-facing query in this file.
+ */
+export const getCustomerIntelligenceProfile = query({
+  args: { customerId: v.id("users"), userId: v.id("users"), token: v.string() },
+  handler: async (ctx, { customerId, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    // 1. Core customer row — same base projection as getCustomerById, but
+    // with measurements/staff_notes stripped out (see AI-facing note below).
+    const doc = await getCustomerDoc(ctx, customerId);
+    if (!doc) return null;
+    // CONFIDENTIAL EXCLUSION: unlike getCustomerById, this profile is built to
+    // eventually feed AI features (Phase 3+, Gemini) — measurements (body-fit
+    // data) and staff_notes (private staff commentary) must never reach an AI
+    // prompt. Destructure them out immediately after the shared helper call;
+    // toMerchantCustomer itself is untouched so getCustomerById and every
+    // other caller keep returning both fields exactly as before.
+    const { measurements: _measurements, staff_notes: _staff_notes, ...customer } =
+      toMerchantCustomer(doc);
+
+    // 2. Full order history — identical query/shape to getOrdersByUser.
+    const orders = await ctx.db
+      .query("orders")
+      .withIndex("by_user", (q) => q.eq("user_id", customerId))
+      .order("desc")
+      .collect();
+
+    // 3. Full points ledger history — identical query + row-mapping to
+    // getPointsHistory (same field names/derivation, kept in sync manually
+    // since it's a small, stable projection — see getPointsHistory above).
+    const ledgerRows = await ctx.db
+      .query("points_ledger")
+      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .order("desc")
+      .collect();
+    const points_history = ledgerRows.map((r) => ({
+      id: String(r._id),
+      userId: String(r.customer_id),
+      action: r.delta < 0 ? "redeemed" : r.reason_type === "adjustment" ? "adjustment" : "earned",
+      points: Math.abs(r.delta),
+      reason: r.note?.trim() ? r.note.trim() : reasonTypeLabel(r.reason_type),
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+
+    // 4. Upcoming occasion (next 7 days) — reuses the SAME window logic as
+    // the Delight Queue via checkUpcoming(), just scoped to this one customer.
+    const OCCASION_WINDOW_DAYS = 7;
+    const birthdayDays = checkUpcoming(doc.birthday, OCCASION_WINDOW_DAYS);
+    const anniversaryDays = checkUpcoming(doc.anniversary, OCCASION_WINDOW_DAYS);
+
+    // Judgment call: if BOTH fall within the window for the same customer
+    // (rare, but possible), surface whichever is sooner — a single merchant-
+    // facing "what's coming up" signal is simpler to consume than an array,
+    // and "soonest" is the one that's actually time-sensitive/actionable
+    // first. A tie (identical days_until) resolves to birthday, since that's
+    // the flow the Delight Queue tab defaults to showing first.
+    let upcoming_occasion: { type: "birthday" | "anniversary"; days_until: number } | null = null;
+    if (birthdayDays !== null && anniversaryDays !== null) {
+      upcoming_occasion =
+        anniversaryDays < birthdayDays
+          ? { type: "anniversary", days_until: anniversaryDays }
+          : { type: "birthday", days_until: birthdayDays };
+    } else if (birthdayDays !== null) {
+      upcoming_occasion = { type: "birthday", days_until: birthdayDays };
+    } else if (anniversaryDays !== null) {
+      upcoming_occasion = { type: "anniversary", days_until: anniversaryDays };
+    }
+
+    return {
+      customer,
+      orders,
+      points_history,
+      upcoming_occasion,
+    };
+  },
+});
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md
+ *
+ * getDraftForCustomer — merchant-guarded read of the current draft (if any)
+ * for a given customer/occasion/date, written by the daily AI-drafts cron
+ * (crons.ts -> ai.ts generateMessageDraft). Queries the SAME
+ * by_customer_occasion_date index the cron uses for its own duplicate check,
+ * so the tuple lookup semantics stay identical on both the write and read
+ * sides.
+ *
+ * "Current" draft = the newest "pending" row for the tuple (a merchant may
+ * eventually see a "used"/"discarded" history here too, in a later task —
+ * for now the cron only ever writes "pending", so filtering to that status
+ * is the correct/only meaningful read).
+ *
+ * This is a read-path-only addition for a later frontend task (per the
+ * Phase 3 design doc) — no UI wiring happens in this task. Guarded with
+ * requireMerchantSession, the SAME pattern as every other merchant-facing
+ * query in this file.
+ */
+export const getDraftForCustomer = query({
+  args: {
+    customerId: v.id("users"),
+    occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    occasionDate: v.string(),
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { customerId, occasion, occasionDate, userId, token }) => {
+    await requireMerchantSession(ctx, userId, token);
+
+    const rows = await ctx.db
+      .query("ai_message_drafts")
+      .withIndex("by_customer_occasion_date", (q) =>
+        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      )
+      .collect();
+
+    const pending = rows.filter((r) => r.status === "pending");
+    if (pending.length === 0) return null;
+    // Newest pending row wins, in case more than one ever exists for the tuple.
+    pending.sort((a, b) => b.generated_at - a.generated_at);
+    const doc = pending[0];
+    return {
+      _id: doc._id,
+      customer_id: doc.customer_id,
+      occasion: doc.occasion,
+      occasion_date: doc.occasion_date,
+      draft_text: doc.draft_text,
+      generated_at: doc.generated_at,
+      status: doc.status,
     };
   },
 });
