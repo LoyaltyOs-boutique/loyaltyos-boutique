@@ -134,7 +134,7 @@ export default function Onboarding() {
     e.preventDefault();
     if (!f.name.trim() || !f.whatsapp.trim()) return;
     setCreating(true);
-    const res = await onboardCustomerRemote(f);
+    const res = await onboardCustomerRemote(f, { asMerchant: true });
     setCreating(false);
     if (res.error) {
       // If existing customer (duplicate mobile), generate magic link and show it

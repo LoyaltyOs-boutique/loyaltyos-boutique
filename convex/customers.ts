@@ -1,5 +1,5 @@
 import { mutation, query, internalQuery, type MutationCtx, type QueryCtx } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession, issueMagicToken } from "./auth";
@@ -984,8 +984,25 @@ export const createCustomer = mutation({
     // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
     // optional-boolean, upgrade-only shape below (never silently downgraded).
     vvip: v.optional(v.boolean()),
+    // Merchant session — only required to set vvip:true (see VVIP guard below).
+    userId: v.optional(v.id("users")),
+    token: v.optional(v.string()),
   },
-  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent, vvip }) => {
+  handler: async (ctx, { mobile, name, birthday, anniversary, custom_tags, whatsapp_consent, vvip, userId, token }) => {
+    // VVIP guard — docs/superpowers/specs/2026-09-24-createcustomer-vvip-guard-design.md
+    // Marking a customer VVIP unlocks VVIP-only events (events.ts getEventAccess
+    // + dispatch recipients), so it MUST require a valid merchant session. This
+    // runs FIRST — before the rate limiter or any ctx.db read/write — so an
+    // unauthenticated vvip:true attempt is rejected with no side effects.
+    // When vvip is not true, userId/token are ignored (unauthenticated /join
+    // path is unchanged).
+    if (vvip === true) {
+      if (!userId || !token) {
+        throw new ConvexError("Only the boutique can mark a customer as VVIP. Please sign in again.");
+      }
+      await requireMerchantSession(ctx, userId, token);
+    }
+
     const digits = mobile.replace(/\D/g, '');
     if (digits.length !== 10) {
       return { ok: false, error: "Please enter a valid 10-digit mobile number" };

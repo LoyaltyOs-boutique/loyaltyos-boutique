@@ -2449,9 +2449,21 @@ export function onboardCustomer(f) {
  * the local-only sync check. Falls back to the local link when Convex is
  * unreachable (same-browser demo keeps working).
  */
-export async function onboardCustomerRemote(f) {
+export async function onboardCustomerRemote(f, options = {}) {
   const client = getConvex();
   if (!client) return createLocalCustomer(f);
+
+  // Scope A (merchant Onboarding form): send the merchant session so the
+  // VVIP guard in convex/customers.ts accepts a ticked VVIP box, and surface
+  // real backend errors instead of the silent local fallback. The public
+  // /join path never passes options.asMerchant, so it keeps the old behaviour.
+  const asMerchant = options.asMerchant === true;
+  const session = merchantSessionArgs();
+  // A VVIP tick with no signed-in merchant can never pass the backend guard —
+  // stop before any network call and tell the merchant to sign in again.
+  if (asMerchant && f.vvip && !session) {
+    return { error: 'Not logged in — please sign in again.' };
+  }
 
   const mobile = waDigits(f.whatsapp || f.calling);
   try {
@@ -2466,6 +2478,9 @@ export async function onboardCustomerRemote(f) {
       // Phase 5 (Feature C, Virtual Events + VVIP) — mirrors whatsapp_consent's
       // "only send when truthy" shape immediately above.
       ...(f.vvip ? { vvip: true } : {}),
+      // Merchant session — the backend only checks it when vvip is true, so a
+      // signed-in merchant sends it for every onboarding (harmless otherwise).
+      ...(asMerchant && session ? session : {}),
     });
     // IMPROVEMENT: Handle existing customer (no dup) -> rotate token.
     if (created && !created.ok) {
@@ -2529,7 +2544,23 @@ export async function onboardCustomerRemote(f) {
       user: synced,
       magicLink: `/lookbook?id=${linkRes.user.id}&token=${linkRes.token}`,
     };
-  } catch {
+  } catch (err) {
+    // Scope A: the merchant form surfaces the real error (e.g. the VVIP guard)
+    // instead of faking a local-only success. Prefer the ConvexError payload
+    // (err.data), then a cleaned err.message with Convex's wrapper prefixes
+    // stripped, then a plain fallback.
+    if (asMerchant) {
+      let message;
+      if (typeof err.data === 'string' && err.data.length > 0) {
+        message = err.data;
+      } else if (err.message) {
+        message = err.message
+          .replace(/^\[CONVEX[^\]]*\]/, '')
+          .replace(/^Uncaught ConvexError:/, '')
+          .trim();
+      }
+      return { error: message || 'Something went wrong — please try again.' };
+    }
     return createLocalCustomer(f); // offline / Convex error → same-browser local link (unchanged)
   }
 }
