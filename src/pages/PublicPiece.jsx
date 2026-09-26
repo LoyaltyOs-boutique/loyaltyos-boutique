@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import { BRAND } from '../data/seed.js';
 import { getCatalogueItemById } from '../lib/db.js';
 import { inr } from '../lib/util.js';
+import { ProductGallery } from '../components/ProductGallery.jsx';
 
 export default function PublicPiece() {
   const { pieceId } = useParams();
@@ -68,11 +69,7 @@ export default function PublicPiece() {
         <section className="grid md:grid-cols-2 gap-x-10 gap-y-6 py-10 items-start">
           {/* Image */}
           <div className="relative bg-mist overflow-hidden border border-line">
-            <img
-              src={piece.image_url}
-              alt={piece.title}
-              className="aspect-[3/4] w-full object-cover"
-            />
+            <ProductGallery piece={piece} className="aspect-[3/4] w-full object-cover" />
           </div>
 
           {/* Details */}

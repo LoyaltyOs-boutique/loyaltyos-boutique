@@ -37,6 +37,40 @@ async function getItemCount(ctx: QueryCtx, lookbookId: Id<"lookbooks">): Promise
   return items.filter((i) => i.is_deleted !== true).length;
 }
 
+/**
+ * Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+ * (Backend section) — shape of one catalogue_items.media entry, shared by the
+ * schema, addCatalogueItem, and updateCatalogueItem so the three never drift.
+ */
+const MEDIA_ITEM = v.object({
+  url: v.string(),
+  type: v.union(v.literal("image"), v.literal("video")),
+});
+
+type MediaItem = { url: string; type: "image" | "video" };
+
+/**
+ * Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+ * (Backend section) — validates an optional catalogue_items.media gallery
+ * before insert/patch: 1 to 8 entries, at most 2 videos, every url non-empty,
+ * and the first entry (the cover) must be an image. Throws a ConvexError on
+ * any violation; both callers must not write anything if this throws.
+ */
+function validateMedia(media: MediaItem[]) {
+  if (media.length < 1 || media.length > 8) {
+    throw new ConvexError("A piece can have between 1 and 8 photos or videos.");
+  }
+  if (media.filter((m) => m.type === "video").length > 2) {
+    throw new ConvexError("A piece can have at most 2 videos.");
+  }
+  if (media.some((m) => !m.url || !m.url.trim())) {
+    throw new ConvexError("Every photo or video needs a URL.");
+  }
+  if (media[0].type !== "image") {
+    throw new ConvexError("The first photo (the cover) must be an image, not a video.");
+  }
+}
+
 // --- PUBLIC API ---
 
 /** Get all lookbooks with item_count, sorted by created_at desc. MERCHANT-ONLY. */
@@ -173,6 +207,8 @@ export const getCustomerCatalogue = query({
       instagram_link: string;
       source: string;
       lookbook_id: Id<"lookbooks">;
+      // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+      media?: MediaItem[];
     }> = [];
 
     // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2) —
@@ -194,6 +230,7 @@ export const getCustomerCatalogue = query({
           instagram_link: item.instagram_link || "",
           source: lb.source || "manual",
           lookbook_id: lb._id,
+          media: item.media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
         });
       }
     }
@@ -307,6 +344,8 @@ export const addCatalogueItem = mutation({
     price: v.number(), // PAISE integer
     image_url: v.string(),
     instagram_link: v.optional(v.string()),
+    // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+    media: v.optional(v.array(MEDIA_ITEM)),
   },
   handler: async (ctx, { userId, token, ...args }) => {
     await requireMerchantSession(ctx, userId, token);
@@ -314,6 +353,12 @@ export const addCatalogueItem = mutation({
     const lb = await ctx.db.get(args.lookbook_id);
     if (!lb || lb.is_deleted === true) {
       throw new ConvexError("This lookbook has been deleted.");
+    }
+    // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
+    // validate the gallery and mirror the cover into image_url when provided.
+    if (args.media) {
+      validateMedia(args.media);
+      args.image_url = args.media[0].url;
     }
     return await ctx.db.insert("catalogue_items", args);
   },
@@ -329,6 +374,8 @@ export const updateCatalogueItem = mutation({
     price: v.optional(v.number()),
     image_url: v.optional(v.string()),
     instagram_link: v.optional(v.string()),
+    // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+    media: v.optional(v.array(MEDIA_ITEM)),
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
     await requireMerchantSession(ctx, userId, token);
@@ -336,6 +383,12 @@ export const updateCatalogueItem = mutation({
     const existing = await ctx.db.get(id);
     if (!existing || existing.is_deleted === true) {
       throw new ConvexError("This piece has been deleted.");
+    }
+    // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
+    // validate the gallery and mirror the cover into image_url when provided.
+    if (patch.media) {
+      validateMedia(patch.media);
+      patch.image_url = patch.media[0].url;
     }
     await ctx.db.patch(id, patch);
   },

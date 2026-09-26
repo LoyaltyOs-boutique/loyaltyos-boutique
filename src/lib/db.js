@@ -1297,7 +1297,10 @@ export function deleteLookbook(id) {
 }
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
-export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id }) {
+export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media }) {
+  // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
+  // when a gallery is provided, the cover mirrors media[0].url, same as the backend.
+  if (Array.isArray(media) && media.length > 0) image_url = media[0].url;
   // 0. Guard the missing-session case BEFORE the optimistic write. When a Convex
   // client exists but there is no merchant session, the item would otherwise be
   // added to the local UI and silently never persist — it vanishes on the next
@@ -1321,7 +1324,8 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
     source: source || 'manual',
     likes: 0,
     likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
-    lookbook_id
+    lookbook_id,
+    media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
   };
   state.catalogueItems.unshift(item);
   pushEvent('owner', 'catalogue', `New lookbook item added · ${title} (₹${item.price})`);
@@ -1345,6 +1349,7 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
           price: Math.round((Number(price) || 0) * 100),
           image_url: image_url || '',
           instagram_link: instagram_link || undefined,
+          ...(media ? { media } : {}), // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
           ...addSession,
         }).then((cvxId) => {
           // Stamp the real ID so subsequent deletes/updates target Convex
@@ -1361,14 +1366,35 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
   return item;
 }
 
-/** Patch catalogue item on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
+/**
+ * Patch catalogue item on Convex (async). MERCHANT-ONLY.
+ * Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
+ * no optimistic local change; local state is only touched after the backend
+ * confirms, so the "Edit photos" caller can keep the merchant's in-progress
+ * edits on screen until a real success. Rejects on failure (missing session
+ * or a thrown mutation) so the caller can show friendlyError(err), matching
+ * deleteLookbook/removeCatalogueItem's convention elsewhere in this file.
+ */
 export function updateCatalogueItem(id, patch) {
   const client = getConvex();
   const session = merchantSessionArgs();
-  if (!client || !session) return Promise.resolve(null);
+  if (!client || !session) return Promise.reject(new Error('Not logged in — please sign in again.'));
   const p = { ...patch };
   if (p.price !== undefined) p.price = Math.round(Number(p.price) * 100);
-  return client.mutation(api.lookbooks.updateCatalogueItem, { id, ...p, ...session }).catch(() => null);
+  return client.mutation(api.lookbooks.updateCatalogueItem, { id, ...p, ...session }).then(() => {
+    const idx = state.catalogueItems.findIndex((i) => i.id === id || i.convexId === id);
+    if (idx >= 0) {
+      // Mirrors the backend: sending media alone still moves the cover, so the
+      // local image_url is derived from media[0].url the same way, not left stale.
+      if (Array.isArray(p.media)) {
+        state.catalogueItems[idx].media = p.media;
+        state.catalogueItems[idx].image_url = p.media[0].url;
+      } else if (p.image_url !== undefined) {
+        state.catalogueItems[idx].image_url = p.image_url;
+      }
+      emit();
+    }
+  });
 }
 
 /**
@@ -1439,7 +1465,8 @@ export function hydrateCatalogue(force) {
             source: lb.source || 'manual',
             likes: 0,
             likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
-            lookbook_id: lb._id
+            lookbook_id: lb._id,
+            media: i.media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
           })));
         }
       }

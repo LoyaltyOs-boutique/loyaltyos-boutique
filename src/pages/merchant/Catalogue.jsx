@@ -1,14 +1,58 @@
 import { useEffect, useRef, useState } from 'react';
-import { getData, subscribe, allCatalogue, addCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia, hydrateCatalogue, deleteLookbook, friendlyError } from '../../lib/db.js';
+import { getData, subscribe, allCatalogue, addCatalogueItem, updateCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia, hydrateCatalogue, deleteLookbook, friendlyError } from '../../lib/db.js';
+import { classifyFile, addEntries, moveEntry, removeEntry, fromPiece, validateList } from '../../lib/mediaList.js';
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
-import { SectionTitle, Empty } from '../../components/ui.jsx';
+import { SectionTitle, Empty, Modal } from '../../components/ui.jsx';
 
 const useDb = () => {
   const [, setV] = useState(0);
   useEffect(() => subscribe(() => setV((v) => v + 1)), []);
   return getData();
 };
+
+// Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+// (decision 3) — shared preview/reorder/remove editor for a gallery `list`,
+// used by both Manual Entry (a not-yet-saved list) and the Edit photos modal
+// (an existing piece's list). Pure controlled component: mediaList.js does
+// every rule check, this just renders `list` and calls `onChange(nextList)`.
+function MediaEditor({ list, onChange }) {
+  const [err, setErr] = useState('');
+  if (!list.length) return null;
+  const apply = (result) => {
+    if (result.error) { setErr(result.error); return; }
+    setErr('');
+    onChange(result.list);
+  };
+  return (
+    <div>
+      <div className="flex flex-wrap gap-2">
+        {list.map((m, i) => {
+          const leftBlocked = i === 0 || !!moveEntry(list, i, 'left').error;
+          const rightBlocked = i === list.length - 1 || !!moveEntry(list, i, 'right').error;
+          return (
+            <div key={`${m.url}-${i}`} className="relative">
+              {m.type === 'video' ? (
+                <video src={m.url} muted preload="metadata" className="h-20 w-16 object-cover border border-line" />
+              ) : (
+                <img src={m.url} alt="" className="h-20 w-16 object-cover border border-line" />
+              )}
+              {i === 0 && (
+                <span className="absolute top-3 left-3 bg-white/90 border border-line px-1 text-[10px] tracking-wide2 uppercase text-steel">Cover</span>
+              )}
+              <div className="flex items-center justify-between mt-1">
+                <button type="button" onClick={() => apply(moveEntry(list, i, 'left'))} disabled={leftBlocked} className="text-steel hover:text-ink text-xs leading-none disabled:opacity-40 cursor-pointer">‹</button>
+                <button type="button" onClick={() => apply(removeEntry(list, i))} className="text-steel hover:text-ink text-xs leading-none cursor-pointer">×</button>
+                <button type="button" onClick={() => apply(moveEntry(list, i, 'right'))} disabled={rightBlocked} className="text-steel hover:text-ink text-xs leading-none disabled:opacity-40 cursor-pointer">›</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {err && <div className="text-xs text-gold mt-2">{err}</div>}
+    </div>
+  );
+}
 
 export default function Catalogue() {
   const db = useDb();
@@ -29,6 +73,19 @@ export default function Catalogue() {
   const [mediaUploading, setMediaUploading] = useState(false);
   const [mediaMsg, setMediaMsg] = useState('');
   const manualMediaRef = useRef(null);
+  // Product gallery (design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md)
+  const [manualMedia, setManualMedia] = useState([]);
+  const [editPieceId, setEditPieceId] = useState(null); // piece.id showing the Edit photos modal, or null
+  const [editMedia, setEditMedia] = useState([]);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editErr, setEditErr] = useState('');
+  // Edit photos modal — its own upload message/uploading/URL state, kept
+  // separate from Manual Entry's so the two forms never cross-talk; all reset
+  // in openEditPhotos/closeEditPhotos below.
+  const [editMediaMsg, setEditMediaMsg] = useState('');
+  const [editMediaUploading, setEditMediaUploading] = useState(false);
+  const [editImageUrl, setEditImageUrl] = useState('');
+  const editMediaRef = useRef(null);
   // Step C — Manual Entry "Add to" target: 'all' = Current catalogue (no lookbook_id),
   // '__new__' = create a new designer lookbook (name from newLookbookName), else an existing lookbook _id.
   const [addTo, setAddTo] = useState('all');
@@ -172,8 +229,50 @@ export default function Catalogue() {
       }
     };
 
+    // Product gallery (design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md decision 3).
+    const openEditPhotos = (item) => {
+      setEditPieceId(item.id);
+      setEditMedia(fromPiece(item));
+      setEditErr('');
+      setEditMediaMsg('');
+      setEditMediaUploading(false);
+      setEditImageUrl('');
+    };
+    const closeEditPhotos = () => {
+      setEditPieceId(null);
+      setEditMedia([]);
+      setEditErr('');
+      setEditMediaMsg('');
+      setEditMediaUploading(false);
+      setEditImageUrl('');
+    };
+    const saveEditPhotos = async () => {
+      const validationError = validateList(editMedia);
+      if (validationError) { setEditErr(validationError); return; }
+      setEditSaving(true);
+      setEditErr('');
+      try {
+        await updateCatalogueItem(editPieceId, { media: editMedia });
+        closeEditPhotos();
+      } catch (err) {
+        setEditErr(friendlyError(err));
+      } finally {
+        setEditSaving(false);
+      }
+    };
+    const editingItem = items.find((i) => i.id === editPieceId);
+
   const addManual = async () => {
     if (!manual.title || !manual.price) return;
+    // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
+    // a typed Image URL that was never explicitly "Add"-ed still joins the gallery here.
+    let galleryList = manualMedia;
+    const pendingUrl = manual.image_url.trim();
+    if (pendingUrl && !galleryList.some((m) => m.url === pendingUrl)) {
+      const added = addEntries(galleryList, [{ url: pendingUrl, type: 'image' }]);
+      if (added.error) { setMediaMsg(added.error); return; }
+      galleryList = added.list;
+    }
     // Step C — resolve which lookbook the piece is assigned to:
     //  'all'      → Current catalogue (no lookbook_id, unchanged legacy behavior)
     //  '__new__'  → create a new designer lookbook first, then use its _id
@@ -190,39 +289,55 @@ export default function Catalogue() {
     } else if (addTo !== 'all') {
       lookbook_id = addTo;
     }
-    const res = addCatalogueItem({ ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) });
+    // A non-empty gallery sends media (+ its own cover); an empty gallery keeps
+    // today's single-image_url behaviour exactly, including an empty image_url.
+    const payload = galleryList.length > 0
+      ? { title: manual.title, price: manual.price, instagram_link: manual.instagram_link, source: 'manual', media: galleryList, image_url: galleryList[0].url, ...(lookbook_id ? { lookbook_id } : {}) }
+      : { ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) };
+    const res = addCatalogueItem(payload);
     // Missing-session case: surface the error (via the Manual-entry mediaMsg line)
     // and do NOT clear the form / show success — the item was never saved.
     if (res && res.ok === false) { setMediaMsg(res.error); return; }
     setManual({ title: '', price: '', image_url: '', instagram_link: '' });
+    setManualMedia([]);
     setAddTo('all');
     setNewLookbookName('');
   };
-  // Manual Entry — drag-drop upload handler, mirrors Templates.jsx MediaCard's
-  // onMediaFile exactly (file-type check, try/catch/finally, uploading/msg
-  // state), but auto-fills manual.image_url on success instead of a
-  // separate mediaUrl state.
-  const onManualMediaFile = async (f) => {
-    if (!f) return;
-    const isAllowed = f.type.startsWith('video/') || f.type.startsWith('image/') || f.type === 'application/pdf';
-    if (!isAllowed) { setMediaMsg('Only video, image, or PDF files are supported.'); return; }
-    setMediaUploading(true);
-    setMediaMsg('Uploading…');
-    try {
-      const bytes = await f.arrayBuffer();
-      const res = await uploadTemplateMedia(bytes, f.name, f.type);
-      if (res && res.ok) {
-        setManual((m) => ({ ...m, image_url: res.url }));
-        setMediaMsg(`"${f.name}" uploaded.`);
-      } else {
-        setMediaMsg('Upload failed — please try again.');
+  // Shared drag-drop upload loop, mirrors Templates.jsx MediaCard's
+  // onMediaFile (try/catch/finally, uploading/msg state). Design spec:
+  // docs/superpowers/specs/2026-09-25-product-gallery-design.md (decision 3) —
+  // takes a whole FileList and uploads one file at a time into whichever
+  // gallery list/setter/message/uploading state the caller passes in, so
+  // Manual Entry and the Edit photos modal share one upload path instead of
+  // two copies of this loop.
+  const uploadMediaFiles = async (fileList, currentList, setList, setMsg, setUploading) => {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
+    setUploading(true);
+    let list = currentList;
+    for (let idx = 0; idx < files.length; idx++) {
+      const f = files[idx];
+      const kind = classifyFile(f);
+      if (kind === 'pdf') { setMsg("PDFs can't be added as product photos — use the PDF linesheet uploader."); continue; }
+      if (kind === 'other') { setMsg("This file type isn't supported."); continue; }
+      setMsg(`Uploading ${idx + 1} of ${files.length}…`);
+      try {
+        const bytes = await f.arrayBuffer();
+        const res = await uploadTemplateMedia(bytes, f.name, f.type);
+        if (!res || !res.ok) { setMsg('Upload failed — please try again.'); continue; }
+        const added = addEntries(list, [{ url: res.url, type: kind }]);
+        if (added.error) { setMsg(added.error); continue; }
+        list = added.list;
+        setList(list);
+        setMsg(`"${f.name}" uploaded.`);
+      } catch (err) {
+        setMsg(friendlyError(err));
       }
-    } catch (err) {
-      setMediaMsg(friendlyError(err));
-    } finally {
-      setMediaUploading(false);
     }
+    setUploading(false);
   };
+  const onManualMediaFiles = (fileList) => uploadMediaFiles(fileList, manualMedia, setManualMedia, setMediaMsg, setMediaUploading);
+  const onEditMediaFiles = (fileList) => uploadMediaFiles(fileList, editMedia, setEditMedia, setEditMediaMsg, setEditMediaUploading);
 
   const addIg = () => {
     if (!igImg) return;
@@ -379,18 +494,39 @@ export default function Catalogue() {
               <div><label className="label">Price (INR)</label><input className="input" type="number" value={manual.price} onChange={(e) => setManual({ ...manual, price: e.target.value })} /></div>
               <div><label className="label">Source</label><input className="input" value="Manual" readOnly /></div>
             </div>
-            <div><label className="label">Image URL</label><input className="input" value={manual.image_url} onChange={(e) => setManual({ ...manual, image_url: e.target.value })} /></div>
+            <div>
+              <label className="label">Image URL</label>
+              <div className="flex items-center gap-2">
+                <input className="input" value={manual.image_url} onChange={(e) => setManual({ ...manual, image_url: e.target.value })} />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const url = manual.image_url.trim();
+                    if (!url) return;
+                    const added = addEntries(manualMedia, [{ url, type: 'image' }]);
+                    if (added.error) { setMediaMsg(added.error); return; }
+                    setManualMedia(added.list);
+                    setManual((m) => ({ ...m, image_url: '' }));
+                  }}
+                  disabled={!manual.image_url.trim()}
+                  className="btn-ghost !py-1 !px-3 text-[9px]"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
             <div
               onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => { e.preventDefault(); onManualMediaFile(e.dataTransfer.files?.[0]); }}
+              onDrop={(e) => { e.preventDefault(); onManualMediaFiles(e.dataTransfer.files); }}
               onClick={() => manualMediaRef.current?.click()}
               className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
             >
-              <input ref={manualMediaRef} type="file" accept="video/*,image/*,.pdf" className="hidden" onChange={(e) => onManualMediaFile(e.target.files?.[0])} />
+              <input ref={manualMediaRef} type="file" accept="image/*,video/*" multiple className="hidden" onChange={(e) => onManualMediaFiles(e.target.files)} />
               <div className="text-2xl mb-2">📎</div>
-              <div className="text-sm">Drag & drop a video, image, or PDF</div>
+              <div className="text-sm">Drag & drop photos or videos</div>
             </div>
             {mediaMsg && <div className="text-xs text-gold mt-2">{mediaMsg}</div>}
+            <MediaEditor list={manualMedia} onChange={setManualMedia} />
             <div><label className="label">Instagram link (optional)</label><input className="input" value={manual.instagram_link} onChange={(e) => setManual({ ...manual, instagram_link: e.target.value })} /></div>
             <div>
               <label className="label">Add to</label>
@@ -483,6 +619,9 @@ export default function Catalogue() {
                   <img src={i.image_url} alt={i.title} className="aspect-[3/4] w-full object-cover" />
                   <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink/80 to-transparent p-3 flex justify-between items-end">
                     <span className="text-[9px] tracking-wide2 uppercase text-white/80">{i.source} · {i.likes || 0} ♥</span>
+                    {Array.isArray(i.media) && i.media.length > 1 && (
+                      <span className="text-[9px] tracking-wide2 uppercase text-white/80">+{i.media.length - 1}</span>
+                    )}
                   </div>
                 </div>
                 <div className="p-4">
@@ -502,6 +641,9 @@ export default function Catalogue() {
                       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg>
                     </a>
                   </div>
+                  {i.convexId && (
+                    <button onClick={() => openEditPhotos(i)} className="btn-ghost w-full mt-3">Edit photos</button>
+                  )}
                   <div className="flex items-center gap-2 mt-2">
                     <button onClick={() => alert('Coming soon')} className="btn-ink !py-1 !px-2 text-[9px] flex-1">
                       Buy Now
@@ -517,6 +659,50 @@ export default function Catalogue() {
           </div>
         ) : <Empty>The catalogue is empty — add your first piece above.</Empty>}
       </section>
+      {editPieceId && editingItem && (
+        <Modal open onClose={closeEditPhotos} title={`Edit photos — ${editingItem.title}`}>
+          <div className="space-y-3">
+            <div>
+              <label className="label">Image URL</label>
+              <div className="flex items-center gap-2">
+                <input className="input" value={editImageUrl} onChange={(e) => setEditImageUrl(e.target.value)} />
+                <button
+                  type="button"
+                  onClick={() => {
+                    const url = editImageUrl.trim();
+                    if (!url) return;
+                    const added = addEntries(editMedia, [{ url, type: 'image' }]);
+                    if (added.error) { setEditMediaMsg(added.error); return; }
+                    setEditMedia(added.list);
+                    setEditImageUrl('');
+                  }}
+                  disabled={!editImageUrl.trim()}
+                  className="btn-ghost !py-1 !px-3 text-[9px]"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+            <div
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); onEditMediaFiles(e.dataTransfer.files); }}
+              onClick={() => editMediaRef.current?.click()}
+              className="border-2 border-dashed border-line hover:border-gold p-6 text-center cursor-pointer transition-colors"
+            >
+              <input ref={editMediaRef} type="file" accept="image/*,video/*" multiple className="hidden" onChange={(e) => onEditMediaFiles(e.target.files)} />
+              <div className="text-2xl mb-2">📎</div>
+              <div className="text-sm">Drag & drop photos or videos</div>
+            </div>
+            {editMediaMsg && <div className="text-xs text-gold mt-2">{editMediaMsg}</div>}
+            <MediaEditor list={editMedia} onChange={setEditMedia} />
+            {editErr && <div className="text-xs text-gold mt-2">{editErr}</div>}
+            <div className="flex items-center gap-2">
+              <button onClick={saveEditPhotos} disabled={editSaving || editMediaUploading} className="btn-ink flex-1">{editSaving ? 'Saving…' : 'Save'}</button>
+              <button onClick={closeEditPhotos} disabled={editSaving} className="btn-ghost flex-1">Cancel</button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

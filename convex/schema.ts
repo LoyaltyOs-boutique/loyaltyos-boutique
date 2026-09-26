@@ -173,6 +173,19 @@ export default defineSchema({
     // parent lookbook is deleted; missing/false = active.
     is_deleted: v.optional(v.boolean()),
     deleted_at: v.optional(v.number()),
+    // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+    // Optional ordered gallery (decision 1) — media[0] is always the cover and
+    // is mirrored into image_url (which stays required), so every existing
+    // reader — OG preview, cards, AI — keeps working unchanged for legacy
+    // single-photo pieces that never set this field.
+    media: v.optional(
+      v.array(
+        v.object({
+          url: v.string(),
+          type: v.union(v.literal("image"), v.literal("video")),
+        }),
+      ),
+    ),
   }).index("by_lookbook", ["lookbook_id"]),
 
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */

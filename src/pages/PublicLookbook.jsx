@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import { BRAND } from '../data/seed.js';
 import { getLookbookById } from '../lib/db.js';
 import { inr, cls } from '../lib/util.js';
+import { ProductGallery } from '../components/ProductGallery.jsx';
 
 export default function PublicLookbook() {
   const { lookbookId } = useParams();
@@ -84,12 +85,7 @@ export default function PublicLookbook() {
             {items.map((item) => (
               <article key={item._id || item.id} className="animate-fadeUp group">
                 <div className="relative bg-mist overflow-hidden border border-line">
-                  <img
-                    src={item.image_url}
-                    alt={item.title}
-                    loading="lazy"
-                    className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105"
-                  />
+                  <ProductGallery piece={item} className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
                 </div>
                 <div className="pt-4">
                   <div className="eyebrow text-[9px] mb-1">85 Lansdowne Atelier</div>

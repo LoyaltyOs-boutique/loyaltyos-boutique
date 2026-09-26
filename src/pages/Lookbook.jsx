@@ -10,6 +10,7 @@ import {
   trackCartAdd, trackLookbookView, hydrateCustomerCatalogue,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
+import { ProductGallery } from '../components/ProductGallery.jsx';
 import AccessDenied from './AccessDenied.jsx';
 import { Stars } from '../components/ui.jsx';
 
@@ -331,7 +332,7 @@ export default function Lookbook() {
                 {catalogue.map((item) => (
                   <article key={item.id} className="animate-fadeUp group">
                     <div className="relative bg-mist overflow-hidden border border-line">
-                      <img src={item.image_url} alt={item.title} loading="lazy" className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
+                      <ProductGallery piece={item} className="aspect-[3/4] w-full object-cover transition-transform duration-500 group-hover:scale-105" />
                       <button
                         onClick={() => { likeItem(customer.id, item.id); setLikeAnim(item.id); setTimeout(() => setLikeAnim(null), 400); }}
                         className={cls('absolute top-3 right-3 h-9 w-9 bg-white/90 border border-line flex items-center justify-center text-lg transition-transform cursor-pointer hover:scale-110', likeAnim === item.id && 'animate-pop')}
