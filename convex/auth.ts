@@ -6,6 +6,7 @@ import { internal } from "./_generated/api";
 import type { QueryCtx, MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 import { rateLimiter } from "./rateLimits";
+import { shouldRefuseLogin, HEARTBEAT_MIN_WRITE_MS } from "./sessionLock";
 
 /**
  * LoyaltyOS Boutique — Auth functions (Step 3)
@@ -113,8 +114,9 @@ export const merchantLogin = mutation({
   args: {
     email: v.string(),
     password: v.string(),
+    currentToken: v.optional(v.string()),
   },
-  handler: async (ctx, { email, password }) => {
+  handler: async (ctx, { email, password, currentToken }) => {
     const normalized = email.trim().toLowerCase();
     const merchant = await ctx.db
       .query("users")
@@ -134,15 +136,81 @@ export const merchantLogin = mutation({
     const valid = bcrypt.compareSync(password, merchant.password_hash);
     if (!valid) return null;
 
-    const token = randomHex();
+    // One-Device Login Lock (design spec 2026-09-28, decisions 3-5, amendments
+    // 14 + 24). This runs STRICTLY AFTER password verification, so a wrong
+    // password never reveals whether the account is locked. shouldRefuseLogin
+    // refuses with { locked: true } only when the ONE_DEVICE_LOCK switch is "on",
+    // a live session exists, AND currentToken does NOT match the stored token —
+    // i.e. a genuinely different device. A merchant reopening their OWN browser
+    // passes its currentToken and is allowed through (same-device recognition).
+    // With the switch OFF (unset or any other value) this is a no-op and login
+    // proceeds exactly as before. No token issued and no session field touched
+    // when refused.
     const now = Date.now();
+    if (shouldRefuseLogin(merchant, now, process.env.ONE_DEVICE_LOCK, currentToken)) {
+      return { locked: true };
+    }
+
+    const token = randomHex();
     const expiresAt = now + SESSION_DAYS * DAY_MS;
     await ctx.db.patch(merchant._id, {
       session_token: token,
       session_expiry: expiresAt,
+      session_last_seen: now, // one-device-lock: stamp liveness on login (decision 5)
     });
 
     return { user: toPublicUser(merchant), token, expiresAt };
+  },
+});
+
+/**
+ * One-Device Login Lock (design spec 2026-09-28, decision 6) — server-side
+ * logout. Clears the session fields so the account is immediately free for a
+ * new login on any device. Best-effort and UNauthenticated by design: a device
+ * signing out may already hold a stale token, so this NEVER throws. It only
+ * clears the fields when the given token matches the stored one; for a missing
+ * user or a mismatched/stale token it does nothing and still returns { ok:true }
+ * (idempotent — a losing race or a second click cannot wipe a newer session).
+ */
+export const merchantLogout = mutation({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { userId, token }) => {
+    const user = await ctx.db.get(userId);
+    if (user && user.session_token === token) {
+      await ctx.db.patch(userId, {
+        session_token: undefined,
+        session_expiry: undefined,
+        session_last_seen: undefined,
+      });
+    }
+    return { ok: true };
+  },
+});
+
+/**
+ * One-Device Login Lock (design spec 2026-09-28, decision 7) — liveness
+ * heartbeat. Validates the caller with the EXISTING requireMerchantSession
+ * (called, never modified) — a bad/expired/mismatched token throws the same
+ * session errors as everywhere else. On a valid session it stamps
+ * session_last_seen to now, but skips the write when the stored value is newer
+ * than HEARTBEAT_MIN_WRITE_MS (30s) old, to avoid needless writes on the
+ * frequent 60s/visibility heartbeats.
+ */
+export const merchantHeartbeat = mutation({
+  args: {
+    userId: v.id("users"),
+    token: v.string(),
+  },
+  handler: async (ctx, { userId, token }) => {
+    const user = await requireMerchantSession(ctx, userId, token);
+    const now = Date.now();
+    if (!user.session_last_seen || now - user.session_last_seen >= HEARTBEAT_MIN_WRITE_MS) {
+      await ctx.db.patch(userId, { session_last_seen: now });
+    }
+    return { ok: true };
   },
 });
 

@@ -38,6 +38,7 @@ export default defineSchema({
     reset_expiry: v.optional(v.number()), // epoch ms — reset token expiry (24h)
     session_token: v.optional(v.string()), // merchant session token (256-bit hex)
     session_expiry: v.optional(v.number()), // epoch ms — merchant session expiry (7 days)
+    session_last_seen: v.optional(v.number()), // epoch ms — one-device-lock liveness heartbeat (last merchant activity)
     role: v.union(v.literal("customer"), v.literal("merchant")),
     name: v.string(),
     // Scaling Fix 1 — lowercased mirror of `name`, kept in sync on every name
