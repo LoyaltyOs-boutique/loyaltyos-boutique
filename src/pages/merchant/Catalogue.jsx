@@ -4,6 +4,7 @@ import { classifyFile, addEntries, moveEntry, removeEntry, fromPiece, validateLi
 import { BRAND } from '../../data/seed.js';
 import { inr } from '../../lib/util.js';
 import { SectionTitle, Empty, Modal } from '../../components/ui.jsx';
+import { ProductGallery } from '../../components/ProductGallery.jsx';
 
 const useDb = () => {
   const [, setV] = useState(0);
@@ -616,7 +617,7 @@ export default function Catalogue() {
             {shownItems.map((i) => (
               <div key={i.id} className="card overflow-hidden group">
                 <div className="relative">
-                  <img src={i.image_url} alt={i.title} className="aspect-[3/4] w-full object-cover" />
+                  <ProductGallery piece={i} viewerOnly className="aspect-[3/4] w-full object-cover" />
                   <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink/80 to-transparent p-3 flex justify-between items-end">
                     <span className="text-[9px] tracking-wide2 uppercase text-white/80">{i.source} · {i.likes || 0} ♥</span>
                     {Array.isArray(i.media) && i.media.length > 1 && (
