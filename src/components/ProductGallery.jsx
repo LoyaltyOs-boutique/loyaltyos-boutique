@@ -19,7 +19,7 @@ const ProductGalleryViewer = lazy(() => import('./ProductGalleryViewer.jsx'));
  * the page rendered before this component existed — no arrows, no dots, no
  * extra wrapping element.
  */
-export function ProductGallery({ piece, className }) {
+export function ProductGallery({ piece, className, viewerOnly = false }) {
   const media = fromPiece(piece);
   const count = media.length;
   const [index, setIndex] = useState(0);
@@ -27,24 +27,57 @@ export function ProductGallery({ piece, className }) {
   // Stays true after the first open so the lazy import above only ever fires
   // once per mount, even across later close/reopen cycles.
   const [hasOpened, setHasOpened] = useState(false);
-  const touchStartX = useRef(null);
+  const touchStart = useRef(null);
+  // Set true in onTouchEnd when the finger moved past the swipe threshold, so
+  // the synthetic click browsers fire after touchend is suppressed and only a
+  // real tap opens the viewer.
+  const swiped = useRef(false);
+  // Pending id for the timer that clears `swiped` after a swipe, so a swipe's
+  // flag can never outlive its own gesture and swallow a later unrelated tap.
+  const swipedTimer = useRef(null);
 
   if (count === 0) return null; // nothing to show — same as an empty image_url today
 
   const safeIndex = Math.min(index, count - 1);
-  const current = media[safeIndex];
+  const current = viewerOnly ? media[0] : media[safeIndex];
   const alt = piece?.title || '';
 
   const advance = (delta) => setIndex((i) => (i + delta + count) % count);
-  const openViewer = () => { setHasOpened(true); setOpen(true); };
-
-  const onTouchStart = (e) => { touchStartX.current = e.touches[0].clientX; };
-  const onTouchEnd = (e) => {
-    if (touchStartX.current === null) return;
-    const dx = e.changedTouches[0].clientX - touchStartX.current;
-    if (Math.abs(dx) > 40) advance(dx < 0 ? 1 : -1);
-    touchStartX.current = null;
+  const openViewer = () => {
+    if (swiped.current) { swiped.current = false; return; }
+    setHasOpened(true);
+    setOpen(true);
   };
+
+  // A single entry (or viewerOnly cover) has nothing to swipe between, so its
+  // touch handlers stay undefined and only the tap-to-open click applies.
+  const swipeEnabled = count > 1 && !viewerOnly;
+  const onTouchStart = swipeEnabled
+    ? (e) => {
+        // A fresh gesture always starts clean, and any pending clear-timer from
+        // a previous swipe is cancelled so timers never stack across swipes.
+        if (swipedTimer.current !== null) clearTimeout(swipedTimer.current);
+        swiped.current = false;
+        touchStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      }
+    : undefined;
+  const onTouchEnd = swipeEnabled
+    ? (e) => {
+        if (touchStart.current === null) return;
+        const dx = e.changedTouches[0].clientX - touchStart.current.x;
+        const dy = e.changedTouches[0].clientY - touchStart.current.y;
+        if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+          swiped.current = true; // suppress the click that follows a swipe
+          if (Math.abs(dx) > 40) advance(dx < 0 ? 1 : -1);
+          // On real phones a large move may fire no follow-up click at all, so
+          // the flag would otherwise outlive this gesture and swallow the next
+          // unrelated tap. Clear it after a delay longer than any real
+          // click-after-touchend but far shorter than a second human tap.
+          swipedTimer.current = setTimeout(() => { swiped.current = false; }, 350);
+        }
+        touchStart.current = null;
+      }
+    : undefined;
 
   const slides = media.map((m) => (
     m.type === 'video'
@@ -74,7 +107,34 @@ export function ProductGallery({ piece, className }) {
     />
   );
 
-  if (count === 1) return mainElement;
+  // The viewer opens at the card's current slide normally, or always at the
+  // cover (0) in viewerOnly mode where the card never tracks a slide.
+  const viewerBlock = hasOpened && (
+    <Suspense fallback={null}>
+      {open && (
+        <ProductGalleryViewer
+          slides={slides}
+          index={viewerOnly ? 0 : safeIndex}
+          open={open}
+          onClose={() => setOpen(false)}
+          onViewChange={viewerOnly ? () => {} : setIndex}
+        />
+      )}
+    </Suspense>
+  );
+
+  // Single entry, or a viewerOnly cover: the bare element renders identically to
+  // before (no wrapper, no arrows, no dots), the click just also mounts the
+  // viewer. Before any click hasOpened is false so viewerBlock is null — the
+  // closed-state DOM is exactly mainElement alone.
+  if (count === 1 || viewerOnly) {
+    return (
+      <>
+        {mainElement}
+        {viewerBlock}
+      </>
+    );
+  }
 
   return (
     <>
@@ -106,19 +166,7 @@ export function ProductGallery({ piece, className }) {
           />
         ))}
       </div>
-      {hasOpened && (
-        <Suspense fallback={null}>
-          {open && (
-            <ProductGalleryViewer
-              slides={slides}
-              index={safeIndex}
-              open={open}
-              onClose={() => setOpen(false)}
-              onViewChange={setIndex}
-            />
-          )}
-        </Suspense>
-      )}
+      {viewerBlock}
     </>
   );
 }

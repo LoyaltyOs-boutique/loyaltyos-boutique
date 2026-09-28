@@ -23,6 +23,12 @@ const LIGHTBOX_STYLES = {
  * Renders the Lightbox exactly as it was configured there, unchanged.
  */
 export default function ProductGalleryViewer({ slides, index, open, onClose, onViewChange }) {
+  // A single slide (always an image per mediaList.validateList) needs only Zoom;
+  // returning null for the nav buttons removes them from the DOM entirely, which
+  // carousel.finite alone would not do — it only disables them at the edges.
+  const single = slides.length === 1;
+  const plugins = single ? [Zoom] : [Zoom, Video, Thumbnails, Counter];
+  const render = single ? { buttonPrev: () => null, buttonNext: () => null } : undefined;
   return (
     <Lightbox
       open={open}
@@ -30,7 +36,8 @@ export default function ProductGalleryViewer({ slides, index, open, onClose, onV
       index={index}
       on={{ view: ({ index: i }) => onViewChange(i) }}
       slides={slides}
-      plugins={[Zoom, Video, Thumbnails, Counter]}
+      plugins={plugins}
+      render={render}
       styles={LIGHTBOX_STYLES}
     />
   );
