@@ -19,6 +19,7 @@ import type * as notifications from "../notifications.js";
 import type * as orders from "../orders.js";
 import type * as rateLimits from "../rateLimits.js";
 import type * as reviews from "../reviews.js";
+import type * as sessionLock from "../sessionLock.js";
 import type * as settings from "../settings.js";
 import type * as templates from "../templates.js";
 import type * as whatsapp from "../whatsapp.js";
@@ -41,6 +42,7 @@ declare const fullApi: ApiFromModules<{
   orders: typeof orders;
   rateLimits: typeof rateLimits;
   reviews: typeof reviews;
+  sessionLock: typeof sessionLock;
   settings: typeof settings;
   templates: typeof templates;
   whatsapp: typeof whatsapp;
