@@ -3,6 +3,7 @@ import {
   clearMerchantSession, getMerchantSession,
   hydrateNotifications, notifications, markAllSeenRemote, deleteNotificationRemote,
   subscribe, generateActivitySummaryRemote, getData, hydrateAllMerchantData,
+  sendMerchantHeartbeat, merchantLogoutRemote,
 } from '../../lib/db.js';
 import { useEffect, useRef, useState } from 'react';
 import { cls, timeAgo } from '../../lib/util.js';
@@ -358,7 +359,11 @@ export default function Shell({ children }) {
   const [me] = useState(() => getMerchantSession());
   const [open, setOpen] = useState(false);
   const close = () => setOpen(false);
-  const signOut = () => { clearMerchantSession(); navigate('/login'); };
+  // One-Device Login Lock (design spec 2026-09-28, decision 10): tell the
+  // server to free the account (fire-and-forget — merchantLogoutRemote never
+  // throws), then ALWAYS clear locally and navigate so logout works even if
+  // the server call never completes.
+  const signOut = () => { merchantLogoutRemote(); clearMerchantSession(); navigate('/login'); };
 
   // Hydrate-on-mount gate (2026-09-15, merchant-hydration-fix spec). Every
   // merchant page routes through Shell, so firing the full data warm here — once
@@ -376,6 +381,36 @@ export default function Shell({ children }) {
     hydratedTokenRef.current = token;
     hydrateAllMerchantData();
   });
+
+  // One-Device Login Lock (design spec 2026-09-28, decisions 7 + 9). Keyed on
+  // the merchant token (read the SAME way the hydrate effect above reads it),
+  // so cleanup-then-rerun on a token change prevents duplicate timers. Sends
+  // one heartbeat now, one every 60s, and one each time the tab returns to
+  // view. A tick is skipped while the tab is not visible. ONLY a 'rejected'
+  // result ends the session — 'ok'/'skipped'/'error' do nothing (a transient
+  // network blip must never log the merchant out).
+  const heartbeatToken = getMerchantSession()?.token || null;
+  useEffect(() => {
+    if (!heartbeatToken) return;
+    const beat = async () => {
+      const result = await sendMerchantHeartbeat();
+      if (result === 'rejected') {
+        clearMerchantSession();
+        navigate('/login', { replace: true, state: { sessionEnded: true } });
+      }
+    };
+    beat();
+    const id = setInterval(() => {
+      if (document.hidden) return; // skip the beat while the tab is not visible
+      beat();
+    }, 60000);
+    const onVisible = () => { if (!document.hidden) beat(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [heartbeatToken]);
 
   return (
     <div className="min-h-screen bg-mist">

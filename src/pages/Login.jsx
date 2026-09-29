@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { BRAND } from '../data/seed.js';
-import { merchantLogin, saveMerchantSession, resetDemo, forgotPassword } from '../lib/db.js';
+import { merchantLoginAsync, resetDemo, forgotPassword } from '../lib/db.js';
 import { cls } from '../lib/util.js';
+import { Modal } from '../components/ui.jsx';
 
 export default function Login() {
   const navigate = useNavigate();
@@ -12,13 +13,37 @@ export default function Login() {
   const [error, setError] = useState('');
   const [mode, setMode] = useState('login'); // login | forgot | sent
   const [fpEmail, setFpEmail] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [locked, setLocked] = useState(false);
 
-  const submit = (e) => {
+  // One-Device Login Lock (design spec 2026-09-28, decision 9): a device sent
+  // here after its session ended elsewhere carries state.sessionEnded.
+  const sessionEnded = !!location.state?.sessionEnded;
+
+  const submit = async (e) => {
     e.preventDefault();
-    const u = merchantLogin(email, password);
-    if (!u) { setError('Incorrect email or password.'); return; }
-    saveMerchantSession(u.id);
-    navigate(location.state?.from?.pathname || '/merchant/dashboard', { replace: true });
+    if (submitting) return; // guard against a double-fire while in flight
+    setSubmitting(true);
+    setError('');
+    try {
+      const res = await merchantLoginAsync(email, password);
+      if (res.status === 'ok') {
+        navigate(location.state?.from?.pathname || '/merchant/dashboard', { replace: true });
+      } else if (res.status === 'locked') {
+        setLocked(true);
+      } else if (res.status === 'unreachable') {
+        setError('Could not reach the server. Please try again.');
+      } else {
+        setError('Incorrect email or password.');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const closeLocked = () => {
+    setLocked(false);
+    setPassword(''); // clear only the password, keep the email
   };
 
   const sendReset = async (e) => {
@@ -59,8 +84,9 @@ export default function Login() {
               <form onSubmit={submit} className="space-y-4">
                 <div><label className="label">Email</label><input className="input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="owner@boutique.in" required /></div>
                 <div><label className="label">Password</label><input className="input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" required /></div>
+                {sessionEnded && <div className="text-xs text-red-500">Your session ended because this account was used on another device or timed out. Please sign in again.</div>}
                 {error && <div className="text-xs text-red-500">{error}</div>}
-                <button className="btn-ink w-full">Sign in to your boutique</button>
+                <button className="btn-ink w-full" disabled={submitting}>Sign in to your boutique</button>
               </form>
               <button onClick={() => { setMode('forgot'); setFpEmail(''); }} className="mt-5 text-xs tracking-wide2 uppercase text-steel hover:text-ink cursor-pointer">
                 Forgot password?
@@ -104,6 +130,17 @@ export default function Login() {
           </div>
         </div>
       </div>
+
+      {/* One-Device Login Lock refusal (design spec 2026-09-28, decision 8) —
+          reuses the existing Modal primitive and only already-audited classes. */}
+      <Modal open={locked} onClose={closeLocked} title="Already signed in elsewhere">
+        <div className="space-y-4">
+          <p className="text-sm text-ink leading-relaxed">
+            This account is already logged in on another device. Please log out from that device first.
+          </p>
+          <button onClick={closeLocked} className="btn-ink w-full">OK</button>
+        </div>
+      </Modal>
     </div>
   );
 }

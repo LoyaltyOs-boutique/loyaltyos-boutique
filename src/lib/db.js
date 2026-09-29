@@ -150,6 +150,119 @@ export function merchantLogin(email, password) {
   }
   return u;
 }
+
+/**
+ * One-Device Login Lock (design spec 2026-09-28, decision 8, amendments 15,
+ * 20, 24). The NEW async login path used ONLY by Login.jsx. Unlike the
+ * synchronous merchantLogin above (kept byte-identical, still used nowhere on
+ * the submit path once Login.jsx is updated), this AWAITS the Convex result
+ * and returns a discriminated status so the caller navigates only after the
+ * server confirms — no optimistic local-only login (amendment 20).
+ *
+ * Returns exactly one of:
+ *   { status: 'ok', user }       — Convex returned { user, token, expiresAt }
+ *   { status: 'invalid' }        — Convex returned null (no such merchant / wrong password)
+ *   { status: 'locked' }         — Convex returned { locked: true } (another device is live)
+ *   { status: 'unreachable' }    — no client, or the call threw/rejected
+ *
+ * Same-device recognition (amendment 24): passes the browser's current token
+ * as currentToken when one exists, so a merchant re-signing-in from their own
+ * live session is not refused by their own lock. The token is never logged.
+ */
+export async function merchantLoginAsync(email, password) {
+  const client = getConvex();
+  if (!client) return { status: 'unreachable' };
+
+  // Include currentToken ONLY when it is a non-empty string, mirroring this
+  // file's optional-arg convention (e.g. `...(channel ? { channel } : {})`).
+  const currentToken = getMerchantSession()?.token;
+  let res;
+  try {
+    res = await client.mutation(api.auth.merchantLogin, {
+      email,
+      password,
+      ...(currentToken ? { currentToken } : {}),
+    });
+  } catch {
+    return { status: 'unreachable' };
+  }
+
+  // { locked: true } is a truthy object — check it BEFORE any generic
+  // truthiness test, or a refusal would be misread as a success.
+  if (res && res.locked === true) return { status: 'locked' };
+  if (!res || !res.token) return { status: 'invalid' };
+
+  // Success: reconcile the Convex result to the LOCAL row by EMAIL (Appendix
+  // B(d) — the real Convex _id does not equal the local seed id). If no local
+  // row exists for that email, treat as unreachable and save nothing.
+  const localRow = localMerchantByEmail(email);
+  if (!localRow) return { status: 'unreachable' };
+
+  // Reproduce every success-path side effect of merchantLogin's .then()
+  // (Appendix A.2): persist the Convex token, stamp convexId/session fields on
+  // the local row, then hydrate every merchant dataset.
+  saveMerchantSession(localRow.id, res.token);
+  const sIdx = state.users.findIndex((x) => x.id === localRow.id);
+  if (sIdx >= 0) {
+    state.users[sIdx] = {
+      ...state.users[sIdx],
+      convexId: res.user?.id || state.users[sIdx].convexId,
+      session_token: res.token,
+      session_expiry: res.expiresAt,
+    };
+    persist();
+  }
+  hydrateCustomers();
+  hydrateCatalogue();
+  hydrateReviews();
+  return { status: 'ok', user: localRow };
+}
+
+/**
+ * One-Device Login Lock (design spec 2026-09-28, decisions 7 + 9). Sends one
+ * liveness heartbeat for the merchant shell. Reuses merchantSessionArgs() —
+ * the SAME helper every locked call uses — so a logged-out caller yields null
+ * and we skip the call. Returns:
+ *   'skipped'  — no real Convex id yet (still a local seed id, never hydrated)
+ *   'ok'       — heartbeat accepted
+ *   'rejected' — server rejected the session (stale/rotated token) → caller may log out
+ *   'error'    — anything else, incl. a transient network blip → caller must NOT log out
+ */
+export async function sendMerchantHeartbeat() {
+  const client = getConvex();
+  const args = merchantSessionArgs();
+  if (!client || !args) return 'skipped';
+  // No real Convex id yet (userId still the local seed value like 'owner'):
+  // the backend's v.id("users") would reject it, so there is nothing to beat.
+  const local = state.users.find((x) => x.id === getMerchantSession()?.id);
+  if (!local || !local.convexId) return 'skipped';
+  try {
+    await client.mutation(api.auth.merchantHeartbeat, args);
+    return 'ok';
+  } catch (err) {
+    return isSessionRejectedError(err) ? 'rejected' : 'error';
+  }
+}
+
+/**
+ * One-Device Login Lock (design spec 2026-09-28, decision 10). Best-effort
+ * server-side logout — MUST NEVER THROW so signOut always completes locally.
+ * Returns immediately (no Convex call) when there is no real Convex id or no
+ * token; otherwise fires merchantLogout inside a try/catch and swallows any
+ * failure.
+ */
+export async function merchantLogoutRemote() {
+  const client = getConvex();
+  const session = getMerchantSession();
+  const token = session?.token;
+  const local = state.users.find((x) => x.id === session?.id);
+  const userId = local?.convexId;
+  if (!client || !token || !userId) return;
+  try {
+    await client.mutation(api.auth.merchantLogout, { userId, token });
+  } catch { /* best-effort — local logout already proceeds regardless */ }
+}
+
 export function merchantByEmail(email) {
   return localMerchantByEmail(email);
 }
