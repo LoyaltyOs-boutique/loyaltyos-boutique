@@ -2310,18 +2310,115 @@ export function resetSettings() {
 
 /* ---------- Derived ---------- */
 export function customers() { return state.users.filter((u) => u.role === 'customer'); }
-export function pendingGmbReviews() { return state.reviews.filter((r) => r.platform === 'gmb' && r.status === 'pending'); }
+// Widened by design (docs/superpowers/specs/2026-09-30-dashboard-real-data-design.md):
+// returns every pending review, any platform — name kept as-is for callers.
+export function pendingGmbReviews() { return state.reviews.filter((r) => r.status === 'pending'); }
 export function activityFeed() { return state.events.slice(0, 40); }
+
+// Design spec: docs/superpowers/specs/2026-09-30-dashboard-real-data-design.md
+// SEPARATE module-scoped cache for the real customer-activity feed pulled
+// from api.dashboard.getRecentCustomerActivity — kept OUT of state.events on
+// purpose (never persisted to localStorage, never written by pushEvent) so
+// this stays a pure read-time merge, same local-first hydrate-then-subscribe
+// shape as hydrateActiveCustomers()/activeCustomers() and the dashboard
+// summary cache above.
+let recentActivityCache = []; // RAW server rows: {id, customerId, customerName, kind, itemTitle?, createdAt} — converted on read, not on fetch
+let recentActivityHydrating = false;
+
+// The Dashboard ACTION map (src/pages/merchant/Dashboard.jsx) only defines
+// icons for purchase/review/points/campaign/like/catalogue/message_action.
+// Map each server `kind` onto the closest existing key on purpose (rather
+// than leaning on Dashboard.jsx:181's `ACTION[e.type] || ACTION.purchase`
+// fallback for everything): like -> like (exact), review -> review (exact),
+// cart_add -> purchase (adding to a cart is the closest purchase-funnel
+// signal the current icon set has), lookbook_view -> catalogue (a lookbook
+// IS the catalogue experience), event_link_click -> campaign (an event link
+// click is a response to a merchant-sent campaign/message).
+const ACTIVITY_KIND_TO_LOCAL_TYPE = {
+  like: 'like',
+  review: 'review',
+  cart_add: 'purchase',
+  lookbook_view: 'catalogue',
+  event_link_click: 'campaign',
+};
+
+// Short plain-English text per activity kind — omits the item name whenever
+// itemTitle is missing/undefined so a row never literally reads "undefined".
+function activityItemText(kind, itemTitle) {
+  const withItem = (verb) => (itemTitle ? `${verb} ${itemTitle}` : verb);
+  if (kind === 'like') return withItem('Liked');
+  if (kind === 'cart_add') return itemTitle ? `Added ${itemTitle} to cart` : 'Added an item to cart';
+  if (kind === 'lookbook_view') return 'Viewed a lookbook';
+  if (kind === 'event_link_click') return 'Opened an event link';
+  return 'Submitted a review'; // kind === 'review'
+}
+
+// Convert one server activity row into the local pushEvent() shape
+// ({id, userId, type, text, ts}). customerId is the server's Convex user id
+// — resolved to the matching local row's convexId (mergeConvexCustomer
+// stamps convexId while keeping the pre-existing local id, see that
+// function's comment) so the SAME db.users.find(u => u.id === X) lookup
+// Dashboard.jsx/Customers.jsx already use resolves a real name. Items with
+// no matching local row are skipped entirely — never fabricated.
+function toLocalActivityEvent(item, usersByConvexId) {
+  const localUser = usersByConvexId.get(item.customerId);
+  if (!localUser) return null;
+  return {
+    id: item.id,
+    userId: localUser.id,
+    type: ACTIVITY_KIND_TO_LOCAL_TYPE[item.kind] || 'purchase',
+    text: activityItemText(item.kind, item.itemTitle),
+    ts: new Date(item.createdAt).toISOString(),
+  };
+}
+
+/**
+ * Background hydrate: pull the newest real customer-activity rows from
+ * Convex and replace recentActivityCache with the RAW server rows
+ * (unconverted — still {id, customerId, customerName, kind, itemTitle?,
+ * createdAt}), then emit(). Conversion to the local event shape now happens
+ * at READ time in recentActivityByCustomer() below, not here — this hydrate
+ * runs concurrently with hydrateCustomers() from hydrateAllMerchantData(),
+ * and converting here against whichever state.users snapshot happens to
+ * exist at THIS exact moment could permanently skip rows for customers that
+ * simply hadn't merged in yet. Deferring conversion to the read that already
+ * re-runs on every emit() removes that race entirely. Same self-guard +
+ * fail-silently ("offline — keep last-known cache") convention as
+ * hydrateDashboardSummary() above. Never writes into state.events /
+ * localStorage.
+ */
+export function hydrateRecentCustomerActivity() {
+  if (recentActivityHydrating) return;
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  recentActivityHydrating = true;
+  client.query(api.dashboard.getRecentCustomerActivity, { limit: 50, ...session })
+    .then((rows) => {
+      recentActivityHydrating = false;
+      if (!Array.isArray(rows)) return;
+      recentActivityCache = rows;
+      emit();
+    })
+    .catch(() => { recentActivityHydrating = false; /* offline — keep last-known cache */ });
+}
 
 /**
  * Dashboard "Recent activity" redesign — one row per customer instead of
- * one row per event. Derives purely from state.events (the same source
- * activityFeed() already reads — a local, already-hydrated array, so no new
- * Convex round-trip is needed): group events by userId, keep only each
- * customer's single MOST RECENT event as that row's preview, then sort the
- * resulting per-customer rows by that timestamp descending — so whichever
- * customer did something most recently overall sits at the top, regardless
- * of how many other events they have piled up underneath.
+ * one row per event. Derives from state.events PLUS the RAW
+ * recentActivityCache rows above, converted to the local event shape RIGHT
+ * HERE using whatever state.users looks like on THIS call (no new Convex
+ * round-trip either way — the raw rows were already pulled by
+ * hydrateRecentCustomerActivity()). Doing the customerId -> local-user match
+ * at read time instead of at fetch time means a call that runs after
+ * hydrateCustomers() finishes will pick up customers that merged in later,
+ * every emit() already re-runs this, so a not-yet-merged customer's rows
+ * simply appear once their record shows up — no reload needed, no race
+ * against which hydrate call lands first: group events by userId, keep only
+ * each customer's single MOST RECENT event as that row's preview, then sort
+ * the resulting per-customer rows by that timestamp descending — so
+ * whichever customer did something most recently overall sits at the top,
+ * regardless of how many other events they have piled up underneath.
  *
  * The 'owner'/'system' pseudo-events (pushEvent('owner', ...) for catalogue
  * adds / campaign dispatches) are kept as their own row — they are not tied
@@ -2331,8 +2428,24 @@ export function activityFeed() { return state.events.slice(0, 40); }
  * as the old flat feed did.
  */
 export function recentActivityByCustomer() {
-  const latestByUser = new Map(); // userId -> most recent event for that user
+  const usersByConvexId = new Map(state.users.filter((u) => u.convexId).map((u) => [u.convexId, u]));
+  const convertedCache = recentActivityCache
+    .map((item) => toLocalActivityEvent(item, usersByConvexId))
+    .filter(Boolean);
+  const seenIds = new Set();
+  const combined = [];
   for (const e of state.events) {
+    if (seenIds.has(e.id)) continue;
+    seenIds.add(e.id);
+    combined.push(e);
+  }
+  for (const e of convertedCache) {
+    if (seenIds.has(e.id)) continue;
+    seenIds.add(e.id);
+    combined.push(e);
+  }
+  const latestByUser = new Map(); // userId -> most recent event for that user
+  for (const e of combined) {
     const prev = latestByUser.get(e.userId);
     if (!prev || (e.ts || '') > (prev.ts || '')) latestByUser.set(e.userId, e);
   }
@@ -2360,9 +2473,15 @@ export function customerLedger(userId) {
 export function derivedMetrics() {
   const cs = customers();
   const loyaltyRevenue = state.orders.reduce((s, o) => s + o.finalTotal, 0);
-  const pointsIssued = state.pointsLedger.filter((l) => l.action === 'earned').reduce((s, l) => s + l.points, 0);
+  const localPointsIssued = state.pointsLedger.filter((l) => l.action === 'earned').reduce((s, l) => s + l.points, 0);
+  // Prefer the real Convex-wide counts once hydrateDashboardSummary() has
+  // filled the cache — NEVER add the server and local values together (one
+  // or the other, never both, per the design's anti-double-counting rule).
+  // Cache empty (not yet hydrated, or offline) → keep the existing local calc.
+  const totalCustomers = dashboardSummaryCache ? dashboardSummaryCache.totalCustomers : cs.length;
+  const pointsIssued = dashboardSummaryCache ? dashboardSummaryCache.pointsIssued : localPointsIssued;
   return {
-    totalCustomers: cs.length,
+    totalCustomers,
     loyaltyRevenue,
     pointsIssued,
     pendingReviews: pendingGmbReviews().length,
@@ -2570,6 +2689,40 @@ export function hydrateActiveCustomers() {
 
 /** Synchronous reader for the cached active-customer rows (most-active-first, as returned by Convex). */
 export function activeCustomers() { return activeCustomersCache; }
+
+/* ---------- Delight Desk real-data bridge (Dashboard summary + activity) ---------- */
+// Design spec: docs/superpowers/specs/2026-09-30-dashboard-real-data-design.md
+// Same local-first hydrate-then-subscribe shape as hydrateActiveCustomers()/
+// activeCustomers() directly above: a module-scoped cache, a background
+// hydrate function that self-guards against overlapping calls and leaves the
+// cache untouched on any failure ("offline — keep last-known cache"), and a
+// synchronous reader consumed inside derivedMetrics() below. Dashboard.jsx is
+// not edited — it keeps calling derivedMetrics()/recentActivityByCustomer()
+// exactly as before; only their internals change.
+let dashboardSummaryCache = null; // null = not yet hydrated (keep local calc); else {totalCustomers, pointsIssued}
+let dashboardSummaryHydrating = false;
+
+/**
+ * Background hydrate: pull the real merchant-wide {totalCustomers,
+ * pointsIssued} counts from Convex and replace the summary cache, then
+ * emit() so Dashboard's useDb()-style subscribe() re-renders. Self-guards
+ * against overlapping concurrent calls, same as hydrateActiveCustomers().
+ */
+export function hydrateDashboardSummary() {
+  if (dashboardSummaryHydrating) return;
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client || !session) return;
+  dashboardSummaryHydrating = true;
+  client.query(api.dashboard.getDashboardSummary, session)
+    .then((res) => {
+      dashboardSummaryHydrating = false;
+      if (!res) return;
+      dashboardSummaryCache = { totalCustomers: res.totalCustomers, pointsIssued: res.pointsIssued };
+      emit();
+    })
+    .catch(() => { dashboardSummaryHydrating = false; /* offline — keep last-known cache */ });
+}
 
 /* ---------- Client onboarding & magic links ---------- */
 const mdFromDate = (iso) => {
@@ -2836,6 +2989,10 @@ export const waMessage = (user, magicLink) =>
  *                                    getCustomers/getLookbooksForSelector) — so
  *                                    warming the cache here reaches both pages
  *                                    WITHOUT editing Templates.jsx/Campaigns.jsx
+ *   7. hydrateDashboardSummary()   → real totalCustomers/pointsIssued counts
+ *                                    for derivedMetrics() (Delight Desk cards)
+ *   8. hydrateRecentCustomerActivity() → real like/cart/view/click/review rows
+ *                                    merged into recentActivityByCustomer()
  *
  * Every hydrate callee self-guards via its own `xHydrating` flag, so this is
  * idempotent and race-safe alongside merchantLogin()'s existing trigger and the
@@ -2851,6 +3008,8 @@ export function hydrateAllMerchantData() {
   hydrateReviews();
   hydrateCustomersPage(0, CUSTOMERS_PAGE_SIZE);
   hydrateSettings();
+  hydrateDashboardSummary();
+  hydrateRecentCustomerActivity();
 
   // Warm the selector cache the two dropdown bridges read from FIRST. Fetched
   // directly (not via getCustomers()/getLookbooksForSelector()) so a stale empty
