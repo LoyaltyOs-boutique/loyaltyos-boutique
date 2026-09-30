@@ -7,3 +7,9 @@ superpowers.zip
 *.log
 preview.*
 test-tmp/
+
+# local tool and QA artifacts (repo hygiene 2026-09-30)
+.playwright-mcp/
+.serena/
+.claude/.headroom_wrap_settings.lock
+qa-screenshots-*/
