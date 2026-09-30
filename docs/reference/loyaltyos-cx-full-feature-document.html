@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LoyaltyOS Boutique — Feature &amp; Architecture Document · Version 2.0</title>
+<style>
+  :root {
+    --ink: #161616; --charcoal: #292929; --steel: #68645e;
+    --gold: #b79768; --gold-dark: #886a42; --gold-pale: #f5efe6;
+    --paper: #faf9f6; --white: #ffffff; --line: #ded8ce;
+    --green: #2d6a4f; --green-pale: #eaf4ee;
+    --blue: #3c647d; --blue-pale: #eaf2f7;
+    --amber: #8d5c18; --amber-pale: #fbf1df;
+    --red: #914343; --red-pale: #f8eaea;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: #efede9; color: var(--ink); font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; font-size: 15px; line-height: 1.65; }
+  .document { max-width: 1000px; margin: 34px auto; background: var(--white); box-shadow: 0 20px 60px rgba(25,21,15,.10); }
+  header { position: relative; overflow: hidden; padding: 50px 58px 42px; color: var(--white); background: var(--ink); border-bottom: 5px solid var(--gold); }
+  header::after { content: ""; position: absolute; right: -120px; top: -175px; width: 370px; height: 370px; border: 1px solid rgba(183,151,104,.28); border-radius: 50%; }
+  .brand-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 36px; }
+  .brand { display: flex; align-items: center; gap: 13px; color: #e5ded3; font-size: 11px; letter-spacing: .2em; text-transform: uppercase; }
+  .mark { width: 36px; height: 36px; display: grid; place-items: center; color: var(--gold); border: 1px solid var(--gold); font-family: Georgia, serif; font-size: 18px; }
+  .version { padding: 6px 10px; color: #dfd6ca; border: 1px solid rgba(255,255,255,.25); font-size: 9px; letter-spacing: .15em; text-transform: uppercase; }
+  h1, h2, h3, h4 { margin-top: 0; color: var(--ink); font-family: Georgia, "Times New Roman", serif; font-weight: 500; line-height: 1.2; }
+  header h1 { max-width: 780px; margin: 0 0 14px; color: var(--white); font-size: clamp(29px, 4.2vw, 44px); letter-spacing: -.025em; }
+  header p { max-width: 770px; margin: 0; color: #cbc3b8; font-size: 16.5px; }
+  .meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 30px; background: #45413b; border: 1px solid #45413b; }
+  .meta-item { padding: 13px 15px; background: #232323; }
+  .meta-label { display: block; color: var(--gold); font-size: 9px; letter-spacing: .15em; text-transform: uppercase; }
+  .meta-value { color: #f4f0e9; font-size: 13px; }
+  main { padding: 44px 58px 60px; }
+  section { margin-top: 46px; }
+  section:first-child { margin-top: 0; }
+  .kicker { margin-bottom: 6px; color: var(--gold-dark); font-size: 10px; font-weight: 800; letter-spacing: .17em; text-transform: uppercase; }
+  section > h2 { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); font-size: 27px; }
+  .lead { margin: 0 0 20px; color: var(--steel); font-size: 15.5px; }
+  .promise { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .promise-item { padding: 17px 19px; border: 1px solid var(--line); border-left: 3px solid var(--gold); background: var(--paper); }
+  .promise-item strong { display: block; margin-bottom: 3px; font-family: Georgia, serif; font-weight: 500; font-size: 15.5px; }
+  .promise-item span { color: var(--steel); font-size: 13px; }
+  .feature { margin-top: 18px; padding: 26px 28px 22px; border: 1px solid var(--line); border-top: 3px solid var(--gold); background: linear-gradient(180deg, #fff 0%, #fbf9f5 100%); }
+  .feature-tag { display: inline-block; margin-bottom: 8px; padding: 4px 9px; border: 1px solid #e3d5bd; background: var(--gold-pale); color: var(--gold-dark); font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+  .feature h3 { margin: 0 0 8px; font-size: 22px; }
+  .feature .what { margin: 0 0 6px; color: var(--charcoal); font-size: 14px; }
+  .journey-box { margin-top: 14px; padding: 18px 20px 12px; border: 1px solid var(--line); background: var(--white); }
+  .journey-box h4, .rules h4 { margin: 0 0 10px; color: var(--gold-dark); font-size: 10px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; font-family: Inter, sans-serif; }
+  .steps { margin: 0; padding: 0; list-style: none; counter-reset: step; }
+  .steps li { position: relative; counter-increment: step; padding: 9px 0 9px 44px; border-bottom: 1px dashed var(--line); font-size: 13.5px; color: var(--charcoal); }
+  .steps li:last-child { border-bottom: none; }
+  .steps li::before { content: counter(step, decimal-leading-zero); position: absolute; left: 0; top: 10px; color: var(--gold-dark); font-family: Georgia, serif; font-size: 17px; }
+  .steps strong { font-weight: 700; }
+  .rules { margin-top: 14px; padding: 18px 20px 14px; border: 1px solid var(--line); background: var(--paper); }
+  .rules ul { margin: 0; padding: 0; list-style: none; }
+  .rules li { position: relative; padding: 7px 0 7px 24px; font-size: 13px; color: var(--charcoal); border-bottom: 1px dashed var(--line); }
+  .rules li:last-child { border-bottom: none; }
+  .rules li::before { content: "◆"; position: absolute; left: 0; top: 7px; color: var(--gold); font-size: 9px; }
+  .rules li .p-tag { float: right; color: var(--gold-dark); font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+  .note { margin-top: 14px; padding: 12px 15px; border-left: 3px solid var(--blue); background: var(--blue-pale); color: #35596f; font-size: 13px; }
+  .note.green { border-left-color: var(--green); background: var(--green-pale); color: #2d5a44; }
+  .note.gold { border-left-color: var(--gold); background: var(--gold-pale); color: #6f5a35; }
+  .note.red { border-left-color: var(--red); background: var(--red-pale); color: #7a3535; }
+  .surfaces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; }
+  .surface { padding: 18px; border: 1px solid var(--line); border-top: 3px solid var(--gold); background: var(--white); text-align: center; }
+  .surface strong { display: block; margin-bottom: 4px; font-family: Georgia, serif; font-weight: 500; font-size: 16px; }
+  .surface span { color: var(--steel); font-size: 12px; }
+  .summary-box { margin-top: 22px; padding: 24px; color: var(--white); background: var(--ink); border-bottom: 4px solid var(--gold); }
+  .summary-box h3 { color: var(--white); font-size: 22px; }
+  .summary-box p { margin: 0; color: #d4cdc2; }
+  footer { display: flex; justify-content: space-between; gap: 18px; padding: 22px 58px; color: var(--steel); background: var(--paper); border-top: 1px solid var(--line); font-size: 10px; }
+
+  /* New components for v2 */
+  .toc { margin: 0 0 8px; padding: 22px 26px; border: 1px solid var(--line); border-left: 3px solid var(--gold); background: var(--paper); }
+  .toc ol { margin: 0; padding: 0; list-style: none; counter-reset: toc; }
+  .toc li { counter-increment: toc; padding: 5px 0; border-bottom: 1px dashed var(--line); font-size: 13.5px; }
+  .toc li:last-child { border-bottom: none; }
+  .toc li::before { content: counter(toc, decimal-leading-zero); margin-right: 12px; color: var(--gold-dark); font-family: Georgia, serif; }
+  .toc a { color: var(--charcoal); text-decoration: none; }
+  .toc a:hover { color: var(--gold-dark); }
+  .toc .sub { color: var(--steel); font-size: 12px; margin-left: 4px; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 13px; }
+  th, td { padding: 9px 12px; text-align: left; border: 1px solid var(--line); vertical-align: top; }
+  th { background: var(--ink); color: #f4f0e9; font-family: Georgia, serif; font-weight: 500; font-size: 13.5px; letter-spacing: .02em; }
+  tr:nth-child(even) td { background: var(--paper); }
+  td .term { font-weight: 700; color: var(--charcoal); }
+  .pill { display: inline-block; margin: 1px 2px; padding: 2px 8px; border: 1px solid #e3d5bd; background: var(--gold-pale); color: var(--gold-dark); font-size: 9px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
+  .pill.blue { border-color: #c3d7e4; background: var(--blue-pale); color: var(--blue); }
+  .pill.green { border-color: #bcd8c7; background: var(--green-pale); color: var(--green); }
+
+  .principle { margin-top: 12px; padding: 15px 18px; border: 1px solid var(--line); border-left: 4px solid var(--gold); background: var(--paper); }
+  .principle strong { display: block; font-family: Georgia, serif; font-weight: 500; font-size: 15.5px; margin-bottom: 2px; }
+  .principle .pid { float: right; color: var(--gold-dark); font-weight: 800; font-size: 11px; letter-spacing: .1em; }
+  .principle span { color: var(--steel); font-size: 13px; }
+
+  .consent-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+  .consent-card { padding: 16px 18px; border: 1px solid var(--line); border-top: 3px solid var(--gold); background: var(--white); }
+  .consent-card strong { display: block; font-family: Georgia, serif; font-weight: 500; font-size: 15px; margin-bottom: 5px; }
+  .consent-card span { color: var(--steel); font-size: 12.5px; }
+
+  .gate { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-bottom: 1px dashed var(--line); font-size: 13.5px; }
+  .gate:last-child { border-bottom: none; }
+  .gate .num { flex: 0 0 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--gold); color: var(--gold-dark); font-family: Georgia, serif; font-weight: 700; }
+  .gate strong { font-weight: 700; }
+
+  @media (max-width: 800px) {
+    .document { margin: 0; }
+    header, main { padding-left: 24px; padding-right: 24px; }
+    .brand-row { flex-direction: column; align-items: flex-start; }
+    .meta, .promise, .surfaces, .consent-grid { grid-template-columns: 1fr; }
+    .feature { padding: 18px; }
+    footer { padding: 18px 24px; flex-direction: column; }
+  }
+  @media print {
+    @page { size: A4; margin: 13mm; }
+    body { background: #fff; font-size: 11px; }
+    .document { max-width: none; margin: 0; box-shadow: none; }
+    header { padding: 28px 34px 24px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    header h1 { font-size: 30px; }
+    main { padding: 26px 34px 32px; }
+    .feature, .promise-item, .summary-box, .surface, .journey-box, .rules, .principle, .consent-card, table, .toc { break-inside: avoid; }
+    footer { padding: 16px 34px; }
+  }
+</style>
+</head>
+<body>
+<article class="document">
+  <header>
+    <div class="brand-row">
+      <div class="brand"><span class="mark">L</span><span>85 Lansdowne · LoyaltyOS Boutique</span></div>
+      <div class="version">Feature &amp; Architecture Document · Version 2.0</div>
+    </div>
+    <h1>Built to launch: every feature, traced to its reason</h1>
+    <p>This is the complete, launch-ready document for the AI Customer Experience system. It explains what each feature does, walks through it as a real-life journey, and — new in this version — names the single operating principles every rule hangs from, so nothing can quietly contradict anything else. Written so the whole team can read it start to finish.</p>
+    <div class="meta">
+      <div class="meta-item"><span class="meta-label">Written for</span><span class="meta-value">Everyone — no technical background needed</span></div>
+      <div class="meta-item"><span class="meta-label">Covers</span><span class="meta-value">8 features · 4 guarantees · 8 principles · launch gates</span></div>
+      <div class="meta-item"><span class="meta-label">Prepared on</span><span class="meta-value">20 August 2026</span></div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ===================== TOC ===================== -->
+    <section id="toc">
+      <div class="kicker">How this document is organised</div>
+      <h2>Contents</h2>
+      <div class="toc">
+        <ol>
+          <li><a href="#part0">Part 0 · The logical spine</a> <span class="sub">— vocabulary, principles, consent, the law</span></li>
+          <li><a href="#part1">Part 1 · The client record</a> <span class="sub">— memory, points, tiers, the exclusive list, lists &amp; segments</span></li>
+          <li><a href="#part2">Part 2 · The eight features</a> <span class="sub">— F1 to F8, each with journey + rules</span></li>
+          <li><a href="#part3">Part 3 · The four standing guarantees</a> <span class="sub">— G1 to G4, the non-negotiable frame</span></li>
+          <li><a href="#part4">Part 4 · When things go wrong</a> <span class="sub">— the system fails politely</span></li>
+          <li><a href="#part5">Part 5 · The build &amp; launch sequence</a> <span class="sub">— order of work and the launch gates</span></li>
+          <li><a href="#part6">Part 6 · The traceability matrix</a> <span class="sub">— every principle, where it is enforced</span></li>
+          <li><a href="#part7">Part 7 · Glossary &amp; decisions still open</a> <span class="sub">— one name for each thing, one list of your choices</span></li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ===================== PART 0 ===================== -->
+    <section id="part0">
+      <div class="kicker">Part 0 · The logical spine</div>
+      <h2>Why this document cannot fall apart</h2>
+      <p class="lead">Every well-built system rests on a small set of fixed ideas, stated once, and then never contradicted. This part states them. Every feature in Part 2 and every guarantee in Part 3 exists <em>because</em> of one of these ideas — and every rule is tagged with the principle it serves, so a contradiction is impossible to hide. The traceability matrix in Part 6 shows the whole picture at a glance.</p>
+
+      <h3>The eight operating principles</h3>
+      <p class="lead" style="margin-top:-6px">These are the axioms. If a proposed feature or rule conflicts with one of them, the feature or rule is wrong — not the principle.</p>
+
+      <div class="principle"><span class="pid">P1 · Human authority</span><strong>Nothing reaches a client without your recorded approval.</strong><span>There is no code path that sends autonomously. Approval always records who and when. This is built into the system, not a policy written on top of it.</span></div>
+      <div class="principle"><span class="pid">P2 · Memory with reasons</span><strong>Every conclusion the system draws about a client carries its reasons.</strong><span>If the system thinks "she likes pastels," it can show you the two purchases and five likes behind that. No black boxes, ever.</span></div>
+      <div class="principle"><span class="pid">P3 · Your correction wins</span><strong>Stated facts outrank inferences — permanently.</strong><span>What you tell the system beats what it guesses, and the system never silently reverts a correction. (See the single, explicit boundary in Part 1.)</span></div>
+      <div class="principle"><span class="pid">P4 · Consent is sacred</span><strong>Three independent switches, re-checked at the moment of sending.</strong><span>Occasion wishes, marketing, and STOP are separate decisions, each checked again every single time — never assumed from an old list.</span></div>
+      <div class="principle"><span class="pid">P5 · Honesty</span><strong>Real stock, real prices, honest counts.</strong><span>No padding a thin suggestion, no guessing an unreadable price, no dead links, no stale pages. When the truth is modest, the system says so.</span></div>
+      <div class="principle"><span class="pid">P6 · Dignity</span><strong>Clients never see budget talk or anything that feels like a bill.</strong><span>Price-range and spend filtering happen invisibly; clients only ever see beautiful pieces and warm words.</span></div>
+      <div class="principle"><span class="pid">P7 · The design is frozen</span><strong>No visual drift, enforced by a machine — not goodwill.</strong><span>The half-built website design is never altered; an automated check rejects any work that touches it.</span></div>
+      <div class="principle"><span class="pid">P8 · Graceful failure</span><strong>Every feature fails politely.</strong><span>Every bad day has a fallback that is quieter, safer and more honest than the failure itself. Details in Part 4.</span></div>
+
+      <h3 style="margin-top:34px">The vocabulary — every thing has one name</h3>
+      <p class="lead" style="margin-top:-6px">A system falls apart when two parts use two different words for the same thing. This is the fixed list of the things in this system, used identically everywhere from here on.</p>
+      <table>
+        <tr><th style="width:150px">Term</th><th>What it means (the only meaning)</th></tr>
+        <tr><td class="term">Client</td><td>A person with a record in the system — identity, memory, consent, points, tier, list membership.</td></tr>
+        <tr><td class="term">Memory</td><td>Everything the system knows about a client. Two kinds: <strong>facts</strong> (you stated them) and <strong>inferences</strong> (it noticed them, each with reasons).</td></tr>
+        <tr><td class="term">Consent</td><td>Three independent switches on a client record: occasion wishes, marketing, STOP. Defined fully below.</td></tr>
+        <tr><td class="term">Loyalty account</td><td>The client's points ledger. Append-only — never editable (see P5 and Part 1).</td></tr>
+        <tr><td class="term">Tier</td><td>A client's standing — Standard, Champagne or Noir — which decides eligibility for lists, events and curation.</td></tr>
+        <tr><td class="term">Exclusive list</td><td>The curated list of ~2,000 clients who may receive personal lookbook suggestions (F5). You manage it.</td></tr>
+        <tr><td class="term">List / Segment / Tag</td><td>Three ways to group clients for a send. A <strong>saved list</strong> is fixed; a <strong>segment</strong> is a live rule; a <strong>tag</strong> is a label. All re-resolved at send time.</td></tr>
+        <tr><td class="term">Lookbook</td><td>A named collection of pieces, organised under a designer or a collection.</td></tr>
+        <tr><td class="term">Piece</td><td>One item card with its own price, size, colour and stock status.</td></tr>
+        <tr><td class="term">Event</td><td>A private, time-bound virtual showcase with a teaser, an unlock moment, and buying/booking.</td></tr>
+        <tr><td class="term">Message</td><td>The unit of outbound communication. Every message follows one path: draft → edit → approve → send → record.</td></tr>
+        <tr><td class="term">Owner's number</td><td>The boutique's existing WhatsApp number and habits. Never touched (G1).</td></tr>
+        <tr><td class="term">Studio number</td><td>The new, separate WhatsApp number the system sends from. The only name used for it anywhere.</td></tr>
+        <tr><td class="term">Approval</td><td>A recorded act — who approved, what, and when. No message exists without one (P1).</td></tr>
+      </table>
+
+      <h3 style="margin-top:34px">The consent model — three switches, kept apart</h3>
+      <p class="lead" style="margin-top:-6px">Conflating these is the single most common way a messaging system falls apart — and the most common way it breaks the law. They are three different decisions, stored separately, checked separately.</p>
+      <div class="consent-grid">
+        <div class="consent-card"><strong>1 · Occasion wishes</strong><span>Does this client want birthday and anniversary wishes? On by invitation, off otherwise. Checked before every occasion message.</span></div>
+        <div class="consent-card"><strong>2 · Marketing</strong><span>Does this client want lookbooks, podcast shares, event invites and suggestions? A "no" quietly excludes her from every outreach — re-checked at the moment of sending, not when a list was built.</span></div>
+        <div class="consent-card"><strong>3 · STOP</strong><span>A hard, immediate opt-out. If a client writes "STOP" to the Studio number, every message to her stops at once, permanently, across all features.</span></div>
+      </div>
+      <div class="note"><strong>Why three and not one:</strong> a client might love birthday wishes but refuse marketing; another might accept marketing but type STOP in a moment of irritation. One switch could not honour any of that. Three switches, each re-read at send time, can.</div>
+
+      <h3 style="margin-top:34px">The law — what a public launch obliges</h3>
+      <p class="lead" style="margin-top:-6px">India's <strong>Digital Personal Data Protection Act, 2023</strong> and its <strong>Rules, 2025</strong> are fully operational since 14 November 2025. A public launch in India must honour them. This document states the obligations in plain words; the detailed compliance plan lives in the technical document.</p>
+      <div class="rules">
+        <ul>
+          <li><strong>Consent and notice.</strong> We tell each client, plainly, what we hold and why, and we process it on the consent switches above. <span class="p-tag">P4</span></li>
+          <li><strong>Rights.</strong> A client can ask what we hold, correct it, or ask to be erased — and we respond within ninety days. Erasure is real, not cosmetic (F1, F2). <span class="p-tag">P2 · P3</span></li>
+          <li><strong>Security.</strong> Client data is encrypted, access-controlled and masked where possible — a statutory duty, with penalties up to ₹250 crore for failure. <span class="p-tag">P2</span></li>
+          <li><strong>Retention.</strong> Data is kept only as long as it serves the purpose, then erased — while logs the law requires are retained. <span class="p-tag">P5</span></li>
+          <li><strong>Breach.</strong> If client data is ever compromised, we have a prepared, practised process to contain it and notify the Board and affected clients. <span class="p-tag">P8</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- ===================== PART 1 ===================== -->
+    <section id="part1">
+      <div class="kicker">Part 1 · The client record</div>
+      <h2>The foundation everything stands on</h2>
+      <p class="lead">The previous document described the memory but never defined the four things that give it shape: points, tiers, the exclusive list, and the list/segment/tag model. They now have a single, fixed definition — because features like suggestions (F5) and events (F8) depend on them and must not improvise.</p>
+
+      <div class="feature">
+        <span class="feature-tag">1.1 · Memory — facts, inferences, corrections</span>
+        <h3>A perfect memory, with reasons attached</h3>
+        <p class="what">Each client's memory holds two kinds of thing: <strong>facts</strong> you state (birthday, anniversary, phone number, sizes) and <strong>inferences</strong> the system forms from behaviour (favourite designers, colours she keeps loving, her usual price range). Every inference stores its reasons. You can inspect, correct or delete any of it.</p>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Every inference is visible with its reasons — "two purchases and five likes," never "the computer said so." <span class="p-tag">P2</span></li>
+            <li>Your correction always wins over an inference, permanently. <span class="p-tag">P3</span></li>
+            <li><strong>The one boundary:</strong> the system learns from your edits to <em>wording</em> (how it phrases drafts), but never from your edits to <em>facts</em>. A stated fact is treated as final, not as a training example. <span class="p-tag">P3</span></li>
+            <li>Private details (measurements, staff notes, internal taste notes) stay confidential and can never be reached through a client link — blocked by the system, not just hidden on a screen. <span class="p-tag">P2</span></li>
+            <li>A client who asks to be forgotten can be properly, completely erased. <span class="p-tag">DPDP</span></li>
+          </ul>
+        </div>
+        <div class="note green">This single boundary resolves the one tension in the previous version: <em>"the system learns from your edits"</em> (good, for drafts) vs <em>"your correction wins forever"</em> (good, for facts). They are now two different rules about two different things, and neither can swallow the other.</div>
+      </div>
+
+      <div class="feature">
+        <span class="feature-tag">1.2 · The loyalty account &amp; points</span>
+        <h3>Points: the mechanism is fixed, the numbers are yours</h3>
+        <p class="what">The loyalty account is the client's points ledger. The <em>mechanism</em> below is fixed and safe; the <em>numbers</em> (rates, values, thresholds) are parameters you set in Settings — they are listed in Part 7 as decisions to confirm, and changing them later never breaks the ledger.</p>
+        <div class="rules">
+          <h4>The mechanism</h4>
+          <ul>
+            <li><strong>Accrual:</strong> points are earned on every purchase — in-store and online at events — at a rate you set (e.g. 1 point per ₹100). <span class="p-tag">P5</span></li>
+            <li><strong>Gifts:</strong> points can also be given as a gift (the birthday gift in F6), at a value you set. <span class="p-tag">P6</span></li>
+            <li><strong>Value:</strong> points convert to store credit at a rate you set (e.g. 1 point = ₹1). <span class="p-tag">P5</span></li>
+            <li><strong>Redemption:</strong> points redeem at checkout, online and in-store, exactly the same way — the two are always in sync. <span class="p-tag">P5</span></li>
+            <li><strong>Honesty:</strong> the points history is append-only. It can never be edited or deleted — the one part of the record you cannot rewrite. You may add a note; you may not change money history. <span class="p-tag">P5</span></li>
+          </ul>
+        </div>
+        <div class="note">Points are the load-bearing concept the previous document used everywhere and defined nowhere. Now every mention of "points" in Part 2 refers to exactly this ledger.</div>
+      </div>
+
+      <div class="feature">
+        <span class="feature-tag">1.3 · Tiers &amp; the exclusive list</span>
+        <h3>Standard · Champagne · Noir — and the ~2,000</h3>
+        <p class="what">Every client has a tier: <strong>Standard</strong> (the default), <strong>Champagne</strong>, or <strong>Noir</strong>. The tier decides eligibility for lists, events and curation. The <strong>exclusive list</strong> — about 2,000 clients — is the specific group that may receive personal suggestions (F5).</p>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li><strong>Tier is decided by rules you set</strong> — typically trailing-twelve-month spend, optionally tenure — and the thresholds are yours (Part 7). <span class="p-tag">P5</span></li>
+            <li><strong>The exclusive list is yours to manage.</strong> The system can <em>propose</em> members from a rule (e.g. Noir, opted in to suggestions, active in the last year), but you add and remove people by hand, and your hand always wins. <span class="p-tag">P3</span></li>
+            <li><strong>No dignity leaks.</strong> A client is never shown her tier, her segment, or the word "exclusive list." These labels are internal only. <span class="p-tag">P6</span></li>
+          </ul>
+        </div>
+        <div class="note">The previous document said the boutique "manages the list yourself" but never said what qualifies a client for it. Now it does: a rule proposes, you decide.</div>
+      </div>
+
+      <div class="feature">
+        <span class="feature-tag">1.4 · Lists, segments &amp; tags</span>
+        <h3>Three tools for choosing an audience</h3>
+        <p class="what">When a feature sends to "a list," three distinct tools are in play, and each behaves differently at send time.</p>
+        <table>
+          <tr><th style="width:110px">Tool</th><th>What it is</th><th>Example</th></tr>
+          <tr><td class="term">Saved list</td><td>A fixed set of clients you assembled once and named.</td><td>"Top 100 clients"</td></tr>
+          <tr><td class="term">Segment</td><td>A live rule that resolves <em>at the moment of sending</em>.</td><td>"all Champagne clients"</td></tr>
+          <tr><td class="term">Tag</td><td>A label on a client record, for ad-hoc grouping.</td><td>"wedding-season"</td></tr>
+        </table>
+        <div class="rules">
+          <h4>The rule that keeps them honest</h4>
+          <ul>
+            <li>Whatever tool you choose, the audience is <strong>re-resolved at the moment of sending</strong> — so a client who opted out, changed tier, or said STOP yesterday is excluded from today's send, even if the list was built last month. <span class="p-tag">P4</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== PART 2 ===================== -->
+    <section id="part2">
+      <div class="kicker">Part 2 · The eight features</div>
+      <h2>The features — each traced to its principles</h2>
+      <p class="lead">Eight features, not eleven. The three sections the previous version counted as features — your WhatsApp habit, approval, editability — are reframed here as the <em>guarantees</em> in Part 3, because they are the frame the features hang on, not features themselves. Each feature below ends with the principles its rules serve.</p>
+
+      <!-- F1 -->
+      <div class="feature">
+        <span class="feature-tag">F1 · The system's memory of every client</span>
+        <h3>Remembering, safely</h3>
+        <p class="what">The system remembers facts and inferences about each client — birthdays, anniversaries, purchases, likes, favourite designers, sizes — visible only to the boutique, with reasons behind every guess.</p>
+        <div class="journey-box">
+          <h4>The journey — a memory is born</h4>
+          <ol class="steps">
+            <li><strong>Meera becomes a client.</strong> Her name, number, birthday and anniversary are saved, with the occasion-wishes switch set.</li>
+            <li><strong>She browses her private link,</strong> taps ♥ on three Sabyasachi pieces, reserves one.</li>
+            <li><strong>The system notes it quietly:</strong> "likes Sabyasachi, size M, prefers pastels" — each note with its reasons attached.</li>
+            <li><strong>She buys;</strong> the purchase adds to her taste profile and price range, and to her points ledger.</li>
+            <li><strong>You ask "why does it think that?"</strong> and it shows the two purchases and five likes — never "the computer said so."</li>
+            <li><strong>You correct it</strong> — and your correction wins, permanently.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Occasion wishes only if the client has agreed — the switch is checked every time, never assumed. <span class="p-tag">P4</span></li>
+            <li>Every memory has visible reasons. <span class="p-tag">P2</span></li>
+            <li>Your corrections beat its guesses, always, and are never silently undone. <span class="p-tag">P3</span></li>
+            <li>Measurements and staff notes stay confidential, blocked from client links. <span class="p-tag">P2</span></li>
+            <li>A client can be properly erased on request. <span class="p-tag">DPDP</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F2 -->
+      <div class="feature">
+        <span class="feature-tag">F2 · The client's private link</span>
+        <h3>No app, no password — just her link</h3>
+        <p class="what">Each client has one private link to her personal page: her points, her lookbooks, her invitations — in the design she already knows. It arrives on WhatsApp and remembers her, so likes and reservations are credited to her.</p>
+        <div class="journey-box">
+          <h4>The journey — Meera opens her world</h4>
+          <ol class="steps">
+            <li><strong>She taps the link</strong> in a WhatsApp message — it opens like a site made just for her.</li>
+            <li><strong>She sees her points, lookbooks, invitations</strong> — same design she already knows.</li>
+            <li><strong>She taps hearts and reserves;</strong> you see it instantly on the dashboard.</li>
+            <li><strong>She changes phones, or a link leaks</strong> — one button issues a fresh link or switches the old one off, instantly.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Links are private and unguessable; guessing attacks are blocked automatically. <span class="p-tag">P2</span></li>
+            <li>Switching off or renewing a link takes effect immediately. <span class="p-tag">P8</span></li>
+            <li>Confidential information is unreachable through a client link — blocked by the system, not just the screen. <span class="p-tag">P2</span></li>
+            <li>Old links expire gently — the client is offered a fresh one, not a dead page. <span class="p-tag">P8</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F3 -->
+      <div class="feature">
+        <span class="feature-tag">F3 · Building lookbooks</span>
+        <h3>Every lookbook has a name; every picture its own details</h3>
+        <p class="what">Lookbooks are organised under a designer or a collection. Each picture is its own card with its own price, size and colour — two pieces in one book can differ entirely.</p>
+        <div class="journey-box">
+          <h4>The journey — three ways to fill the shelf</h4>
+          <ol class="steps">
+            <li><strong>Start with a name:</strong> "Sabyasachi" or "The Wedding Edit 2026."</li>
+            <li><strong>PDF:</strong> upload a designer's PDF; each page becomes a card, and printed names/prices are read and filled in for you.</li>
+            <li><strong>Instagram link:</strong> paste the post; pictures and the designer's name arrive. If Instagram blocks the pull, it simply asks you to upload — no dead end.</li>
+            <li><strong>Manual:</strong> upload photos yourself, one or many.</li>
+            <li><strong>Every picture gets its card</strong> — price, size, colour; fill what you know, leave what you don't.</li>
+            <li><strong>You confirm.</strong> Nothing goes live until you press Publish.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Duplicate uploads are noticed — the system warns instead of duplicating. <span class="p-tag">P5</span></li>
+            <li>The reading assistant never guesses a price it can't see clearly — it marks it "unreadable" for you to fill. <span class="p-tag">P5</span></li>
+            <li>Everything published here becomes material the suggestion engine and events can use. <span class="p-tag">—</span></li>
+            <li>Any card can be edited after publishing. <span class="p-tag">P3</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F4 -->
+      <div class="feature">
+        <span class="feature-tag">F4 · Sharing — a whole lookbook, or one piece</span>
+        <h3>Every lookbook has a Share button — and so does every picture</h3>
+        <p class="what">Share the whole collection, or just the one lehenga a client asked about. Two ways: copy a link and paste it yourself, or send from the dashboard with the WhatsApp button.</p>
+        <div class="journey-box">
+          <h4>The journey — two taps on WhatsApp</h4>
+          <ol class="steps">
+            <li><strong>Pick what to share</strong> — whole lookbook, or one piece (the piece's link shows its own details).</li>
+            <li><strong>Copy the link</strong> and paste it yourself, in your own words, from your own number — free and informal.</li>
+            <li><strong>Or use the WhatsApp button:</strong> a ready message with the picture appears; edit, pick a client or saved list, approve — sent.</li>
+            <li><strong>See what happens next:</strong> who opened, looked, loved, reserved — on the dashboard.</li>
+            <li><strong>At showtime,</strong> any lookbook becomes an event with one switch.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Copy-paste sharing is yours — your number, your style, no system approval needed. <span class="p-tag">G1</span></li>
+            <li>Button-sharing goes through your approval, like everything the system sends. <span class="p-tag">P1</span></li>
+            <li>A removed piece shows a polite "no longer available" with the rest of the collection — never a dead page. <span class="p-tag">P8</span></li>
+            <li>If a piece sells out <em>after</em> the lookbook is shared, its card on the shared link updates live to "Sold out" — no stale price, no surprise at the counter. <span class="p-tag">P5</span></li>
+            <li>Shared links always show current details; you can hide a price before sharing. <span class="p-tag">P5</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F5 -->
+      <div class="feature">
+        <span class="feature-tag">F5 · Custom suggestions — for the exclusive list</span>
+        <h3>The system shops your shelves for each client</h3>
+        <p class="what">When you want to delight an exclusive client — or she asks — the system suggests a personal lookbook built only from what's actually in stock, matched to her designer, size and taste. You review, adjust, approve.</p>
+        <div class="journey-box">
+          <h4>The journey — "anything new for wedding season?"</h4>
+          <ol class="steps">
+            <li><strong>Meera messages:</strong> "Anything new for wedding season? Love Sabyasachi." — or you open her page and press "Suggest Lookbook."</li>
+            <li><strong>The system shops your shelves:</strong> only in-stock pieces, her size, her usual price range, favourite designers on top.</li>
+            <li><strong>You see the draft:</strong> 6–10 pieces, each with a small reason. If only two truly fit, it says so honestly instead of padding.</li>
+            <li><strong>You adjust freely</strong> — swap, remove, change the note.</li>
+            <li><strong>Press Approve.</strong> Meera receives her private link.</li>
+            <li><strong>She loves three, reserves one.</strong> Next time, the draft is even more her.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Suggestions go only to clients on your exclusive list — the list you manage (Part 1.3). <span class="p-tag">P3</span></li>
+            <li>Only real, in-stock items — checked again at the moment of sending. <span class="p-tag">P5</span></li>
+            <li>Clients never see "budget" or "price range" — filtering is invisible; only beautiful pieces appear. <span class="p-tag">P6</span></li>
+            <li>Out of stock before sending? Swapped or flagged to you — never sent as a disappointment. <span class="p-tag">P5</span></li>
+            <li>What she likes and reserves is credited back, improving her taste profile. <span class="p-tag">P2</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F6 -->
+      <div class="feature">
+        <span class="feature-tag">F6 · Birthdays &amp; anniversaries</span>
+        <h3>The morning wish, ready before your chai</h3>
+        <p class="what">Every morning the system checks the calendar and puts a reminder on the dashboard — whose day is due — with a warm, personal message already drafted. You read, maybe change a word, and press Approve &amp; Send.</p>
+        <div class="journey-box">
+          <h4>The journey — the morning of Meera's birthday</h4>
+          <ol class="steps">
+            <li><strong>9:00 AM</strong> — the system finds today's occasions: clients who agreed to wishes and haven't been wished this year.</li>
+            <li><strong>9:01 AM</strong> — the dashboard shows the reminder with the message ready, including the gift you configured: <em>"…we've added a little gift to your loyalty account. ✨"</em></li>
+            <li><strong>You read it.</strong> It sounds like you. Change a word — it's a normal text box.</li>
+            <li><strong>Press Approve &amp; Send.</strong> It reaches Meera's WhatsApp.</li>
+            <li><strong>She replies "Thank you! 😍"</strong> — the reply appears on her card. If she ever replies STOP, the system never messages her again.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>No message without your approval — built into the system, not a setting. <span class="p-tag">P1</span></li>
+            <li>One wish per occasion per year, guaranteed — double-tapping Send can't duplicate it. <span class="p-tag">P5</span></li>
+            <li>The AI chooses words, never facts: names exactly as in the profile; gifts only from what you configured. <span class="p-tag">P5</span></li>
+            <li>If a draft fails quality checks, a safe classic version is prepared — there's always something good to send. <span class="p-tag">P8</span></li>
+            <li>Wishes never mention spend or anything that feels like a bill — warmth first. <span class="p-tag">P6</span></li>
+            <li>Missed a morning? Nothing sends itself and nothing is lost — the reminder waits. <span class="p-tag">P1</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F7 -->
+      <div class="feature">
+        <span class="feature-tag">F7 · Sharing your podcast &amp; videos</span>
+        <h3>Paste a link, pick who, press send</h3>
+        <p class="what">When a new episode or short is out, paste the YouTube link. A preview and a short message appear; you choose exactly who receives it — one client, a saved list, a segment, or everyone.</p>
+        <div class="journey-box">
+          <h4>The journey — the new episode is out</h4>
+          <ol class="steps">
+            <li><strong>Paste the YouTube link.</strong> Title and thumbnail appear on their own.</li>
+            <li><strong>A short message is drafted</strong> underneath — edit it however you like.</li>
+            <li><strong>Pick the audience:</strong> one client, a saved list, a segment, or every contact.</li>
+            <li><strong>The system shows the reach</strong> — "This will go to 1,850 people."</li>
+            <li><strong>Press Approve.</strong> It lands as a neat message with the link; the dashboard shows received and read.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Lists are yours to build — hand-picked or rule-built (Part 1.4), saved and reusable. <span class="p-tag">P3</span></li>
+            <li>Anyone who said "no marketing" is quietly left out — re-checked at send time, not when the list was made. <span class="p-tag">P4</span></li>
+            <li>Messages go out in sensible hours only — never at 2 a.m. <span class="p-tag">P6</span></li>
+            <li>Each person receives it exactly once, even for large sends. <span class="p-tag">P5</span></li>
+            <li>Every send shows its results: delivered, read, replied. <span class="p-tag">P5</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- F8 -->
+      <div class="feature">
+        <span class="feature-tag">F8 · Virtual events</span>
+        <h3>The link that opens like a trunk show</h3>
+        <p class="what">A private, time-bound showcase: invited clients see a teaser the day before, and at the event hour prices appear for everyone at once. Each piece shows its own price, size and colour — clients can buy online or book with the stylist.</p>
+        <div class="journey-box">
+          <h4>The journey — a festive trunk show</h4>
+          <ol class="steps">
+            <li><strong>Create the event:</strong> name it, pick the lookbook, set the live time and duration, choose the guest list.</li>
+            <li><strong>The day before, invites go out</strong> — the invite message waits for your approval, like everything else.</li>
+            <li><strong>Early birds see the teaser</strong> — collection shown beautifully, prices hidden.</li>
+            <li><strong>At the event hour it unlocks</strong> — prices appear for everyone at once, like doors opening.</li>
+            <li><strong>Meera falls for a lehenga.</strong> She can <strong>Buy Now</strong> (UPI or card; points added automatically) or <strong>Book with Stylist</strong> (size and colour preference; the stylist gets a WhatsApp alert within a minute).</li>
+            <li><strong>The dashboard shows it live:</strong> who visited, what's bought or booked, what's left. Sold-out pieces show "Sold out" on their own.</li>
+            <li><strong>After the window closes,</strong> the link ends gracefully; a gentle follow-up to browsers is possible — with your approval.</li>
+          </ol>
+        </div>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Prices are truly hidden before unlock — not sent to the visitor's device until the hour. <span class="p-tag">P5</span></li>
+            <li>Online purchases create real orders with loyalty points, in sync with the shop counter. <span class="p-tag">P5</span></li>
+            <li>Bookings create a reserved order and alert the stylist within a minute. <span class="p-tag">P8</span></li>
+            <li>Stock is honest: what's sold shows as sold, live. <span class="p-tag">P5</span></li>
+            <li>A stuck payment waits politely as "confirming" — no double charges — and offline booking always works. <span class="p-tag">P8</span></li>
+            <li>Event links expire when the event ends — no stale pages. <span class="p-tag">P5</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== PART 3 ===================== -->
+    <section id="part3">
+      <div class="kicker">Part 3 · The four standing guarantees</div>
+      <h2>The frame the features hang on</h2>
+      <p class="lead">These are not features — they are the standing conditions under which every feature operates. They were scattered as "features 9, 10 and 11" in the previous version; they are now one fixed frame, each with its own rules, and nothing in Part 2 may contradict them.</p>
+
+      <div class="feature">
+        <span class="feature-tag">G1 · Your number, your habits — untouched</span>
+        <h3>Two doors, zero interference</h3>
+        <p class="what">The boutique already messages clients its own way, from the Owner's number, in its own style. That continues exactly as it is. The new system works from the Studio number, so the two never share queues, limits or problems.</p>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>The Owner's number and tool are never migrated, re-registered or "upgraded" — the team is not allowed to touch them. <span class="p-tag">P7</span></li>
+            <li>The Studio number's sends never share a queue with your broadcasts — one can never slow or block the other. <span class="p-tag">P8</span></li>
+            <li>Clients who reply STOP to the Studio number are respected immediately and quietly. <span class="p-tag">P4</span></li>
+            <li>All system messages use approved WhatsApp formats — properly branded, never spam. <span class="p-tag">P5</span></li>
+            <li>During building, test messages go to test numbers only; real clients are reached only after you switch the system on. <span class="p-tag">P1</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="feature">
+        <span class="feature-tag">G2 · You approve everything</span>
+        <h3>A human button on every send</h3>
+        <p class="what">No client-facing message is ever sent without your recorded approval — who, what, when. It is not a policy; it is how the system is built.</p>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>There is no code path that sends without an approval. <span class="p-tag">P1</span></li>
+            <li>Approvals record who and when — full traceability, always. <span class="p-tag">P1</span></li>
+            <li>You can edit anything before approving, and the system learns from your wording edits — while your factual corrections always win (Part 1.1). <span class="p-tag">P3</span></li>
+            <li>Every feature has its own off-switch in Settings — turn one off; the rest keep running. <span class="p-tag">P8</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="feature">
+        <span class="feature-tag">G3 · The design is frozen</span>
+        <h3>The look you love never changes</h3>
+        <p class="what">The website design you already love is never altered by the building team. New features appear inside the existing look.</p>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Every piece of work is checked for design changes before it can be accepted; design drift is rejected automatically. <span class="p-tag">P7</span></li>
+            <li>New features appear inside the existing design — never instead of it. <span class="p-tag">P7</span></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="feature">
+        <span class="feature-tag">G4 · Everything is editable by you</span>
+        <h3>No black boxes</h3>
+        <p class="what">Every input the system depends on — memories, wording, gifts, drafts, lookbook details, lists, timings, links — is data you can see and change from the dashboard, anytime, without calling anyone.</p>
+        <div class="rules">
+          <h4>The rules</h4>
+          <ul>
+            <li>Every change is recorded: who changed what, when, and what it was before. <span class="p-tag">P5</span></li>
+            <li>Your edits outrank the system's conclusions, always. <span class="p-tag">P3</span></li>
+            <li><strong>Two things are intentionally not editable:</strong> the loyalty points history and the record of past sends — money and history stay honest. You may add a note; you cannot rewrite history. <span class="p-tag">P5</span></li>
+            <li>"Editable" never includes the website design — that protection stands above everything (G3). <span class="p-tag">P7</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== PART 4 ===================== -->
+    <section id="part4">
+      <div class="kicker">Part 4 · When things go wrong</div>
+      <h2>The system fails politely</h2>
+      <p class="lead">Every feature has a plan for its bad day. In every case, the fallback is quieter, safer and more honest than the failure. This is principle P8 made concrete.</p>
+      <div class="promise">
+        <div class="promise-item"><strong>The AI writes something odd</strong><span>Quality checks catch it; a safe, classic message is prepared instead. You always have something good to send.</span></div>
+        <div class="promise-item"><strong>A piece goes out of stock</strong><span>Swapped or flagged before a lookbook is sent; during an event it shows "Sold out" live.</span></div>
+        <div class="promise-item"><strong>WhatsApp rejects a format</strong><span>The system falls back to the last approved format and tells you — messages keep flowing.</span></div>
+        <div class="promise-item"><strong>A client says STOP</strong><span>All messaging to her stops immediately and quietly.</span></div>
+        <div class="promise-item"><strong>You double-press Send</strong><span>Impossible. Each message can only go once.</span></div>
+        <div class="promise-item"><strong>Instagram or YouTube blocks a fetch</strong><span>The system asks you to upload or paste the details manually — no dead ends.</span></div>
+        <div class="promise-item"><strong>An event payment gets stuck</strong><span>The order waits as "confirming" without double-charging; the stylist booking path always works.</span></div>
+        <div class="promise-item"><strong>Any part misbehaves</strong><span>Its off-switch in Settings stops it instantly; the rest of the boutique keeps running.</span></div>
+        <div class="promise-item"><strong>A link leaks or a phone changes</strong><span>One button issues a fresh link or switches the old one off, instantly.</span></div>
+        <div class="promise-item"><strong>Client data is compromised</strong><span>A prepared breach process contains it and notifies the Board and affected clients, as the law requires.</span></div>
+      </div>
+    </section>
+
+    <!-- ===================== PART 5 ===================== -->
+    <section id="part5">
+      <div class="kicker">Part 5 · The build &amp; launch sequence</div>
+      <h2>How this gets built — and what must be true before launch</h2>
+      <p class="lead">Piece by piece, each finished, tested and shown to you before it touches anything real. Then, before anything goes public, a fixed set of gates must all pass.</p>
+      <div class="journey-box" style="margin-top:0">
+        <h4>The build order, in plain steps</h4>
+        <ol class="steps">
+          <li><strong>The memory</strong> — learn to remember clients, safely and correctly. Nothing visible changes yet.</li>
+          <li><strong>The birthday engine</strong> — morning reminders and drafted wishes, tested with sample clients first.</li>
+          <li><strong>The WhatsApp plumbing</strong> — the Studio number set up on its own, with test numbers throughout.</li>
+          <li><strong>The private links</strong> — clients receive their personal pages.</li>
+          <li><strong>The lookbook shelf</strong> — PDF, Instagram and manual creation, with per-piece price, size and colour.</li>
+          <li><strong>Custom suggestions</strong> — the exclusive list starts receiving curated lookbooks.</li>
+          <li><strong>Sharing &amp; the podcast section</strong> — links, WhatsApp buttons, lists and segments.</li>
+          <li><strong>Virtual events</strong> — invitations, unlocks, online buying and stylist bookings.</li>
+        </ol>
+      </div>
+
+      <h3 style="margin-top:30px">The launch gates</h3>
+      <p class="lead" style="margin-top:-6px">A launch fails not when a feature breaks, but when a <em>principle</em> breaks unnoticed. So each gate below verifies a principle, not just a button. All must pass before the first real client is reached.</p>
+      <div class="rules">
+        <div class="gate"><span class="num">1</span><span><strong>Consent is live.</strong> All three switches exist, and a test confirms that a client who opted out yesterday is excluded from today's send. <em>P4</em></span></div>
+        <div class="gate"><span class="num">2</span><span><strong>Approval is recorded.</strong> A test confirms no message can send without a recorded who-and-when. <em>P1</em></span></div>
+        <div class="gate"><span class="num">3</span><span><strong>The Studio number is verified</strong> with WhatsApp-approved templates, on test numbers only. <em>P5</em></span></div>
+        <div class="gate"><span class="num">4</span><span><strong>The design check is on.</strong> An automated test confirms any visual drift is rejected. <em>P7</em></span></div>
+        <div class="gate"><span class="num">5</span><span><strong>The points ledger is append-only</strong> and reconciles with the shop counter. <em>P5</em></span></div>
+        <div class="gate"><span class="num">6</span><span><strong>Erasure works.</strong> A test client is fully deleted, and their link dies with them. <em>DPDP</em></span></div>
+        <div class="gate"><span class="num">7</span><span><strong>Every off-switch works.</strong> Turn each feature off; confirm the rest keep running. <em>P8</em></span></div>
+        <div class="gate"><span class="num">8</span><span><strong>A pilot ran.</strong> A small, friendly list goes live first; you watch it for a few days before the full public launch. <em>P8</em></span></div>
+      </div>
+
+      <div class="summary-box">
+        <h3>One sentence to remember it by</h3>
+        <p>The system never forgets a client, never sends without your approval, never changes the design you love — and everything it knows, you can edit; the only things you cannot rewrite are money and history.</p>
+      </div>
+    </section>
+
+    <!-- ===================== PART 6 ===================== -->
+    <section id="part6">
+      <div class="kicker">Part 6 · The traceability matrix</div>
+      <h2>Every principle, and where it is enforced</h2>
+      <p class="lead">This is the document's self-check. Each principle maps to the features and guarantees that implement it. If a principle had no home here, it would be empty talk; if a rule served no principle, it would be fluff. Every principle has a home, and every home is shown below.</p>
+      <table>
+        <tr><th style="width:240px">Principle</th><th>Where it is enforced</th></tr>
+        <tr><td class="term">P1 · Human authority</td><td>F4, F6 (approval); G2 (recorded approval, no code path without it); G1 (test numbers only until you switch on)</td></tr>
+        <tr><td class="term">P2 · Memory with reasons</td><td>F1 (reasons on every inference, confidentiality); F2 (unguessable links, blocked data); F5 (likes credited back); Part 0 (DPDP security)</td></tr>
+        <tr><td class="term">P3 · Your correction wins</td><td>F1, F3 (editable cards), F5 (you manage the list), F7 (your lists), G2, G4; Part 1.1 (the wording-vs-facts boundary)</td></tr>
+        <tr><td class="term">P4 · Consent is sacred</td><td>F1 (occasion switch), F6 (STOP), F7 (no-marketing re-check), G1 (STOP on Studio number); Part 0 (the three-switch model); Gate 1</td></tr>
+        <tr><td class="term">P5 · Honesty</td><td>F3 (no guessed prices, no duplicates), F4 (current details, live "Sold out"), F5 (in-stock only), F6 (one wish, real facts), F7 (once per person), F8 (hidden prices, honest stock, expiry); G4 (non-editable ledger and history)</td></tr>
+        <tr><td class="term">P6 · Dignity</td><td>F5 (no budget talk), F6 (warmth first), F7 (sensible hours); Part 1.3 (tier labels internal)</td></tr>
+        <tr><td class="term">P7 · The design is frozen</td><td>G1 (Owner's number untouched), G3 (automated design check), G4 (design excluded from "editable"); Gate 4</td></tr>
+        <tr><td class="term">P8 · Graceful failure</td><td>F2 (expiring links), F4 (no dead pages), F6 (safe classic message), F8 (stuck payments, stylist path); G2 (off-switches); Part 4 (the full list); Gate 7</td></tr>
+        <tr><td class="term">DPDP · the law</td><td>Part 0 (obligations), F1/F2 (erasure), Part 4 (breach); Gates 1 and 6</td></tr>
+      </table>
+      <div class="note green">Read this matrix once at the end of any future edit to this document. If you add a rule that serves no principle here, cut it. If you weaken a feature that a principle depends on, the matrix will show the hole.</div>
+    </section>
+
+    <!-- ===================== PART 7 ===================== -->
+    <section id="part7">
+      <div class="kicker">Part 7 · Glossary &amp; decisions still open</div>
+      <h2>One name for each thing, one list of your choices</h2>
+
+      <h3>The decisions that are yours to make</h3>
+      <p class="lead" style="margin-top:-6px">The architecture above is fixed. The <em>numbers</em> below are parameters — decisions only you can make, because they are business judgements, not engineering. Until each is set, the system runs on the stated defaults, and changing any of them later never breaks the ledger or the rules.</p>
+      <table>
+        <tr><th style="width:280px">Decision</th><th>Default suggestion</th><th>Where it is used</th></tr>
+        <tr><td class="term">Points accrual rate</td><td>1 point per ₹100 spent</td><td>Part 1.2</td></tr>
+        <tr><td class="term">Points value</td><td>1 point = ₹1 store credit</td><td>Part 1.2</td></tr>
+        <tr><td class="term">Birthday gift value</td><td>A points gift you configure</td><td>F6</td></tr>
+        <tr><td class="term">Tier thresholds</td><td>Standard → Champagne → Noir, by trailing-12-month spend</td><td>Part 1.3</td></tr>
+        <tr><td class="term">Exclusive-list criteria</td><td>Noir + opted in to suggestions + active in last year</td><td>Part 1.3, F5</td></tr>
+        <tr><td class="term">Sensible sending hours</td><td>e.g. 9:00–20:00 IST</td><td>F7</td></tr>
+        <tr><td class="term">Data retention period</td><td>Purpose-bound; erased after inactivity (per DPDP)</td><td>Part 0</td></tr>
+      </table>
+
+      <h3 style="margin-top:30px">Out of scope</h3>
+      <p class="lead" style="margin-top:-6px">To keep this document honest, here is what it deliberately does not cover — each lives in its own document.</p>
+      <div class="rules">
+        <ul>
+          <li><strong>Costs and pricing</strong> — the cost plan is separate.</li>
+          <li><strong>Technical architecture</strong> — servers, databases, APIs, the detailed compliance plan — separate technical document.</li>
+          <li><strong>Payment-provider contracts</strong> — UPI/card partners for events, separate.</li>
+          <li><strong>WhatsApp Business provider and templates</strong> — the exact provider and approved templates, separate.</li>
+        </ul>
+      </div>
+
+      <div class="note gold"><strong>How to keep this document alive:</strong> after any change, re-read the traceability matrix (Part 6). If a new rule serves no principle, cut it; if a change weakens a principle's home, the matrix will show the hole. That single habit is what keeps the architecture from ever falling apart.</div>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>LoyaltyOS Boutique · Feature &amp; Architecture Document · Version 2.0</span>
+    <span>Written in plain language for the whole team · 85 Lansdowne</span>
+  </footer>
+</article>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a2e18e5808a394da',t:'MTc4NzIzMDU2NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
