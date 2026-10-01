@@ -312,9 +312,13 @@ export const getDispatchRecipientsInternal = internalQuery({
             q.eq("role", "customer").eq("whatsapp_consent", true),
           )
           .collect();
+    // Packet A (2026-10-01, decision 5) — a soft-deleted customer must never
+    // receive an event message; filtered in memory, after the indexed read,
+    // no index change needed.
+    const active = recipients.filter((r) => r.is_deleted !== true);
     // Only the fields dispatchEvent needs to send a WhatsApp message —
     // never the full user doc (no measurements/staff_notes/auth secrets).
-    return recipients.map((r) => ({ _id: r._id, mobile: r.mobile, name: r.name }));
+    return active.map((r) => ({ _id: r._id, mobile: r.mobile, name: r.name }));
   },
 });
 

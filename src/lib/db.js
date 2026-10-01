@@ -1034,6 +1034,8 @@ export function bulkCreateCustomers(rows) {
         res = await client.mutation(api.customers.bulkCreateCustomers, { rows: part, ...session });
       } catch (err) {
         hydrateCustomers();
+        // Any rows saved before this failure make the warmed selection list stale.
+        if (created.length > 0 || reactivated.length > 0) selectorCache.customers = null;
         return {
           ok: false,
           error: err?.message || 'Import failed — please try again.',
@@ -1048,6 +1050,8 @@ export function bulkCreateCustomers(rows) {
       skipped.push(...(res.skipped || []));
     }
     hydrateCustomers();
+    // New or reactivated rows make the warmed selection list stale.
+    if (created.length > 0 || reactivated.length > 0) selectorCache.customers = null;
     return {
       ok: true,
       created, reactivated, skipped,
@@ -1152,7 +1156,11 @@ export function uploadPdfLookbook(file, filename, lookbookName) {
   const session = merchantSessionArgs();
   if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
   if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
-  return client.action(api.lookbooks.generatePdfUploadUrl, { file, filename, lookbookName, ...session });
+  return client.action(api.lookbooks.generatePdfUploadUrl, { file, filename, lookbookName, ...session }).then((res) => {
+    // A new PDF lookbook makes the warmed lookbook selection list stale.
+    selectorCache.lookbooksSelector = null;
+    return res;
+  });
 }
 
 /**
@@ -1373,7 +1381,11 @@ export function createLookbook(args) {
   const client = getConvex();
   const session = merchantSessionArgs();
   if (!client || !session) return Promise.resolve({ ok: false });
-  return client.mutation(api.lookbooks.createLookbook, { ...args, ...session }).catch(() => ({ ok: false }));
+  return client.mutation(api.lookbooks.createLookbook, { ...args, ...session }).then((res) => {
+    // A new lookbook makes the warmed lookbook selection list stale.
+    selectorCache.lookbooksSelector = null;
+    return res;
+  }).catch(() => ({ ok: false }));
 }
 
 /** Patch lookbook on Convex (async). MERCHANT-ONLY (Merchant Session Lock). */
@@ -1451,30 +1463,26 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
   // "no session → stay on local/offline state" bridge in this file.
   // (client/addSession resolved above, before the optimistic write.)
   if (client && addSession) {
-    // If no lookbook_id provided, we try to find one or ignore (PRD says item must have lookbook)
-    // For the demo / standalone catalogue, we expect the caller to provide it or the first lookbook.
-    client.query(api.lookbooks.getLookbooks, addSession).then((lbs) => {
-      const lbId = lookbook_id || (lbs && lbs[0] ? lbs[0]._id : null);
-      if (lbId) {
-        client.mutation(api.lookbooks.addCatalogueItem, {
-          lookbook_id: lbId,
-          title,
-          price: Math.round((Number(price) || 0) * 100),
-          image_url: image_url || '',
-          instagram_link: instagram_link || undefined,
-          ...(media ? { media } : {}), // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
-          ...addSession,
-        }).then((cvxId) => {
-          // Stamp the real ID so subsequent deletes/updates target Convex
-          const idx = state.catalogueItems.findIndex((i) => i.id === item.id);
-          if (idx >= 0) {
-            state.catalogueItems[idx].convexId = cvxId;
-            state.catalogueItems[idx].id = cvxId; // Swap local ID for Convex ID
-            persist();
-          }
-        }).catch(() => { /* offline — keep local */ });
+    // Pass lookbook_id only when the caller supplied one. When it is missing the
+    // backend now routes the piece into the merchant's own home catalogue, so no
+    // client-side lookbook lookup is needed anymore.
+    client.mutation(api.lookbooks.addCatalogueItem, {
+      ...(lookbook_id ? { lookbook_id } : {}),
+      title,
+      price: Math.round((Number(price) || 0) * 100),
+      image_url: image_url || '',
+      instagram_link: instagram_link || undefined,
+      ...(media ? { media } : {}), // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+      ...addSession,
+    }).then((cvxId) => {
+      // Stamp the real ID so subsequent deletes/updates target Convex
+      const idx = state.catalogueItems.findIndex((i) => i.id === item.id);
+      if (idx >= 0) {
+        state.catalogueItems[idx].convexId = cvxId;
+        state.catalogueItems[idx].id = cvxId; // Swap local ID for Convex ID
+        persist();
       }
-    });
+    }).catch(() => { /* offline — keep local */ });
   }
   return item;
 }
@@ -2802,6 +2810,8 @@ export function onboardCustomer(f) {
       .then((res) => {
         if (res.ok) {
           syncMagicLinkCustomer(res.customer, local.user.magic_token, res.id);
+          // A new customer means the warmed selection list is now stale.
+          selectorCache.customers = null;
         }
       })
       .catch(() => { /* offline — keep local */ });
@@ -2870,7 +2880,7 @@ export async function onboardCustomerRemote(f, options = {}) {
       mobile,
       ...(typeof location !== 'undefined' ? { baseUrl: location.origin } : {}),
     });
-    if (!linkRes || !linkRes.user || !cvxId) return createLocalCustomer(f);
+    if (!linkRes || !linkRes.user || !cvxId) return { error: 'Customer saved, but the magic link could not be created. Please try again.' };
 
     // BUG FIX: generateMagicTokenSelf's linkRes.user goes through auth.ts's
     // toPublicUser projection, which has no whatsapp_consent/vvip fields (it's
@@ -2891,7 +2901,7 @@ export async function onboardCustomerRemote(f, options = {}) {
     const synced = syncMagicLinkCustomer(userForSync, linkRes.token, cvxId, {
       location: { city: f.city || '', country: f.country || 'India' },
     });
-    if (!synced) return createLocalCustomer(f);
+    if (!synced) return { error: 'Customer saved, but the magic link could not be created. Please try again.' };
 
     // BUG FIX: the onboarding form's "Staff note (optional)" field (f.note)
     // used to be silently dropped here — createCustomer's Convex args have no
@@ -2908,6 +2918,10 @@ export async function onboardCustomerRemote(f, options = {}) {
     if (f.note && f.note.trim()) {
       addStaffNote(synced.id, f.note.trim(), 'Onboarding');
     }
+
+    // A new/reactivated customer means the warmed customer selection list is
+    // now stale — drop it so the next read re-fetches from Convex.
+    selectorCache.customers = null;
 
     return {
       user: synced,

@@ -1,4 +1,4 @@
-import { action, internalMutation, internalQuery, mutation, query, type QueryCtx } from "./_generated/server";
+import { action, internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v, ConvexError } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { put } from "@vercel/blob";
@@ -71,6 +71,32 @@ function validateMedia(media: MediaItem[]) {
   }
 }
 
+/**
+ * Packet A (2026-10-01) — finds or lazily creates the one "Current catalogue"
+ * home lookbook (kind: "catalogue"). Not an exported query/mutation/action —
+ * a plain helper, only callable from inside an already-guarded mutation in
+ * this file (today, addCatalogueItem), so it never needs its own session
+ * check. The home row is never shown in getLookbooksForSelector and can
+ * never be removed via deleteLookbook — see those functions below.
+ * Design spec: docs/superpowers/specs/2026-10-01-packet-a-data-safety-design.md
+ */
+async function getOrCreateHomeLookbook(ctx: { db: MutationCtx["db"] }): Promise<Id<"lookbooks">> {
+  const existing = await ctx.db.query("lookbooks").collect();
+  const home = existing.find((lb) => lb.kind === "catalogue" && lb.is_deleted !== true);
+  if (home) return home._id;
+
+  // None exists yet — create the one home row. `designer` and `source` are
+  // required columns with no catalogue-specific value, so a neutral
+  // placeholder mirrors the one createPdfLookbook already uses below.
+  return await ctx.db.insert("lookbooks", {
+    title: "Current catalogue",
+    designer: "—", // em dash — "not applicable" placeholder, same as createPdfLookbook
+    source: "manual",
+    kind: "catalogue",
+    created_at: Date.now(),
+  });
+}
+
 // --- PUBLIC API ---
 
 /** Get all lookbooks with item_count, sorted by created_at desc. MERCHANT-ONLY. */
@@ -109,9 +135,13 @@ export const getLookbooksForSelector = query({
   handler: async (ctx, { userId, token }) => {
     await requireMerchantSession(ctx, userId, token);
     const lookbooks = await ctx.db.query("lookbooks").collect();
-    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2).
+    // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2),
+    // plus the home "Current catalogue" row (kind: "catalogue") — it must
+    // never show up as a pickable option here (design spec 2026-10-01,
+    // decision 3), even though getLookbooks/getLookbookById/
+    // getCustomerCatalogue keep including it so its pieces still load.
     return lookbooks
-      .filter((lb) => lb.is_deleted !== true)
+      .filter((lb) => lb.is_deleted !== true && lb.kind !== "catalogue")
       .map((lb) => ({
         _id: lb._id,
         name: lb.title,
@@ -320,6 +350,12 @@ export const deleteLookbook = mutation({
     if (!lb || lb.is_deleted === true) {
       return { ok: true, alreadyDeleted: true, hiddenItems: 0 };
     }
+    // The home "Current catalogue" row (kind: "catalogue") is permanent —
+    // design spec 2026-10-01, decision 4. Checked before any write so a
+    // rejected call never soft-deletes its pieces either.
+    if (lb.kind === "catalogue") {
+      throw new ConvexError("The Current catalogue cannot be deleted.");
+    }
     const deletedAt = Date.now();
     const items = await ctx.db
       .query("catalogue_items")
@@ -339,7 +375,10 @@ export const addCatalogueItem = mutation({
   args: {
     userId: v.id("users"),
     token: v.string(),
-    lookbook_id: v.id("lookbooks"),
+    // Packet A (2026-10-01, decision 2) — optional now. When omitted, the
+    // piece goes into the home "Current catalogue" lookbook instead of
+    // guessing the newest one; the schema column itself stays required.
+    lookbook_id: v.optional(v.id("lookbooks")),
     title: v.string(),
     price: v.number(), // PAISE integer
     image_url: v.string(),
@@ -349,8 +388,15 @@ export const addCatalogueItem = mutation({
   },
   handler: async (ctx, { userId, token, ...args }) => {
     await requireMerchantSession(ctx, userId, token);
+
+    // Packet A (2026-10-01, decision 2) — resolve a missing lookbook_id to
+    // the home lookbook, finding or creating it in the same transaction, so
+    // a piece added without a chosen lookbook never lands on whichever
+    // lookbook happens to be newest.
+    const lookbookId = args.lookbook_id ?? (await getOrCreateHomeLookbook(ctx));
+
     // Reject adding into a soft-deleted lookbook (2026-09-25-lookbook-delete-design.md decision 3).
-    const lb = await ctx.db.get(args.lookbook_id);
+    const lb = await ctx.db.get(lookbookId);
     if (!lb || lb.is_deleted === true) {
       throw new ConvexError("This lookbook has been deleted.");
     }
@@ -360,7 +406,7 @@ export const addCatalogueItem = mutation({
       validateMedia(args.media);
       args.image_url = args.media[0].url;
     }
-    return await ctx.db.insert("catalogue_items", args);
+    return await ctx.db.insert("catalogue_items", { ...args, lookbook_id: lookbookId });
   },
 });
 
