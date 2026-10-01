@@ -13,6 +13,7 @@ import type * as ai from "../ai.js";
 import type * as auth from "../auth.js";
 import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
+import type * as dashboard from "../dashboard.js";
 import type * as events from "../events.js";
 import type * as lookbooks from "../lookbooks.js";
 import type * as notifications from "../notifications.js";
@@ -36,6 +37,7 @@ declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   crons: typeof crons;
   customers: typeof customers;
+  dashboard: typeof dashboard;
   events: typeof events;
   lookbooks: typeof lookbooks;
   notifications: typeof notifications;
