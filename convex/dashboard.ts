@@ -28,8 +28,12 @@ const MAX_ACTIVITY_LIMIT = 100;
  * A dedicated by_role-only index would duplicate what this prefix already
  * gives us, so no schema change is needed.
  *
- * pointsIssued — sum of every positive points_ledger delta (awards only;
- * negative deltas are deductions and are excluded per the spec).
+ * pointsIssued — every point the boutique has actually given: positive
+ * points_ledger deltas (awards only; negative deltas are deductions and are
+ * excluded), plus points_earned on purchases, plus points_awarded on
+ * approved reviews. The same three sources the Platform Admin already totals
+ * (convex/platformStats.ts). All customers count — no test-name exclusion,
+ * per the design spec; the figure corrects itself once test data is cleaned.
  */
 export const getDashboardSummary = query({
   args: { userId: v.id("users"), token: v.string() },
@@ -43,10 +47,31 @@ export const getDashboardSummary = query({
       .collect();
 
     const ledgerRows = await ctx.db.query("points_ledger").collect();
-    const pointsIssued = ledgerRows.reduce(
+    const pointsFromLedger = ledgerRows.reduce(
       (total, row) => (row.delta > 0 ? total + row.delta : total),
       0,
     );
+
+    // Purchase points: points_earned across every purchase record.
+    const purchaseRows = await ctx.db.query("orders").collect();
+    const pointsFromPurchases = purchaseRows.reduce(
+      (total, row) => total + (row.points_earned ?? 0),
+      0,
+    );
+
+    // Review points: points_awarded on approved reviews only — the exact
+    // approved condition convex/platformStats.ts uses (status "approved").
+    const approvedReviews = await ctx.db
+      .query("reviews")
+      .withIndex("by_status", (q) => q.eq("status", "approved"))
+      .collect();
+    const pointsFromReviews = approvedReviews.reduce(
+      (total, row) => total + (row.points_awarded ?? 0),
+      0,
+    );
+
+    const pointsIssued =
+      pointsFromLedger + pointsFromPurchases + pointsFromReviews;
 
     return {
       totalCustomers: customers.length,
