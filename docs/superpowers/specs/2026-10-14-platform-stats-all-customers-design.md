@@ -1,0 +1,13 @@
+Title: Platform Admin counts every 85 Lansdowne customer, like the Delight Desk
+Goal: the Platform Admin must show the same customer count and Points issued as the Delight Desk, including customers whose names look like test data, because nobody can yet tell which customers are real.
+Evidence: convex/platformStats.ts:16 defines TEST_NAME_PATTERN and :49-58 drops test-named customers from the counted set; every point and review sum is limited to that set (:66, :72, :76) and weekly activity too (:91); testCustomersExcluded is returned at :137; the Delight Desk counts all active, not-deleted customers (convex/dashboard.ts:43-47) and sums every points_ledger positive delta, every order's points_earned and every approved review's points_awarded with no customer filter (convex/dashboard.ts:49-74); audit on 2026-10-14: Platform Admin 66 customers and 46,211 points against Delight Desk 97 and 54,002; the Platform Admin requires testCustomersExcluded to be a number (loyaltyos-platform-admin convex/lib/stats.ts:37) and shows it on no screen.
+Decisions (approved by the user):
+1. The test-name filter is removed. customersActive counts every customer that is not soft-deleted, the same rule as the Delight Desk totalCustomers.
+2. pointsIssued sums every positive points_ledger delta, every order's points_earned (missing as 0) and every approved review's points_awarded (missing as 0), with no customer filter, exactly like the Delight Desk.
+3. reviewsApproved counts every approved review, with no customer filter.
+4. weeklyUses and weeklyHistory count activity only from customers that are not soft-deleted.
+5. testCustomersExcluded is still returned, always 0, so the reply shape and the Platform Admin validation stay the same. ownerOnlineAt, ownerLastActionAt, firstRecordAt, schemaVersion and generatedAt do not change.
+6. Only convex/platformStats.ts changes. convex/http.ts, convex/dashboard.ts, the Platform Admin repo and every other file stay the same.
+Known limits: points and approved reviews of soft-deleted customers are included, because those points were really given; test data stays in both numbers until a future cleanup; LoyaltyOS has one Convex deployment, pleasant-cobra-560, so the change is live on the endpoint as soon as it is deployed, before the merge.
+Test plan: a read-only data check reproduces customersActive 97 and pointsIssued equal to the Delight Desk total (54,002 on 2026-10-13 unless data changed); function count stays 121; requireMerchantSession count stays 62; ONE_DEVICE_LOCK stays on; convex/http.ts, convex/dashboard.ts, convex/auth.ts, convex/schema.ts and src diffs are empty; after the user deploys, a Platform Admin Refresh now shows 97 customers and the same Points issued as the Delight Desk.
+END OF DESIGN.
