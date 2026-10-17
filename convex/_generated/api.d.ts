@@ -18,6 +18,7 @@ import type * as dashboard from "../dashboard.js";
 import type * as events from "../events.js";
 import type * as http from "../http.js";
 import type * as lookbooks from "../lookbooks.js";
+import type * as migrations from "../migrations.js";
 import type * as notifications from "../notifications.js";
 import type * as orders from "../orders.js";
 import type * as platformStats from "../platformStats.js";
@@ -46,6 +47,7 @@ declare const fullApi: ApiFromModules<{
   events: typeof events;
   http: typeof http;
   lookbooks: typeof lookbooks;
+  migrations: typeof migrations;
   notifications: typeof notifications;
   orders: typeof orders;
   platformStats: typeof platformStats;

@@ -2,6 +2,7 @@ import { internalMutation, type MutationCtx } from "./_generated/server";
 import { v } from "convex/values";
 import bcrypt from "bcryptjs";
 import type { Id } from "./_generated/dataModel";
+import { getDefaultBoutique } from "./boutiques";
 
 /**
  * LoyaltyOS Boutique — multi-boutique test data (Phase 1 Batch 2).
@@ -353,6 +354,10 @@ export const seedMultiBoutiqueTestData = internalMutation({
       throw new Error("already seeded: run wipeMultiBoutiqueTestData first");
     }
 
+    // Alpha is the default only when no default boutique exists yet, so the
+    // backend never has two defaults (getDefaultBoutique uses .unique()).
+    const defaultExists = (await getDefaultBoutique(ctx)) !== null;
+
     // Same bcryptjs sync hashing convex/auth.ts's merchantLogin verifies
     // against (bcrypt.compareSync) — never logged, returned, or stored
     // anywhere other than this one password_hash field.
@@ -361,7 +366,8 @@ export const seedMultiBoutiqueTestData = internalMutation({
 
     const counts = emptyCounts();
     for (const cfg of BOUTIQUE_CONFIGS) {
-      await seedOneBoutique(ctx, cfg, passwordHash, now, counts);
+      const isDefault = cfg.label === "Alpha" ? !defaultExists : false;
+      await seedOneBoutique(ctx, { ...cfg, isDefault }, passwordHash, now, counts);
     }
     return counts;
   },
