@@ -11,6 +11,7 @@
 import type * as activity from "../activity.js";
 import type * as ai from "../ai.js";
 import type * as auth from "../auth.js";
+import type * as boutiques from "../boutiques.js";
 import type * as crons from "../crons.js";
 import type * as customers from "../customers.js";
 import type * as dashboard from "../dashboard.js";
@@ -25,6 +26,7 @@ import type * as reviews from "../reviews.js";
 import type * as sessionLock from "../sessionLock.js";
 import type * as settings from "../settings.js";
 import type * as templates from "../templates.js";
+import type * as testSeed from "../testSeed.js";
 import type * as whatsapp from "../whatsapp.js";
 
 import type {
@@ -37,6 +39,7 @@ declare const fullApi: ApiFromModules<{
   activity: typeof activity;
   ai: typeof ai;
   auth: typeof auth;
+  boutiques: typeof boutiques;
   crons: typeof crons;
   customers: typeof customers;
   dashboard: typeof dashboard;
@@ -51,6 +54,7 @@ declare const fullApi: ApiFromModules<{
   sessionLock: typeof sessionLock;
   settings: typeof settings;
   templates: typeof templates;
+  testSeed: typeof testSeed;
   whatsapp: typeof whatsapp;
 }>;
 
