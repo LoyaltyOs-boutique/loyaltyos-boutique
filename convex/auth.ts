@@ -7,6 +7,7 @@ import type { QueryCtx, MutationCtx } from "./_generated/server";
 import type { Id } from "./_generated/dataModel";
 import { rateLimiter } from "./rateLimits";
 import { shouldRefuseLogin, HEARTBEAT_MIN_WRITE_MS } from "./sessionLock";
+import { getBoutiqueBySlug, getDefaultBoutique } from "./boutiques";
 
 /**
  * LoyaltyOS Boutique — Auth functions (Step 3)
@@ -52,6 +53,24 @@ const DUMMY_HASH =
   "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
 
 type UserDoc = import("./_generated/dataModel").Doc<"users">;
+
+/**
+ * Multi-boutique Phase 1 Batch 4 — resolve the boutique for a PUBLIC magic-link
+ * entry point (generateMagicTokenSelf / generateMagicToken) from an optional
+ * slug. No slug (undefined, or empty after trim) -> the single default
+ * boutique. An unrecognised slug resolves to null and the caller MUST treat
+ * that identically to "customer not found" — never fall back to the default,
+ * or a bad slug would silently leak into the wrong tenant's data.
+ * Module-private: not exported, not a registered Convex function.
+ */
+async function resolvePublicBoutique(
+  ctx: MutationCtx,
+  slug: string | undefined,
+): Promise<import("./_generated/dataModel").Doc<"boutiques"> | null> {
+  const trimmed = slug?.trim();
+  if (!trimmed) return getDefaultBoutique(ctx);
+  return getBoutiqueBySlug(ctx, trimmed);
+}
 
 /** Public projection of a user doc — never leaks password/reset/session secrets. */
 function toPublicUser(doc: UserDoc) {
@@ -159,7 +178,7 @@ export const merchantLogin = mutation({
       session_last_seen: now, // one-device-lock: stamp liveness on login (decision 5)
     });
 
-    return { user: toPublicUser(merchant), token, expiresAt };
+    return { user: toPublicUser(merchant), token, expiresAt, boutiqueId: merchant.boutique_id };
   },
 });
 
@@ -259,9 +278,18 @@ export const generateMagicTokenSelf = mutation({
   args: {
     mobile: v.string(),
     baseUrl: v.optional(v.string()),
+    slug: v.optional(v.string()),
   },
-  handler: async (ctx, { mobile, baseUrl }) => {
+  handler: async (ctx, { mobile, baseUrl, slug }) => {
     const digits = mobile.replace(/\D/g, "");
+
+    // Multi-boutique Phase 1 Batch 4: resolve tenant BEFORE the rate-limit
+    // call so the limiter key and the mobile lookup are both boutique-scoped.
+    // An unknown slug returns null here and must produce the exact same
+    // "not found" shape as a missing customer below -- never reveal whether
+    // the slug exists by returning a different shape.
+    const boutique = await resolvePublicBoutique(ctx, slug);
+    if (!boutique) return null;
 
     // Rate limit (design spec 2026-09-05, Part A4/B) — defense-in-depth
     // against Critical #1's takeover vector (mints a working 180-day session
@@ -279,14 +307,14 @@ export const generateMagicTokenSelf = mutation({
     // fallback behavior is a pre-existing gap in src/lib/db.js, explicitly
     // out of scope for this task per its STRICT FILE SCOPE, and is not made
     // worse by this change — see task report for detail.)
-    const rl = await rateLimiter.limit(ctx, "magicTokenByMobile", { key: digits });
+    const rl = await rateLimiter.limit(ctx, "magicTokenByMobile", { key: `${boutique._id}:${digits}` });
     if (!rl.ok) {
       return { ok: false, error: "Too many attempts — please try again in a few minutes.", rateLimited: true };
     }
 
     const customer = await ctx.db
       .query("users")
-      .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+      .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutique._id).eq("mobile", digits))
       .first();
     if (!customer || customer.role !== "customer") return null;
 
@@ -309,10 +337,15 @@ export const generateMagicTokenForCustomer = mutation({
     baseUrl: v.optional(v.string()),
   },
   handler: async (ctx, { userId, token, customerId, baseUrl }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
 
     const customer = await ctx.db.get(customerId);
     if (!customer || customer.role !== "customer") return null;
+
+    // Multi-boutique Phase 1 Batch 4: a merchant must never mint a magic link
+    // for another boutique's customer. Return the same bare null as a missing
+    // customer, so the reply never reveals that the id exists in another boutique.
+    if (customer.boutique_id === undefined || customer.boutique_id !== merchant.boutique_id) return null;
 
     return issueMagicToken(ctx, customer, baseUrl);
   },
@@ -328,9 +361,16 @@ export const generateMagicToken = mutation({
   args: {
     mobile: v.string(),
     baseUrl: v.optional(v.string()),
+    slug: v.optional(v.string()),
   },
-  handler: async (ctx, { mobile, baseUrl }) => {
+  handler: async (ctx, { mobile, baseUrl, slug }) => {
     const digits = mobile.replace(/\D/g, "");
+
+    // Multi-boutique Phase 1 Batch 4: same tenant-resolution contract as
+    // generateMagicTokenSelf above — unknown slug -> bare null, never falls
+    // back to the default boutique.
+    const boutique = await resolvePublicBoutique(ctx, slug);
+    if (!boutique) return null;
 
     // Rate limit — SAME named limiter as generateMagicTokenSelf (design spec
     // 2026-09-05, Part A4): this alias has a byte-identical body and is
@@ -338,14 +378,14 @@ export const generateMagicToken = mutation({
     // Join.jsx per the revert's root-cause trace), so it shares one bucket
     // per mobile rather than getting a second, independent allowance. See
     // generateMagicTokenSelf above for the full non-throwing-shape rationale.
-    const rl = await rateLimiter.limit(ctx, "magicTokenByMobile", { key: digits });
+    const rl = await rateLimiter.limit(ctx, "magicTokenByMobile", { key: `${boutique._id}:${digits}` });
     if (!rl.ok) {
       return { ok: false, error: "Too many attempts — please try again in a few minutes.", rateLimited: true };
     }
 
     const customer = await ctx.db
       .query("users")
-      .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+      .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutique._id).eq("mobile", digits))
       .first();
     if (!customer || customer.role !== "customer") return null;
 
@@ -382,7 +422,7 @@ export const validateMagicToken = query({
     const expiresAt = createdAt + MAGIC_LINK_DAYS * DAY_MS;
     if (nowMs > expiresAt) return null;
 
-    return { user: toPublicUser(customer), expiresAt };
+    return { user: toPublicUser(customer), expiresAt, boutique_id: customer.boutique_id };
   },
 });
 
