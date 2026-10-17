@@ -91,6 +91,8 @@ export default defineSchema({
         }),
       ),
     ),
+    // Phase 1 Step A: optional until the Step B backfill and the Step C required switch
+    boutique_id: v.optional(v.id("boutiques")),
   })
     .index("by_mobile", ["mobile"]) // Billing Desk phone lookup; duplicate mobile = unique in app logic
     .index("by_email", ["email"]) // merchant login + forgot-password lookup (PRD §3.1)
@@ -127,7 +129,13 @@ export default defineSchema({
     // "widest/most-selective discriminator first" ordering (Option 2 from
     // the design doc's (g) discussion) gives BOTH dispatch paths a pure
     // indexed read with zero in-memory filtering over the users table.
-    .index("by_role_consent_vvip", ["role", "whatsapp_consent", "vvip"]),
+    .index("by_role_consent_vvip", ["role", "whatsapp_consent", "vvip"])
+    .index("by_boutique_mobile", ["boutique_id", "mobile"])
+    .index("by_boutique_tier", ["boutique_id", "tier"])
+    .index("by_boutique_role_name_lower", ["boutique_id", "role", "name_lower"])
+    .index("by_boutique_role_birthday_md", ["boutique_id", "role", "birthday_md"])
+    .index("by_boutique_role_anniversary_md", ["boutique_id", "role", "anniversary_md"])
+    .index("by_boutique_role_consent_vvip", ["boutique_id", "role", "whatsapp_consent", "vvip"]),
 
   /** PRD §6 Table `lookbooks` — designer collection groups. */
   lookbooks: defineTable({
@@ -158,7 +166,9 @@ export default defineSchema({
     // feature can restore a lookbook by clearing both fields.
     is_deleted: v.optional(v.boolean()),
     deleted_at: v.optional(v.number()),
-  }),
+    boutique_id: v.optional(v.id("boutiques")),
+  })
+    .index("by_boutique", ["boutique_id"]),
 
   /** PRD §6 Table `catalogue_items` — items inside a lookbook. */
   catalogue_items: defineTable({
@@ -187,7 +197,9 @@ export default defineSchema({
         }),
       ),
     ),
-  }).index("by_lookbook", ["lookbook_id"]),
+    boutique_id: v.optional(v.id("boutiques")),
+  }).index("by_lookbook", ["lookbook_id"])
+    .index("by_boutique", ["boutique_id"]),
 
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */
   orders: defineTable({
@@ -199,6 +211,7 @@ export default defineSchema({
     final_total: v.number(), // PAISE
     points_earned: v.number(), // earnForAmount(subtotal) × tier multiplier, floored
     created_at: v.number(),
+    boutique_id: v.optional(v.id("boutiques")),
   })
     .index("by_user", ["user_id"])
     // Scaling Fix 2 (docs/superpowers/specs/2026-09-03-scaling-fixes-pre-ai-design.md
@@ -206,7 +219,9 @@ export default defineSchema({
     // created_at >= startOfToday via .withIndex(...) instead of a full-table
     // .filter() scan. created_at is a required, always-populated v.number()
     // epoch-ms timestamp (Date.now() at insert), so no backfill is needed.
-    .index("by_created_at", ["created_at"]),
+    .index("by_created_at", ["created_at"])
+    .index("by_boutique_user", ["boutique_id", "user_id"])
+    .index("by_boutique_created_at", ["boutique_id", "created_at"]),
 
   /** PRD §6 Table `campaigns` — WhatsApp broadcast + creative flyer campaigns. */
   campaigns: defineTable({
@@ -221,7 +236,9 @@ export default defineSchema({
     sent_count: v.optional(v.number()),
     clicks_count: v.optional(v.number()),
     sent_at: v.optional(v.number()),
-  }),
+    boutique_id: v.optional(v.id("boutiques")),
+  })
+    .index("by_boutique", ["boutique_id"]),
 
   /**
    * Step 5 — PRD §8 Settings (centralized).
@@ -236,7 +253,9 @@ export default defineSchema({
     value: v.any(), // JSON payload for that settings group
     updated_at: v.number(), // epoch ms — last write (mutations set Date.now())
     updated_by: v.optional(v.string()), // actor identifier (e.g. merchant email) when known
-    }).index("by_key", ["key"]), // singleton lookup per settings group
+    boutique_id: v.optional(v.id("boutiques")),
+    }).index("by_key", ["key"]) // singleton lookup per settings group
+      .index("by_boutique_key", ["boutique_id", "key"]),
 
   /** PRD Module 3 — Reviews & Testimonials. */
   reviews: defineTable({
@@ -248,9 +267,12 @@ export default defineSchema({
     points_awarded: v.optional(v.number()),
     catalogue_item_id: v.optional(v.id("catalogue_items")), // which product this review is about (type "product" only)
     created_at: v.number(),
+    boutique_id: v.optional(v.id("boutiques")),
   })
     .index("by_user", ["user_id"])
-    .index("by_status", ["status"]),
+    .index("by_status", ["status"])
+    .index("by_boutique_user", ["boutique_id", "user_id"])
+    .index("by_boutique_status", ["boutique_id", "status"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-08-26-message-action-tracking-design.md
@@ -287,10 +309,12 @@ export default defineSchema({
     action: v.union(v.literal("sent"), v.literal("link_opened"), v.literal("cancelled")),
     decided_at: v.number(), // epoch ms
     channel: v.optional(v.union(v.literal("cloud_api"), v.literal("wa_fallback"))), // only meaningful for action:"sent"/"link_opened"
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // Exclusion lookup used by getUpcomingBirthdays/getUpcomingAnniversaries —
     // named after the exact field tuple, matching this file's by_<field(s)> convention.
-    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"])
+    .index("by_boutique_customer_occasion_date", ["boutique_id", "customer_id", "occasion", "occasion_date"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-08-27-points-ledger-phase-b1-design.md
@@ -324,10 +348,12 @@ export default defineSchema({
     resulting_balance: v.number(), // customer's points AFTER this transaction (post-clamp)
     created_by: v.union(v.literal("admin"), v.literal("system")),
     created_at: v.number(), // epoch ms
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // Per-customer history lookup (Activity Ledger tab, future task) — matches
     // this file's by_<field> index-naming convention.
-    .index("by_customer", ["customer_id"]),
+    .index("by_customer", ["customer_id"])
+    .index("by_boutique_customer", ["boutique_id", "customer_id"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-09-04-phase3-whatsapp-ai-drafts-design.md
@@ -353,12 +379,14 @@ export default defineSchema({
     draft_text: v.string(),
     generated_at: v.number(), // epoch ms
     status: v.union(v.literal("pending"), v.literal("used"), v.literal("discarded")),
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // Duplicate-prevention + single-draft lookup for a given
     // (customer, occasion, occasion_date) tuple — mirrors message_actions'
     // by_customer_occasion_date index shape/style exactly (same field order,
     // same naming convention).
-    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"]),
+    .index("by_customer_occasion_date", ["customer_id", "occasion", "occasion_date"])
+    .index("by_boutique_customer_occasion_date", ["boutique_id", "customer_id", "occasion", "occasion_date"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-09-04-phase5-virtual-events-vvip-design.md
@@ -385,13 +413,15 @@ export default defineSchema({
     draft_text: v.optional(v.string()), // AI-generated (or merchant-edited) WhatsApp message body
     status: v.union(v.literal("draft"), v.literal("dispatched")),
     created_at: v.number(), // epoch ms — Date.now() at insert
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // "Upcoming events" range read — see design doc (a): events is a small,
     // single-purpose table (unlike users, no mixed-population equality
     // prefix is needed), so a plain range index on the date field alone is
     // sufficient for getEvents' indexed "soonest first" query with no
     // full-table scan.
-    .index("by_event_datetime", ["event_datetime"]),
+    .index("by_event_datetime", ["event_datetime"])
+    .index("by_boutique_event_datetime", ["boutique_id", "event_datetime"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-09-04-dashboard-notifications-design.md
@@ -426,6 +456,7 @@ export default defineSchema({
     message: v.string(),
     created_at: v.number(), // epoch ms
     seen: v.boolean(),
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // Dedup check in the daily generator — mirrors hasExistingDraft's tuple
     // lookup (crons.ts) and message_actions'/ai_message_drafts'
@@ -436,7 +467,10 @@ export default defineSchema({
     .index("by_seen", ["seen"])
     // Range-read "not expired" (< 30 days old) rows — same shape as orders'
     // by_created_at index (schema.ts:184).
-    .index("by_created_at", ["created_at"]),
+    .index("by_created_at", ["created_at"])
+    .index("by_boutique_customer_occasion_date", ["boutique_id", "customer_id", "occasion", "occasion_date"])
+    .index("by_boutique_seen", ["boutique_id", "seen"])
+    .index("by_boutique_created_at", ["boutique_id", "created_at"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md
@@ -467,6 +501,7 @@ export default defineSchema({
     lookbook_id: v.optional(v.id("lookbooks")),              // lookbook_view
     event_id: v.optional(v.id("events")),                    // event_link_click
     created_at: v.number(), // epoch ms
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // Primary read pattern: "this customer's activity in [start, now]" for
     // the future daily summary + weekly most-active scan. Equality prefix on
@@ -477,7 +512,9 @@ export default defineSchema({
     // the last 7 days across all customers" to find who's active — a
     // range-only index on created_at (mirrors orders' by_created_at,
     // schema.ts:184) avoids a full-table scan for that global scan.
-    .index("by_created_at", ["created_at"]),
+    .index("by_created_at", ["created_at"])
+    .index("by_boutique_customer_created_at", ["boutique_id", "customer_id", "created_at"])
+    .index("by_boutique_created_at", ["boutique_id", "created_at"]),
 
   /**
    * Design spec: docs/superpowers/specs/2026-09-07-customer-activity-intelligence-design.md §b.3
@@ -506,10 +543,36 @@ export default defineSchema({
     customer_id: v.id("users"),
     summary_text: v.string(),
     generated_at: v.number(), // epoch ms — Date.now() at each (re)generation
+    boutique_id: v.optional(v.id("boutiques")),
   })
     // Single-row-per-customer upsert + latest-lookup — same "equality-only
     // point lookup" style as points_ledger's by_customer index, but here the
     // upsert mutation additionally uses this index to find (and patch) any
     // existing row instead of always inserting a new one.
-    .index("by_customer", ["customer_id"]),
+    .index("by_customer", ["customer_id"])
+    .index("by_boutique_customer", ["boutique_id", "customer_id"]),
+
+  /** Spec 3.1: one row per boutique; the 85 Lansdowne row is created in Step B. */
+  boutiques: defineTable({
+    name: v.string(),
+    slug: v.string(), // unique; lowercase letters, digits and hyphens, 3 to 40 characters; never changed after creation
+    logo_storage_id: v.optional(v.id("_storage")),
+    status: v.union(v.literal("active"), v.literal("suspended")),
+    is_default: v.boolean(), // exactly one default boutique; slug-less links resolve to it
+    one_device_lock: v.boolean(),
+    flags: v.record(v.string(), v.boolean()), // a missing key means ON
+    custom_domain: v.optional(v.string()), // reserved for the later custom-domain add-on, unused in this build
+    created_at: v.number(),
+    updated_at: v.number(),
+  })
+    .index("by_slug", ["slug"])
+    .index("by_default", ["is_default"]),
+
+  /** Spec 3.2: read only by internal functions; never returned to a client. */
+  boutique_secrets: defineTable({
+    boutique_id: v.id("boutiques"),
+    whatsapp_access_token: v.string(),
+    whatsapp_phone_number_id: v.string(),
+  })
+    .index("by_boutique", ["boutique_id"]),
 });
