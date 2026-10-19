@@ -5,6 +5,7 @@ import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession, issueMagicToken } from "./auth";
 import { rateLimiter } from "./rateLimits";
 import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
+import { getDefaultBoutique } from "./boutiques";
 
 /**
  * LoyaltyOS Boutique — Customer CRM backend (Step 4, PRD Module 1)
@@ -41,6 +42,31 @@ import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
  */
 
 type UserDoc = import("./_generated/dataModel").Doc<"users">;
+
+/**
+ * Rule 1 (Batch 6 audit, decision D-a) — every merchant function in this
+ * file refuses a merchant whose OWN boutique_id is undefined, throwing the
+ * EXACT SAME error requireMerchantSession already throws for a non-merchant
+ * caller ("Not authorized" — convex/auth.ts:118). A merchant row created
+ * before the multi-boutique migration backfill (or any row that somehow
+ * lacks boutique_id) must never read/write data under an `undefined`
+ * boutique_id, because Convex's withIndex(q.eq("boutique_id", undefined))
+ * would match EVERY row across EVERY boutique that also lacks boutique_id —
+ * not a safe "no boutique" scope.
+ *
+ * Module-private — called immediately after requireMerchantSession() in
+ * every merchant-only function below. Does NOT add a new
+ * requireMerchantSession call site (count stays 62); this throws
+ * independently, using the SAME ConvexError message text so callers (and
+ * src/lib/db.js's isSessionRejectedError allowlist) can't tell the two
+ * failure modes apart — both are "you are not an authorized merchant here".
+ */
+function requireMerchantBoutique(merchant: UserDoc): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
 
 /**
  * Merchant view of a customer — all CRM fields, no auth secrets.
@@ -88,9 +114,14 @@ function toMerchantCustomer(doc: UserDoc) {
  * this helper can't do once it hides is_deleted:true rows. deleteCustomer
  * uses getCustomerDocIncludingDeleted (below) instead.
  */
-async function getCustomerDoc(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
+async function getCustomerDoc(ctx: QueryCtx | MutationCtx, id: Id<"users">, boutiqueId: Id<"boutiques">) {
   const doc = await ctx.db.get(id);
   if (!doc || doc.role !== "customer" || doc.is_deleted === true) return null;
+  // Rule 2 (D-b) — a record belonging to another boutique, or one with no
+  // boutique_id at all, gets the SAME null a genuinely-missing id already
+  // gets today. No new response shape; this only narrows which rows a
+  // caller's own merchant session is allowed to resolve.
+  if (doc.boutique_id !== boutiqueId) return null;
   return doc;
 }
 
@@ -102,9 +133,11 @@ async function getCustomerDoc(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
  * "Customer not found." that the filtered getCustomerDoc would otherwise
  * produce (since it hides is_deleted:true rows from every other caller).
  */
-async function getCustomerDocIncludingDeleted(ctx: QueryCtx | MutationCtx, id: Id<"users">) {
+async function getCustomerDocIncludingDeleted(ctx: QueryCtx | MutationCtx, id: Id<"users">, boutiqueId: Id<"boutiques">) {
   const doc = await ctx.db.get(id);
   if (!doc || doc.role !== "customer") return null;
+  // Rule 2 (D-b) — same cross-boutique null as getCustomerDoc above.
+  if (doc.boutique_id !== boutiqueId) return null;
   return doc;
 }
 
@@ -255,14 +288,15 @@ interface QueueHit {
  */
 async function hasDecidedAction(
   ctx: QueryCtx,
+  boutiqueId: Id<"boutiques">,
   customerId: Id<"users">,
   occasion: "birthday" | "anniversary",
   occasionDate: string,
 ): Promise<boolean> {
   const existing = await ctx.db
     .query("message_actions")
-    .withIndex("by_customer_occasion_date", (q) =>
-      q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+    .withIndex("by_boutique_customer_occasion_date", (q) =>
+      q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
     )
     .first();
   return existing !== null;
@@ -289,6 +323,7 @@ async function hasDecidedAction(
  */
 async function findUpcoming(
   ctx: QueryCtx,
+  boutiqueId: Id<"boutiques">,
   days: number,
   field: "birthday" | "anniversary",
 ): Promise<QueueHit[]> {
@@ -307,14 +342,14 @@ async function findUpcoming(
       field === "birthday"
         ? await ctx.db
             .query("users")
-            .withIndex("by_role_birthday_md", (q) =>
-              q.eq("role", "customer").gte("birthday_md", lo).lte("birthday_md", hi),
+            .withIndex("by_boutique_role_birthday_md", (q) =>
+              q.eq("boutique_id", boutiqueId).eq("role", "customer").gte("birthday_md", lo).lte("birthday_md", hi),
             )
             .collect()
         : await ctx.db
             .query("users")
-            .withIndex("by_role_anniversary_md", (q) =>
-              q.eq("role", "customer").gte("anniversary_md", lo).lte("anniversary_md", hi),
+            .withIndex("by_boutique_role_anniversary_md", (q) =>
+              q.eq("boutique_id", boutiqueId).eq("role", "customer").gte("anniversary_md", lo).lte("anniversary_md", hi),
             )
             .collect();
     for (const row of rows) seen.set(row._id, row);
@@ -345,7 +380,7 @@ async function findUpcoming(
     if (!matchedDate) continue;
     const occasionDate = `${matchedDate.getUTCFullYear()}-${parsed[0]}-${parsed[1]}`;
 
-    if (await hasDecidedAction(ctx, c._id, field, occasionDate)) continue; // already sent/cancelled this specific occurrence
+    if (await hasDecidedAction(ctx, boutiqueId, c._id, field, occasionDate)) continue; // already sent/cancelled this specific occurrence
     hits.push({ doc: c, daysUntil: offset.get(key) ?? 0, occasionDate });
   }
   hits.sort((a, b) => a.daysUntil - b.daysUntil);
@@ -376,10 +411,11 @@ function checkUpcoming(raw: string | null | undefined, days: number): number | n
 export const getCustomers = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const customers = await ctx.db
       .query("users")
-      .filter((q) => q.eq(q.field("role"), "customer"))
+      .withIndex("by_boutique_role_name_lower", (q) => q.eq("boutique_id", boutiqueId).eq("role", "customer"))
       // Soft-delete exclusion (2026-09-14 design, section c.1) — a deleted
       // customer must not show in the CRM full list.
       .filter((q) => q.neq(q.field("is_deleted"), true))
@@ -416,10 +452,11 @@ export const getCustomersPaginated = query({
     token: v.string(),
   },
   handler: async (ctx, { paginationOpts, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const result = await ctx.db
       .query("users")
-      .withIndex("by_role_name_lower", (q) => q.eq("role", "customer"))
+      .withIndex("by_boutique_role_name_lower", (q) => q.eq("boutique_id", boutiqueId).eq("role", "customer"))
       .order("asc")
       // Soft-delete exclusion (2026-09-14 design, section c.2) — a post-index
       // .filter() here (rather than a second index) is the deliberate,
@@ -444,8 +481,9 @@ export const getCustomersPaginated = query({
 export const getCustomerById = query({
   args: { id: v.id("users"), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { id, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const doc = await getCustomerDoc(ctx, id);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const doc = await getCustomerDoc(ctx, id, boutiqueId);
     return doc ? toMerchantCustomer(doc) : null;
   },
 });
@@ -469,8 +507,9 @@ export const updateMeasurements = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerId, measurements, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const doc = await getCustomerDoc(ctx, customerId);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const doc = await getCustomerDoc(ctx, customerId, boutiqueId);
     if (!doc) return null;
     const merged = { ...(doc.measurements ?? {}), ...measurements };
     await ctx.db.patch(customerId, { measurements: merged });
@@ -491,10 +530,11 @@ export const addStaffNote = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerId, text, author, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Staff note text is required.");
-    const doc = await getCustomerDoc(ctx, customerId);
+    const doc = await getCustomerDoc(ctx, customerId, boutiqueId);
     if (!doc) return null;
     const note = { text: trimmed, date: Date.now(), author: author?.trim() || "Owner" };
     const staff_notes = [...(doc.staff_notes ?? []), note];
@@ -512,8 +552,9 @@ export const updateCustomTags = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerId, tags, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const doc = await getCustomerDoc(ctx, customerId);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const doc = await getCustomerDoc(ctx, customerId, boutiqueId);
     if (!doc) return null;
     const custom_tags = tags.map((t) => t.trim()).filter(Boolean);
     await ctx.db.patch(customerId, { custom_tags });
@@ -534,8 +575,9 @@ export const updateCustomerProfile = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerId, userId, token, ...patch }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const doc = await getCustomerDoc(ctx, customerId);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const doc = await getCustomerDoc(ctx, customerId, boutiqueId);
     if (!doc) return null;
     const update: any = {};
     if (patch.name !== undefined) {
@@ -564,8 +606,9 @@ export const updateCustomerProfile = mutation({
 export const getUpcomingBirthdays = query({
   args: { days: v.optional(v.number()), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { days, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const hits = await findUpcoming(ctx, days ?? 7, "birthday");
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const hits = await findUpcoming(ctx, boutiqueId, days ?? 7, "birthday");
     return hits.map(({ doc, daysUntil }) => ({
       _id: doc._id,
       name: doc.name,
@@ -584,8 +627,9 @@ export const getUpcomingBirthdays = query({
 export const getUpcomingAnniversaries = query({
   args: { days: v.optional(v.number()), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { days, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const hits = await findUpcoming(ctx, days ?? 7, "anniversary");
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const hits = await findUpcoming(ctx, boutiqueId, days ?? 7, "anniversary");
     return hits.map(({ doc, daysUntil }) => ({
       _id: doc._id,
       name: doc.name,
@@ -620,14 +664,26 @@ export const getUpcomingAnniversaries = query({
  * Returns the SAME fields getUpcomingBirthdays/getUpcomingAnniversaries
  * return (including whatsapp_consent, the gate the cron filters on before
  * ever calling Gemini — see crons.ts).
+ *
+ * D-c (Batch 6 audit) — `boutiqueId` is OPTIONAL: today's callers (crons.ts,
+ * whatsapp.ts) are not changed in this batch and still call with no
+ * boutiqueId, so they fall back to getDefaultBoutique(ctx) — the single
+ * is_default:true row, which is exactly the one boutique a pre-multi-boutique
+ * deployment has, so this fallback is a no-op for every caller today. Batches
+ * 11/12 will pass the resolved boutique explicitly and make the arg required.
+ * When there is no default boutique at all, returns [] — the SAME empty
+ * array this function already returns today when nothing is upcoming.
  */
 export const findUpcomingInternal = internalQuery({
   args: {
     days: v.optional(v.number()),
     field: v.union(v.literal("birthday"), v.literal("anniversary")),
+    boutiqueId: v.optional(v.id("boutiques")),
   },
-  handler: async (ctx, { days, field }) => {
-    const hits = await findUpcoming(ctx, days ?? 7, field);
+  handler: async (ctx, { days, field, boutiqueId }) => {
+    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
+    if (!resolvedBoutiqueId) return []; // same empty-result shape as "nothing upcoming"
+    const hits = await findUpcoming(ctx, resolvedBoutiqueId, days ?? 7, field);
     // P0-1 fix (2026-09-09): occasion_date now comes straight from
     // findUpcoming()'s own QueueHit.occasionDate — the canonical "YYYY-M-D"
     // key (real matched year + unpadded month/day) computed ONCE, at the
@@ -721,8 +777,9 @@ export const recordMessageAction = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customer_id, occasion, occasion_date, action, channel, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const doc = await getCustomerDoc(ctx, customer_id);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const doc = await getCustomerDoc(ctx, customer_id, boutiqueId);
     if (!doc) throw new Error("Customer not found.");
 
     const trimmedDate = occasion_date.trim();
@@ -731,7 +788,7 @@ export const recordMessageAction = mutation({
     }
 
     // IDEMPOTENCY — same tuple already decided → reject, don't insert a duplicate.
-    if (await hasDecidedAction(ctx, customer_id, occasion, trimmedDate)) {
+    if (await hasDecidedAction(ctx, boutiqueId, customer_id, occasion, trimmedDate)) {
       throw new Error(
         `An action has already been recorded for this customer's ${occasion} on ${trimmedDate}.`,
       );
@@ -744,6 +801,7 @@ export const recordMessageAction = mutation({
       action,
       decided_at: Date.now(),
       ...(channel ? { channel } : {}),
+      boutique_id: boutiqueId,
     });
 
     // ------------------------------------------------------------------
@@ -760,9 +818,12 @@ export const recordMessageAction = mutation({
     // resolveRuleValue for the same shape.
     // ------------------------------------------------------------------
     if (action === "sent" || action === "link_opened") {
+      // D-d (Batch 6 audit) — settings read moves to by_boutique_key with the
+      // merchant's own boutique_id; same fallback (DEFAULT_SETTINGS.tiers)
+      // when no row is found for this boutique/key.
       const settingsDoc = await ctx.db
         .query("settings")
-        .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
+        .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", SETTINGS_KEYS.LOYALTY_RULES))
         .first();
 
       // Same flat-path read as approveReview — settingsDoc.value is stored
@@ -805,6 +866,7 @@ export const recordMessageAction = mutation({
           // would make this indistinguishable from a manual award).
           created_by: "system",
           created_at: Date.now(),
+          boutique_id: boutiqueId,
         });
       }
     }
@@ -853,8 +915,9 @@ export const awardPoints = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customer_id, delta, reason_type, note, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const doc = await getCustomerDoc(ctx, customer_id);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const doc = await getCustomerDoc(ctx, customer_id, boutiqueId);
     if (!doc) throw new Error("Customer not found.");
 
     const resulting_balance = Math.max(0, (doc.points ?? 0) + delta);
@@ -868,6 +931,7 @@ export const awardPoints = mutation({
       resulting_balance,
       created_by: "admin",
       created_at: Date.now(),
+      boutique_id: boutiqueId,
     });
 
     return resulting_balance;
@@ -894,10 +958,16 @@ export const awardPoints = mutation({
 export const getPointsHistory = query({
   args: { customer_id: v.id("users"), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { customer_id, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    // D-b: no existence check exists today for customer_id — this function
+    // returns exactly what it returns today (an empty array) when
+    // customer_id belongs to another boutique, because the
+    // by_boutique_customer index with THIS caller's boutiqueId simply finds
+    // no rows — same as a bogus customer_id does today.
     const rows = await ctx.db
       .query("points_ledger")
-      .withIndex("by_customer", (q) => q.eq("customer_id", customer_id))
+      .withIndex("by_boutique_customer", (q) => q.eq("boutique_id", boutiqueId).eq("customer_id", customer_id))
       .order("desc")
       .collect();
     return rows.map((r) => ({
@@ -947,12 +1017,13 @@ function normalizeMobile(mobile: string): string {
 export const findCustomerByMobile = query({
   args: { mobile: v.string(), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { mobile, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const normalized = normalizeMobile(mobile);
     if (!normalized) return null;
     const doc = await ctx.db
       .query("users")
-      .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
+      .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutiqueId).eq("mobile", normalized))
       .filter((q) => q.eq(q.field("role"), "customer"))
       // Soft-delete exclusion (2026-09-14 design, section c.4) — doesn't go
       // through getCustomerDoc, so needs its own explicit filter.
@@ -994,13 +1065,34 @@ export const createCustomer = mutation({
     // + dispatch recipients), so it MUST require a valid merchant session. This
     // runs FIRST — before the rate limiter or any ctx.db read/write — so an
     // unauthenticated vvip:true attempt is rejected with no side effects.
-    // When vvip is not true, userId/token are ignored (unauthenticated /join
-    // path is unchanged).
-    if (vvip === true) {
-      if (!userId || !token) {
+    //
+    // D-g (Batch 6 audit) — the SAME requireMerchantSession call site below now
+    // ALSO runs whenever a session is supplied (not only when vvip:true), so a
+    // signed-in merchant's own boutique_id can be resolved for this call. This
+    // does not add a new requireMerchantSession call site (count stays 62) —
+    // it is still exactly one call, reached via a wider condition. When vvip is
+    // not true and no session is supplied, behaviour is unchanged (unauthenticated
+    // /join path).
+    let sessionBoutiqueId: Id<"boutiques"> | undefined;
+    if (vvip === true || (userId && token)) {
+      if (vvip === true && (!userId || !token)) {
         throw new ConvexError("Only the boutique can mark a customer as VVIP. Please sign in again.");
       }
-      await requireMerchantSession(ctx, userId, token);
+      if (userId && token) {
+        const merchant = await requireMerchantSession(ctx, userId, token);
+        sessionBoutiqueId = requireMerchantBoutique(merchant);
+      }
+    }
+
+    // Resolve which boutique this new/updated row belongs to: the merchant's
+    // own boutique when a session was supplied, else the single default
+    // boutique (unauthenticated /join path, today's only non-VVIP caller).
+    const boutiqueId = sessionBoutiqueId ?? (await getDefaultBoutique(ctx))?._id;
+    if (!boutiqueId) {
+      // This only happens when no default boutique exists yet (e.g. Step
+      // B/createDefaultBoutique hasn't run) — never insert a row without a
+      // boutique_id in that case.
+      return { ok: false, error: "Unable to create customer right now. Please try again shortly." };
     }
 
     const digits = mobile.replace(/\D/g, '');
@@ -1018,17 +1110,23 @@ export const createCustomer = mutation({
     // error} shape as the invalid-mobile check just above, which Join.jsx's
     // existing res.error / setMobileError handling already renders inline —
     // zero frontend changes needed.
-    const rl = await rateLimiter.limit(ctx, "createCustomerByMobile", { key: normalized });
+    //
+    // D-g — the rate-limit key becomes `${boutiqueId}:${normalized}`, resolved
+    // above BEFORE this limiter call, so two different boutiques onboarding
+    // the same mobile number never share one rate-limit bucket.
+    const rl = await rateLimiter.limit(ctx, "createCustomerByMobile", { key: `${boutiqueId}:${normalized}` });
     if (!rl.ok) {
       return { ok: false, error: "Too many attempts — please try again in a few minutes." };
     }
     const customerName = name.trim();
     if (!customerName) throw new Error("Customer name is required.");
 
-    // UNIQUE CHECK — block duplicate accounts from the same WhatsApp number.
+    // UNIQUE CHECK — block duplicate accounts from the same WhatsApp number,
+    // PER BOUTIQUE (D-f). A mobile that exists only in another boutique is
+    // treated as brand-new here.
     const existing = await ctx.db
       .query("users")
-      .withIndex("by_mobile", (q) => q.eq("mobile", normalized))
+      .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutiqueId).eq("mobile", normalized))
       .first();
     if (existing) {
       // Repeat visit: only ever UPGRADE consent to true, never clear it.
@@ -1085,6 +1183,7 @@ export const createCustomer = mutation({
       // Same "only set when true" shape — never persist an explicit false.
       ...(vvip ? { vvip: true } : {}),
       custom_tags: custom_tags ?? [],
+      boutique_id: boutiqueId, // NEVER insert a row without boutique_id (D-g)
     });
     const created = await ctx.db.get(id);
     return {
@@ -1118,9 +1217,10 @@ export const deleteCustomer = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerId, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const doc = await getCustomerDocIncludingDeleted(ctx, customerId);
+    const doc = await getCustomerDocIncludingDeleted(ctx, customerId, boutiqueId);
     if (!doc) return { ok: false, error: "Customer not found." };
     if (doc.is_deleted === true) {
       return { ok: false, error: "Customer is already deleted." };
@@ -1158,14 +1258,19 @@ export const bulkDeleteCustomers = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerIds, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const deleted: Array<{ id: string; name: string }> = [];
     const skipped: Array<{ id: string; reason: string }> = [];
 
     for (const id of customerIds) {
       const doc = await ctx.db.get(id);
-      if (!doc) {
+      // Rule 2 (D-b) — missing, no-boutique_id, and another-boutique's record
+      // ALL collapse into the SAME "not_found" skip reason a genuinely-missing
+      // id already gets today (never "not_a_customer" or a distinct new
+      // reason — indistinguishable from a bad id).
+      if (!doc || doc.boutique_id !== boutiqueId) {
         skipped.push({ id: String(id), reason: "not_found" });
         continue;
       }
@@ -1252,7 +1357,8 @@ export const bulkCreateCustomers = mutation({
     token: v.string(),
   },
   handler: async (ctx, { rows, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     // Batch limit — checked BEFORE any read or write (design spec: "rows.length
     // above 100 throws a clear error before any write").
@@ -1282,10 +1388,11 @@ export const bulkCreateCustomers = mutation({
         continue;
       }
 
-      // Same duplicate-mobile-check as createCustomer: by_mobile index lookup.
+      // D-f — same duplicate-mobile-check as createCustomer, now PER BOUTIQUE
+      // via by_boutique_mobile.
       const existing = await ctx.db
         .query("users")
-        .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+        .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutiqueId).eq("mobile", digits))
         .first();
 
       if (existing) {
@@ -1347,6 +1454,7 @@ export const bulkCreateCustomers = mutation({
         // explicit false (same conditional-spread shape as createCustomer).
         ...(row.whatsapp_consent ? { whatsapp_consent: true } : {}),
         ...(row.vvip ? { vvip: true } : {}),
+        boutique_id: boutiqueId,
       });
       const newDoc = await ctx.db.get(id);
       if (newDoc) {
@@ -1397,7 +1505,8 @@ export const checkMobilesStatus = query({
     token: v.string(),
   },
   handler: async (ctx, { mobiles, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     // Batch limit — checked BEFORE any database read (same "fail fast"
     // pattern as bulkCreateCustomers's rows.length > 100 guard above).
@@ -1422,10 +1531,10 @@ export const checkMobilesStatus = query({
     const deleted: string[] = [];
 
     for (const digits of normalized) {
-      // Same by_mobile lookup as bulkCreateCustomers (line 1269-1272 above).
+      // D-f — per-boutique lookup, same as createCustomer/bulkCreateCustomers.
       const existing = await ctx.db
         .query("users")
-        .withIndex("by_mobile", (q) => q.eq("mobile", digits))
+        .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutiqueId).eq("mobile", digits))
         .first();
 
       if (!existing) continue; // no row — neither list (frontend treats as "New")
@@ -1474,11 +1583,12 @@ export const checkMobilesStatus = query({
 export const getCustomerIntelligenceProfile = query({
   args: { customerId: v.id("users"), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { customerId, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     // 1. Core customer row — same base projection as getCustomerById, but
     // with measurements/staff_notes stripped out (see AI-facing note below).
-    const doc = await getCustomerDoc(ctx, customerId);
+    const doc = await getCustomerDoc(ctx, customerId, boutiqueId);
     if (!doc) return null;
     // CONFIDENTIAL EXCLUSION: unlike getCustomerById, this profile is built to
     // eventually feed AI features (Phase 3+, Gemini) — measurements (body-fit
@@ -1492,7 +1602,7 @@ export const getCustomerIntelligenceProfile = query({
     // 2. Full order history — identical query/shape to getOrdersByUser.
     const orders = await ctx.db
       .query("orders")
-      .withIndex("by_user", (q) => q.eq("user_id", customerId))
+      .withIndex("by_boutique_user", (q) => q.eq("boutique_id", boutiqueId).eq("user_id", customerId))
       .order("desc")
       .collect();
 
@@ -1501,7 +1611,7 @@ export const getCustomerIntelligenceProfile = query({
     // since it's a small, stable projection — see getPointsHistory above).
     const ledgerRows = await ctx.db
       .query("points_ledger")
-      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .withIndex("by_boutique_customer", (q) => q.eq("boutique_id", boutiqueId).eq("customer_id", customerId))
       .order("desc")
       .collect();
     const points_history = ledgerRows.map((r) => ({
@@ -1575,12 +1685,17 @@ export const getDraftForCustomer = query({
     token: v.string(),
   },
   handler: async (ctx, { customerId, occasion, occasionDate, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
+    // D-b: no existence check exists today for customerId — same reasoning as
+    // getPointsHistory above: the by_boutique_customer_occasion_date index
+    // with THIS caller's boutiqueId returns [] for another boutique's
+    // customer_id, same as any nonexistent tuple returns today.
     const rows = await ctx.db
       .query("ai_message_drafts")
-      .withIndex("by_customer_occasion_date", (q) =>
-        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      .withIndex("by_boutique_customer_occasion_date", (q) =>
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
       )
       .collect();
 
