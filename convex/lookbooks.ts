@@ -79,9 +79,20 @@ function validateMedia(media: MediaItem[]) {
  * check. The home row is never shown in getLookbooksForSelector and can
  * never be removed via deleteLookbook — see those functions below.
  * Design spec: docs/superpowers/specs/2026-10-01-packet-a-data-safety-design.md
+ *
+ * Batch 5 (2026-10-17, data-wall audit §6.1) — now boutique-scoped: takes the
+ * calling merchant's boutique_id and only matches/creates within that
+ * boutique, via the by_boutique index, so two boutiques never share (or
+ * fight over) the same "Current catalogue" row.
  */
-async function getOrCreateHomeLookbook(ctx: { db: MutationCtx["db"] }): Promise<Id<"lookbooks">> {
-  const existing = await ctx.db.query("lookbooks").collect();
+async function getOrCreateHomeLookbook(
+  ctx: { db: MutationCtx["db"] },
+  boutiqueId: Id<"boutiques">,
+): Promise<Id<"lookbooks">> {
+  const existing = await ctx.db
+    .query("lookbooks")
+    .withIndex("by_boutique", (q) => q.eq("boutique_id", boutiqueId))
+    .collect();
   const home = existing.find((lb) => lb.kind === "catalogue" && lb.is_deleted !== true);
   if (home) return home._id;
 
@@ -94,6 +105,7 @@ async function getOrCreateHomeLookbook(ctx: { db: MutationCtx["db"] }): Promise<
     source: "manual",
     kind: "catalogue",
     created_at: Date.now(),
+    boutique_id: boutiqueId,
   });
 }
 
@@ -185,11 +197,20 @@ export const getLookbookById = query({
  * check, and 180-day expiry math are duplicated here on purpose, kept
  * byte-for-byte equivalent to auth.ts. Do not let the two drift apart.
  *
- * Architecture (confirmed, see spec): the catalogue is ONE shared global
- * list — every merchant-added product is visible to every customer, no
- * per-customer filtering, no kind-based filtering (catalogue/designer/pdf
- * are all included). A future "personalized lookbook" AI feature may
- * re-order this list per customer later, but must never restrict it.
+ * Batch 5 (2026-10-17, data-wall audit §6.1) — boutique-scoped. A customer
+ * with no boutique_id (pre-migration row, or any other data-integrity gap)
+ * is refused exactly like an invalid token — Convex's withIndex() equality
+ * match on an `undefined` boutique_id would otherwise match every row that
+ * ALSO has no boutique_id, which is not what "this customer's boutique"
+ * means. The lookbooks read below is narrowed to the customer's own
+ * boutique via the by_boutique index instead of a full-table .collect().
+ *
+ * Architecture (confirmed, see spec): the catalogue is one shared list PER
+ * BOUTIQUE — every product of the customer's own boutique is visible to
+ * that customer, no per-customer filtering, no kind-based filtering
+ * (catalogue/designer/pdf are all included). A future "personalized
+ * lookbook" AI feature may re-order this list per customer later, but must
+ * never restrict it.
  *
  * Returns null (never throws) on any invalid/expired/non-customer caller,
  * matching Lookbook.jsx's existing null-handling convention (null = "show
@@ -223,11 +244,22 @@ export const getCustomerCatalogue = query({
     const expiresAt = createdAt + MAGIC_LINK_DAYS * DAY_MS;
     if (Date.now() > expiresAt) return null;
 
+    // Batch 5 (2026-10-17, audit §6.1 correction 1) — a customer whose own
+    // boutique_id is undefined must be refused the SAME way an invalid
+    // token is refused. Without this check, the by_boutique index lookup
+    // below (q.eq("boutique_id", undefined)) would match every lookbook
+    // that ALSO has no boutique_id — leaking the pre-migration/legacy
+    // shared catalogue to a customer who should see nothing.
+    if (customer.boutique_id === undefined) return null;
+
     // --- Validated: aggregate the full shared global catalogue ---
     // Same aggregation hydrateCatalogue() does client-side (multi round-trip),
     // done here server-side in one query call. No kind/lookbook filtering —
     // every lookbook's items are included (catalogue/designer/pdf all count).
-    const lookbooks = await ctx.db.query("lookbooks").collect();
+    const lookbooks = await ctx.db
+      .query("lookbooks")
+      .withIndex("by_boutique", (q) => q.eq("boutique_id", customer.boutique_id))
+      .collect();
     const allItems: Array<{
       id: Id<"catalogue_items">;
       convexId: Id<"catalogue_items">;
@@ -387,13 +419,25 @@ export const addCatalogueItem = mutation({
     media: v.optional(v.array(MEDIA_ITEM)),
   },
   handler: async (ctx, { userId, token, ...args }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
 
     // Packet A (2026-10-01, decision 2) — resolve a missing lookbook_id to
     // the home lookbook, finding or creating it in the same transaction, so
     // a piece added without a chosen lookbook never lands on whichever
     // lookbook happens to be newest.
-    const lookbookId = args.lookbook_id ?? (await getOrCreateHomeLookbook(ctx));
+    // Batch 5 (2026-10-17, audit §6.1 correction 1) — a merchant with no
+    // boutique_id of their own has no boutique-scoped home lookbook to
+    // resolve to; refuse explicitly (same "not_found" shape used elsewhere
+    // in this file for a bad/missing target) rather than passing `undefined`
+    // through to getOrCreateHomeLookbook, which would otherwise match every
+    // OTHER boundary-less legacy lookbook via the by_boutique index.
+    let lookbookId = args.lookbook_id;
+    if (!lookbookId) {
+      if (merchant.boutique_id === undefined) {
+        throw new Error("not_found");
+      }
+      lookbookId = await getOrCreateHomeLookbook(ctx, merchant.boutique_id);
+    }
 
     // Reject adding into a soft-deleted lookbook (2026-09-25-lookbook-delete-design.md decision 3).
     const lb = await ctx.db.get(lookbookId);

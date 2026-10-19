@@ -1649,6 +1649,37 @@ export function hydrateCustomerCatalogue(id, token, onSettled) {
 }
 
 /* ---------- Customer actions ---------- */
+
+/**
+ * Batch 5 (2026-10-17, data-wall audit §6.2) — reads the customer's
+ * magic-link session token DIRECTLY from localStorage, independent of
+ * state.users (the loyaltyos85_v2 blob). getCustomerSession() (defined
+ * below, near the other session helpers) is NOT used here on purpose: it
+ * calls validateLookbook(), which looks the customer up in state.users —
+ * and state.users is a SEPARATE, independently-clearable localStorage key
+ * from the session itself (loyaltyos_customer_session). A real, unexpired
+ * Convex magic-link session can exist while state.users no longer contains
+ * that customer's row (e.g. a reseed/version bump/resetDemo() touched only
+ * the loyaltyos85_v2 key), in which case getCustomerSession() would wrongly
+ * return null even though the session is perfectly valid. This helper reads
+ * the raw session blob instead, so a tracking call is never silently
+ * dropped just because the unrelated local cache was cleared.
+ *
+ * Returns the stored token ONLY when: the blob parses, both id and token are
+ * present, the 180-day expiry has not passed, AND the stored id matches
+ * `customerConvexId` (the customer this specific call is tracking) — never
+ * the stored id/token themselves (not returned to any caller that doesn't
+ * already know them).
+ */
+function readOwnSessionToken(customerConvexId) {
+  try {
+    const s = JSON.parse(localStorage.getItem('loyaltyos_customer_session'));
+    if (!s || !s.id || !s.token) return null;
+    if (Date.now() - s.ts > 180 * 864e5) return null; // expired — treat as no token
+    return String(s.id) === String(customerConvexId) ? s.token : null;
+  } catch { return null; }
+}
+
 // Like/unlike TOGGLE (bug fix — 2026-09-02): previously this was a bare
 // counter increment with no per-customer uniqueness, so N clicks by the SAME
 // customer on the SAME item created N separate activity-feed rows and
@@ -1697,8 +1728,18 @@ export function likeItem(userId, itemId) {
     const itemConvexId = item.convexId || (item._isConvex ? item.id : null);
     if (client && customerConvexId) {
       try {
+        // Batch 5 (2026-10-17, audit §6.2) — attach the customer's own
+        // magic-link token (read directly from localStorage, see
+        // readOwnSessionToken() above) so the backend can verify this call
+        // is really coming from that customer's own browser session, and
+        // scope the write to that customer's boutique. When no valid token
+        // is found for this exact customer, the call is sent WITHOUT a
+        // token, which the backend now simply ignores (writes nothing)
+        // rather than rejecting, so this never breaks the like toggle itself.
+        const sessionToken = readOwnSessionToken(customerConvexId);
         client.mutation(api.activity.trackActivity, {
           customerId: customerConvexId,
+          ...(sessionToken ? { token: sessionToken } : {}),
           action: 'like',
           ...(itemConvexId ? { catalogueItemId: itemConvexId } : {}),
         }).catch(() => { /* tracking failure must never surface to the customer */ });
@@ -1722,8 +1763,12 @@ export function trackCartAdd(userId, itemId) {
   const itemConvexId = item && (item.convexId || (item._isConvex ? item.id : null));
   if (!client || !customerConvexId) return;
   try {
+    // Batch 5 (2026-10-17, audit §6.2) — same session-token attach as
+    // likeItem() above; see that comment for the full reasoning.
+    const sessionToken = readOwnSessionToken(customerConvexId);
     client.mutation(api.activity.trackActivity, {
       customerId: customerConvexId,
+      ...(sessionToken ? { token: sessionToken } : {}),
       action: 'cart_add',
       ...(itemConvexId ? { catalogueItemId: itemConvexId } : {}),
     }).catch(() => { /* tracking failure must never surface to the customer */ });
@@ -1742,8 +1787,12 @@ export function trackLookbookView(userId, lookbookId) {
   const customerConvexId = user && (user.convexId || (user._isConvex ? user.id : null));
   if (!client || !customerConvexId) return;
   try {
+    // Batch 5 (2026-10-17, audit §6.2) — same session-token attach as
+    // likeItem() above; see that comment for the full reasoning.
+    const sessionToken = readOwnSessionToken(customerConvexId);
     client.mutation(api.activity.trackActivity, {
       customerId: customerConvexId,
+      ...(sessionToken ? { token: sessionToken } : {}),
       action: 'lookbook_view',
       ...(lookbookId ? { lookbookId } : {}),
     }).catch(() => { /* tracking failure must never surface to the customer */ });
