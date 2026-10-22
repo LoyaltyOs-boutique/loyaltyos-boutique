@@ -71,6 +71,20 @@ function validateMedia(media: MediaItem[]) {
   }
 }
 
+type UserDoc = import("./_generated/dataModel").Doc<"users">;
+
+/**
+ * Rule 1 (Batch 8) — refuses a merchant whose OWN boutique_id is undefined,
+ * same "Not authorized" ConvexError text as requireMerchantSession.
+ * Module-private; mirrors convex/customers.ts.
+ */
+function requireMerchantBoutique(merchant: UserDoc): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
+
 /**
  * Packet A (2026-10-01) — finds or lazily creates the one "Current catalogue"
  * home lookbook (kind: "catalogue"). Not an exported query/mutation/action —
@@ -115,8 +129,16 @@ async function getOrCreateHomeLookbook(
 export const getLookbooks = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const lookbooks = await ctx.db.query("lookbooks").order("desc").collect();
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    // D4 — lookbooks HAS a plain by_boutique index; .order("desc") on it is
+    // _creationTime desc within the boutique, identical to today's global
+    // _creationTime desc filtered to this boutique. No re-sort needed.
+    const lookbooks = await ctx.db
+      .query("lookbooks")
+      .withIndex("by_boutique", (q) => q.eq("boutique_id", boutiqueId))
+      .order("desc")
+      .collect();
     // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2).
     const active = lookbooks.filter((lb) => lb.is_deleted !== true);
     return await Promise.all(
@@ -145,8 +167,14 @@ export const getLookbooks = query({
 export const getLookbooksForSelector = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const lookbooks = await ctx.db.query("lookbooks").collect();
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    // D4 — today no .order(); default is _creationTime asc. by_boutique with
+    // default order is also _creationTime asc within the boutique. Identical.
+    const lookbooks = await ctx.db
+      .query("lookbooks")
+      .withIndex("by_boutique", (q) => q.eq("boutique_id", boutiqueId))
+      .collect();
     // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2),
     // plus the home "Current catalogue" row (kind: "catalogue") — it must
     // never show up as a pickable option here (design spec 2026-10-01,
@@ -335,10 +363,12 @@ export const createLookbook = mutation({
     ),
   },
   handler: async (ctx, { userId, token, ...args }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const id = await ctx.db.insert("lookbooks", {
       ...args,
       created_at: Date.now(),
+      boutique_id: boutiqueId,
     });
     return { ok: true, id };
   },
@@ -355,10 +385,12 @@ export const updateLookbook = mutation({
     source: v.optional(LOOKBOOK_SOURCES),
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     // Reject edits to a soft-deleted lookbook (2026-09-25-lookbook-delete-design.md decision 3).
+    // D9 — a lookbook of another boutique gets the same throw as a missing one.
     const existing = await ctx.db.get(id);
-    if (!existing || existing.is_deleted === true) {
+    if (!existing || existing.is_deleted === true || existing.boutique_id !== boutiqueId) {
       throw new ConvexError("This lookbook has been deleted.");
     }
     await ctx.db.patch(id, patch);
@@ -377,9 +409,12 @@ export const updateLookbook = mutation({
 export const deleteLookbook = mutation({
   args: { userId: v.id("users"), token: v.string(), id: v.id("lookbooks") },
   handler: async (ctx, { userId, token, id }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const lb = await ctx.db.get(id);
-    if (!lb || lb.is_deleted === true) {
+    // D9 — a lookbook of another boutique gets the same idempotent response as
+    // a missing/already-deleted one; nothing is removed.
+    if (!lb || lb.is_deleted === true || lb.boutique_id !== boutiqueId) {
       return { ok: true, alreadyDeleted: true, hiddenItems: 0 };
     }
     // The home "Current catalogue" row (kind: "catalogue") is permanent —
@@ -420,28 +455,23 @@ export const addCatalogueItem = mutation({
   },
   handler: async (ctx, { userId, token, ...args }) => {
     const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     // Packet A (2026-10-01, decision 2) — resolve a missing lookbook_id to
     // the home lookbook, finding or creating it in the same transaction, so
     // a piece added without a chosen lookbook never lands on whichever
-    // lookbook happens to be newest.
-    // Batch 5 (2026-10-17, audit §6.1 correction 1) — a merchant with no
-    // boutique_id of their own has no boutique-scoped home lookbook to
-    // resolve to; refuse explicitly (same "not_found" shape used elsewhere
-    // in this file for a bad/missing target) rather than passing `undefined`
-    // through to getOrCreateHomeLookbook, which would otherwise match every
-    // OTHER boundary-less legacy lookbook via the by_boutique index.
+    // lookbook happens to be newest. The merchant's own boutique_id is
+    // guaranteed present by requireMerchantBoutique above (Batch 8, D1).
     let lookbookId = args.lookbook_id;
     if (!lookbookId) {
-      if (merchant.boutique_id === undefined) {
-        throw new Error("not_found");
-      }
-      lookbookId = await getOrCreateHomeLookbook(ctx, merchant.boutique_id);
+      lookbookId = await getOrCreateHomeLookbook(ctx, boutiqueId);
     }
 
     // Reject adding into a soft-deleted lookbook (2026-09-25-lookbook-delete-design.md decision 3).
+    // D9 — a supplied lookbook_id of another boutique gets the same throw as a
+    // missing one. (A home-resolved id is always this boutique's.)
     const lb = await ctx.db.get(lookbookId);
-    if (!lb || lb.is_deleted === true) {
+    if (!lb || lb.is_deleted === true || lb.boutique_id !== boutiqueId) {
       throw new ConvexError("This lookbook has been deleted.");
     }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
@@ -450,7 +480,7 @@ export const addCatalogueItem = mutation({
       validateMedia(args.media);
       args.image_url = args.media[0].url;
     }
-    return await ctx.db.insert("catalogue_items", { ...args, lookbook_id: lookbookId });
+    return await ctx.db.insert("catalogue_items", { ...args, lookbook_id: lookbookId, boutique_id: boutiqueId });
   },
 });
 
@@ -468,10 +498,12 @@ export const updateCatalogueItem = mutation({
     media: v.optional(v.array(MEDIA_ITEM)),
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     // Reject edits to a soft-deleted piece (2026-09-25-lookbook-delete-design.md decision 3).
+    // D9 — a piece of another boutique gets the same throw as a missing one.
     const existing = await ctx.db.get(id);
-    if (!existing || existing.is_deleted === true) {
+    if (!existing || existing.is_deleted === true || existing.boutique_id !== boutiqueId) {
       throw new ConvexError("This piece has been deleted.");
     }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
@@ -488,7 +520,15 @@ export const updateCatalogueItem = mutation({
 export const deleteCatalogueItem = mutation({
   args: { userId: v.id("users"), token: v.string(), id: v.id("catalogue_items") },
   handler: async (ctx, { userId, token, id }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    // D10 (Option A) — load first; a missing item, an item with no boutique_id,
+    // or one of another boutique is a silent no-op; never deletes another
+    // boutique's item, and all three cases give the same response.
+    const item = await ctx.db.get(id);
+    if (!item || item.boutique_id !== boutiqueId) {
+      return;
+    }
     await ctx.db.delete(id);
   },
 });
@@ -511,8 +551,9 @@ export const createPdfLookbook = internalMutation({
   args: {
     name: v.string(),
     pdf_url: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { name, pdf_url }) => {
+  handler: async (ctx, { name, pdf_url, boutiqueId }) => {
     const id = await ctx.db.insert("lookbooks", {
       title: name,
       // `designer` is a required string on the schema; no PDF-specific
@@ -524,6 +565,7 @@ export const createPdfLookbook = internalMutation({
       kind: "pdf",
       pdf_url,
       created_at: Date.now(),
+      boutique_id: boutiqueId,
     });
     return { ok: true, id, pdf_url };
   },
@@ -543,8 +585,11 @@ export const createPdfLookbook = internalMutation({
 export const checkMerchantSession = internalQuery({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return null;
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const boutique = await ctx.db.get(boutiqueId);
+    if (!boutique) throw new ConvexError("Not authorized");
+    return { boutiqueId, slug: boutique.slug };
   },
 });
 
@@ -576,7 +621,8 @@ export const generatePdfUploadUrl = action({
     lookbookName: v.string(),
   },
   handler: async (ctx, { userId, token, file, filename, lookbookName }) => {
-    await ctx.runQuery(internal.lookbooks.checkMerchantSession, { userId, token });
+    // D11 — session/boutique check runs FIRST (before BLOB token read), as today.
+    const { boutiqueId, slug } = await ctx.runQuery(internal.lookbooks.checkMerchantSession, { userId, token });
 
     const blobToken = process.env.BLOB_READ_WRITE_TOKEN;
     if (!blobToken) {
@@ -587,7 +633,9 @@ export const generatePdfUploadUrl = action({
 
     let url: string;
     try {
-      const blob = await put(filename, file, {
+      // item 19 — prefix the Blob pathname with the boutique slug so uploads
+      // are namespaced per boutique. Existing files are not moved.
+      const blob = await put(`${slug}/${filename}`, file, {
         access: "public",
         token: blobToken,
         contentType: "application/pdf",
@@ -606,6 +654,7 @@ export const generatePdfUploadUrl = action({
     const created = await ctx.runMutation(internal.lookbooks.createPdfLookbook, {
       name: lookbookName,
       pdf_url: url,
+      boutiqueId,
     });
 
     return { ok: true, pdf_url: url, lookbookId: created.id, ...created };

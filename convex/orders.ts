@@ -1,8 +1,10 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import type { Id } from "./_generated/dataModel";
 import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 import { requireMerchantSession } from "./auth";
+
+type UserDoc = import("./_generated/dataModel").Doc<"users">;
 
 /**
  * LoyaltyOS Boutique — Orders + Points Backend (Step 7, PRD Module 7)
@@ -10,6 +12,23 @@ import { requireMerchantSession } from "./auth";
  * Atomic transaction logic for creating orders and updating user points.
  * Uses integer paise for all financial calculations (₹1 = 100 paise).
  */
+
+/**
+ * Rule 1 (Batch 7, data-wall audit) — refuses a merchant whose OWN
+ * boutique_id is undefined, throwing the EXACT SAME error text
+ * requireMerchantSession throws for a non-merchant caller ("Not authorized").
+ * Module-private; called immediately after requireMerchantSession() in every
+ * merchant-only function below. Does NOT add a new requireMerchantSession call
+ * site. Mirrors the identical helper in convex/customers.ts. Guards against
+ * Convex's withIndex(q.eq("boutique_id", undefined)) matching every row that
+ * also lacks boutique_id.
+ */
+function requireMerchantBoutique(merchant: UserDoc): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
 
 /** Verify user exists and get their points. */
 async function getUserPoints(ctx: QueryCtx | MutationCtx, userId: Id<"users">) {
@@ -41,11 +60,15 @@ export const createOrder = mutation({
     token: v.string(),
   },
   handler: async (ctx, { customerId, subtotal_paise, payment_method, points_applied, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     // 1. Verify User
     const user = await ctx.db.get(customerId);
     if (!user) return { ok: false, error: "User not found" };
+    // Boutique scope (Batch 7, D2/D7) — a customer of another boutique, or one
+    // with no boutique_id, is treated EXACTLY like a missing customer.
+    if (user.boutique_id !== boutiqueId) return { ok: false, error: "User not found" };
     // Soft-delete rejection (2026-09-14 design, section c.6) — a merchant
     // must not be able to create new orders/points for a deleted customer.
     // Same {ok:false, error} shape as the other validation failures below.
@@ -73,7 +96,7 @@ export const createOrder = mutation({
     // settings fetch and src/lib/db.js's `rules[user.tier] || rules.global`.
     const settingsDoc = await ctx.db
       .query("settings")
-      .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
+      .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", SETTINGS_KEYS.LOYALTY_RULES))
       .first();
     const rules = settingsDoc?.value?.tiers || DEFAULT_SETTINGS.tiers;
     const rule = rules[user.tier] || rules.global;
@@ -93,6 +116,7 @@ export const createOrder = mutation({
       final_total,
       points_earned,
       created_at: Date.now(),
+      boutique_id: boutiqueId,
     });
 
     const order = await ctx.db.get(order_id);
@@ -109,8 +133,16 @@ export const createOrder = mutation({
 export const getOrders = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return await ctx.db.query("orders").order("desc").collect();
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    // D4 — today this is a full-table scan ordered by _creationTime desc.
+    // by_boutique_created_at orders by created_at desc (a DIFFERENT order), so
+    // read scoped then re-sort by _creationTime desc to match today exactly.
+    const scoped = await ctx.db
+      .query("orders")
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId))
+      .collect();
+    return scoped.sort((a, b) => b._creationTime - a._creationTime);
   },
 });
 
@@ -121,10 +153,15 @@ export const getOrdersByUser = query({
   // `user_id`/`userId` collision (matches customers.ts precedent).
   args: { customerId: v.id("users"), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { customerId, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    // D7 — by_boutique_user: another boutique's customer yields the same empty
+    // result as a customer with no orders. Order unchanged: within a single
+    // (boutique,user) pair, .order("desc") is _creationTime desc, same as
+    // today's by_user + .order("desc").
     return await ctx.db
       .query("orders")
-      .withIndex("by_user", (q) => q.eq("user_id", customerId))
+      .withIndex("by_boutique_user", (q) => q.eq("boutique_id", boutiqueId).eq("user_id", customerId))
       .order("desc")
       .collect();
   },
@@ -138,11 +175,11 @@ export const getOrdersByUser = query({
  * ever placed. Now an indexed range read via by_created_at — only orders with
  * created_at >= startOfToday are pulled from the database.
  */
-async function getTodayOrdersInternal(ctx: QueryCtx) {
+async function getTodayOrdersInternal(ctx: QueryCtx, boutiqueId: Id<"boutiques">) {
   const startOfToday = getStartOfToday();
   return await ctx.db
     .query("orders")
-    .withIndex("by_created_at", (q) => q.gte("created_at", startOfToday))
+    .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId).gte("created_at", startOfToday))
     .order("desc")
     .collect();
 }
@@ -151,8 +188,9 @@ async function getTodayOrdersInternal(ctx: QueryCtx) {
 export const getTodayOrders = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return await getTodayOrdersInternal(ctx);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    return await getTodayOrdersInternal(ctx, boutiqueId);
   },
 });
 
@@ -160,8 +198,9 @@ export const getTodayOrders = query({
 export const getTodaySummary = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    const orders = await getTodayOrdersInternal(ctx);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const orders = await getTodayOrdersInternal(ctx, boutiqueId);
     const summary = orders.reduce(
       (
         acc: {

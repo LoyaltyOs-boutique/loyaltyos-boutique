@@ -1,8 +1,11 @@
 import { mutation, query } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import { DEFAULT_SETTINGS, SETTINGS_KEYS } from "./settings";
 import { requireMerchantSession } from "./auth";
 import { rateLimiter } from "./rateLimits";
+import type { Id } from "./_generated/dataModel";
+
+type UserDoc = import("./_generated/dataModel").Doc<"users">;
 
 // ============================================================================
 // SECTION 1 — Validators
@@ -19,6 +22,18 @@ const reviewStatusValidator = v.union(
   v.literal("approved"),
   v.literal("declined"),
 );
+
+/**
+ * Rule 1 (Batch 7) — refuses a merchant whose OWN boutique_id is undefined,
+ * same "Not authorized" ConvexError text requireMerchantSession throws for a
+ * non-merchant caller. Module-private; mirrors convex/customers.ts.
+ */
+function requireMerchantBoutique(merchant: UserDoc): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
 
 // ============================================================================
 // SECTION 2 — Mutations
@@ -74,6 +89,18 @@ export const createReview = mutation({
       return { ok: false, error: "Too many review submissions — please try again later.", rateLimited: true };
     }
 
+    // Boutique stamp (Batch 7, D6/D8) — load the reviewing customer to copy
+    // their boutique_id onto the new review row. The duplicate-scan below is
+    // UNCHANGED (still by_user on the submitter's own reviews). If the row is
+    // missing, is not a customer, or has no boutique_id, do not insert —
+    // createReview has no existing refusal path for a bad user_id, so return
+    // null (the null convention used by getCustomerCatalogue; src/lib/db.js
+    // already .catch(()=>{})s this call).
+    const reviewer = await ctx.db.get(args.user_id);
+    if (!reviewer || reviewer.role !== "customer" || reviewer.boutique_id === undefined) {
+      return null;
+    }
+
     const cutoff = Date.now() - DUPLICATE_SUBMIT_WINDOW_MS;
     const recentOwnReviews = await ctx.db
       .query("reviews")
@@ -99,6 +126,7 @@ export const createReview = mutation({
       status: "pending",
       points_awarded: 0,
       created_at: Date.now(),
+      boutique_id: reviewer.boutique_id,
     });
   },
 });
@@ -113,10 +141,14 @@ export const createReview = mutation({
 export const approveReview = mutation({
   args: { userId: v.id("users"), token: v.string(), id: v.id("reviews") },
   handler: async (ctx, { userId, token, id }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const review = await ctx.db.get(id);
     if (!review) throw new Error("Review not found");
+    // D9 — a review of another boutique (or one with no boutique_id) gets the
+    // same "Review not found" throw as a missing review.
+    if (review.boutique_id !== boutiqueId) throw new Error("Review not found");
     if (review.status !== "pending") throw new Error("Review already processed");
 
     // Fetch user
@@ -132,7 +164,7 @@ export const approveReview = mutation({
     // Get current loyalty rules (fallback to defaults if empty)
     const settingsDoc = await ctx.db
       .query("settings")
-      .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.LOYALTY_RULES))
+      .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", SETTINGS_KEYS.LOYALTY_RULES))
       .first();
 
     // settingsDoc.value is stored FLAT as { global, silver, gold, platinum }
@@ -195,10 +227,12 @@ export const approveReview = mutation({
 export const declineReview = mutation({
   args: { userId: v.id("users"), token: v.string(), id: v.id("reviews") },
   handler: async (ctx, { userId, token, id }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const review = await ctx.db.get(id);
     if (!review) throw new Error("Review not found");
+    if (review.boutique_id !== boutiqueId) throw new Error("Review not found");
     if (review.status !== "pending") throw new Error("Review already processed");
 
     await ctx.db.patch(id, { status: "declined" });
@@ -219,11 +253,12 @@ export const declineReview = mutation({
 export const getPendingReviews = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     return await ctx.db
       .query("reviews")
-      .withIndex("by_status", (q) => q.eq("status", "pending"))
+      .withIndex("by_boutique_status", (q) => q.eq("boutique_id", boutiqueId).eq("status", "pending"))
       .order("desc")
       .collect();
   },
@@ -241,15 +276,31 @@ export const getReviews = query({
     status: v.optional(reviewStatusValidator),
   },
   handler: async (ctx, { userId, token, status }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const q = ctx.db.query("reviews");
     if (status) {
-      return await q
-        .withIndex("by_status", (q) => q.eq("status", status))
+      return await ctx.db
+        .query("reviews")
+        .withIndex("by_boutique_status", (q) => q.eq("boutique_id", boutiqueId).eq("status", status))
         .order("desc")
         .collect();
     }
-    return await q.order("desc").collect();
+    // D4 — today the no-status branch is a full-table scan ordered by
+    // _creationTime desc. There is no plain by_boutique index on reviews, so
+    // read all three statuses via by_boutique_status, concat, and re-sort by
+    // _creationTime desc to reproduce today's exact order within the boutique.
+    // The status list is taken from reviewStatusValidator's literals so any
+    // valid review status is included.
+    const statuses = ["pending", "approved", "declined"] as const;
+    const groups = await Promise.all(
+      statuses.map((s) =>
+        ctx.db
+          .query("reviews")
+          .withIndex("by_boutique_status", (q) => q.eq("boutique_id", boutiqueId).eq("status", s))
+          .collect(),
+      ),
+    );
+    return groups.flat().sort((a, b) => b._creationTime - a._creationTime);
   },
 });
