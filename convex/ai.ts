@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
 import { SETTINGS_KEYS, type WhatsAppTemplateType } from "./settings";
+import { getDefaultBoutique } from "./boutiques";
 import type { Id } from "./_generated/dataModel";
 
 /**
@@ -317,12 +318,16 @@ export const checkMerchantSession = internalQuery({
 export const getWhatsAppTemplateConfigInternal = internalQuery({
   args: {
     type: v.union(v.literal("anniversary"), v.literal("birthday")),
+    boutiqueId: v.optional(v.id("boutiques")),
   },
-  handler: async (ctx, { type }) => {
-    const doc = await ctx.db
-      .query("settings")
-      .withIndex("by_key", (q) => q.eq("key", SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG))
-      .first();
+  handler: async (ctx, { type, boutiqueId }) => {
+    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
+    const doc = resolvedBoutiqueId
+      ? await ctx.db
+          .query("settings")
+          .withIndex("by_boutique_key", (q) => q.eq("boutique_id", resolvedBoutiqueId).eq("key", SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG))
+          .first()
+      : null;
     const stored = doc?.value as
       | Partial<Record<WhatsAppTemplateType, { discountPercent?: string; couponCode?: string; validDays?: string }>>
       | undefined;

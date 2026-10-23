@@ -1,6 +1,8 @@
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
+import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
+import { getBoutiqueBySlug, getDefaultBoutique } from "./boutiques";
 
 /**
  * LoyaltyOS Boutique — Centralized Settings backend (Step 5 + Step 5.5, PRD §8)
@@ -19,8 +21,13 @@ import { requireMerchantSession } from "./auth";
  *
  * ARCHITECTURE (scalable + clean):
  *   - Singleton-per-key pattern: the `settings` table holds at most ONE
- *     document per settings group (`loyalty_rules` | `templates`), looked up
- *     via the `by_key` index. Bounded table — never grows with usage.
+ *     document per (boutique_id, settings-group-key) pair
+ *     (`loyalty_rules` | `templates` | ...), looked up via the
+ *     `by_boutique_key` index. Bounded per boutique — never grows with usage.
+ *     (Phase 1 Batch 9/10 — multi-boutique data-wall fix: settings used to be
+ *     one global singleton per key across all boutiques; now scoped per
+ *     boutique so Boutique A's loyalty rules/templates can never leak into or
+ *     collide with Boutique B's.)
  *   - Defaults as the single source of truth: DEFAULT_SETTINGS (mirrors the
  *     approved seed values in src/data/seed.js) and DEFAULT_TEMPLATES live
  *     here (exported). getSettings merges stored overrides on top of the
@@ -398,13 +405,45 @@ function mergeWhatsAppTemplateConfig(
 // ============================================================================
 
 /**
+ * Module-private; mirrors convex/customers.ts and convex/lookbooks.ts.
+ * Every merchant function below calls this right after requireMerchantSession
+ * so a merchant with no boutique_id (should never happen in practice, but
+ * must be refused BEFORE any by_boutique query runs — Rule 1) gets the exact
+ * same "Not authorized" failure the two sibling files already throw.
+ */
+function requireMerchantBoutique(merchant: import("./_generated/dataModel").Doc<"users">): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
+
+/**
+ * Public-surface boutique resolution for getSettings/getTemplateCardUrls
+ * (D2) — behaviorally identical to auth.ts's module-private
+ * resolvePublicBoutique (trim, empty -> default boutique, non-empty ->
+ * slug lookup via getBoutiqueBySlug, which itself lower-cases), but
+ * re-declared here because resolvePublicBoutique is module-private to
+ * auth.ts and typed to MutationCtx, while getSettings/getTemplateCardUrls
+ * are queries (QueryCtx).
+ */
+async function resolvePublicBoutiqueForSettings(
+  ctx: QueryCtx | MutationCtx,
+  slug: string | undefined,
+) {
+  const trimmed = slug?.trim();
+  if (!trimmed) return getDefaultBoutique(ctx);
+  return getBoutiqueBySlug(ctx, trimmed);
+}
+
+/**
  * Fetch the singleton settings document for a group key, or null if it
  * has never been written (fresh deployment → defaults apply).
  */
-async function getSettingsDoc(ctx: QueryCtx | MutationCtx, key: SettingsKey) {
+async function getSettingsDoc(ctx: QueryCtx | MutationCtx, boutiqueId: Id<"boutiques">, key: SettingsKey) {
   return ctx.db
     .query("settings")
-    .withIndex("by_key", (q) => q.eq("key", key))
+    .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", key))
     .first();
 }
 
@@ -415,12 +454,13 @@ async function getSettingsDoc(ctx: QueryCtx | MutationCtx, key: SettingsKey) {
  */
 async function upsertSettings(
   ctx: MutationCtx,
+  boutiqueId: Id<"boutiques">,
   key: SettingsKey,
   value: unknown,
   updatedBy?: string,
 ) {
   const now = Date.now();
-  const existing = await getSettingsDoc(ctx, key);
+  const existing = await getSettingsDoc(ctx, boutiqueId, key);
   if (existing) {
     await ctx.db.patch(existing._id, {
       value,
@@ -432,6 +472,7 @@ async function upsertSettings(
       key,
       value,
       updated_at: now,
+      boutique_id: boutiqueId,
       ...(updatedBy ? { updated_by: updatedBy } : {}),
     });
   }
@@ -444,8 +485,11 @@ async function upsertSettings(
  * The settings table is bounded by design (one doc per known key, ~2 rows),
  * so `.collect()` is safe here and the table cannot grow with usage.
  */
-async function readMergedSettings(ctx: QueryCtx | MutationCtx) {
-  const docs = await ctx.db.query("settings").collect();
+async function readMergedSettings(ctx: QueryCtx | MutationCtx, boutiqueId: Id<"boutiques">) {
+  const docs = await ctx.db
+    .query("settings")
+    .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId))
+    .collect();
   const byKey = new Map(docs.map((doc) => [doc.key, doc.value]));
 
   const storedRules = byKey.get(SETTINGS_KEYS.LOYALTY_RULES) as
@@ -484,8 +528,18 @@ async function readMergedSettings(ctx: QueryCtx | MutationCtx) {
  * (loyalty_rules + templates), even when the DB is empty (defaults fallback).
  */
 export const getSettings = query({
-  args: {},
-  handler: async (ctx) => readMergedSettings(ctx),
+  args: { slug: v.optional(v.string()) },
+  handler: async (ctx, { slug }) => {
+    const boutique = await resolvePublicBoutiqueForSettings(ctx, slug);
+    if (!boutique) {
+      return {
+        loyalty_rules: { tiers: mergeLoyaltyRules(undefined) },
+        templates: mergeTemplates(undefined),
+        updated_at: { loyalty_rules: null, templates: null },
+      };
+    }
+    return readMergedSettings(ctx, boutique._id);
+  },
 });
 
 /**
@@ -500,7 +554,8 @@ export const updateSettings = mutation({
     settings: loyaltyRulesValidator,
   },
   handler: async (ctx, { userId, token, settings }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     // Keep only the known tier keys + known numeric keys so a malformed
     // client payload can never pollute the stored document.
@@ -517,8 +572,8 @@ export const updateSettings = mutation({
       if (Object.keys(clean).length > 0) nextValue[key] = clean;
     }
 
-    await upsertSettings(ctx, SETTINGS_KEYS.LOYALTY_RULES, nextValue);
-    return readMergedSettings(ctx);
+    await upsertSettings(ctx, boutiqueId, SETTINGS_KEYS.LOYALTY_RULES, nextValue);
+    return readMergedSettings(ctx, boutiqueId);
   },
 });
 
@@ -535,13 +590,14 @@ export const updateTemplate = mutation({
     text: v.string(),
   },
   handler: async (ctx, { userId, token, templateKey, text }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const trimmed = text.trim();
     if (!trimmed) throw new Error("Template text must not be empty.");
 
     // Merge onto the currently stored templates payload (if any).
-    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.TEMPLATES);
+    const existing = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.TEMPLATES);
     const stored = existing?.value as
       | Partial<Record<TemplateKey, string>>
       | undefined;
@@ -550,8 +606,8 @@ export const updateTemplate = mutation({
       [templateKey]: trimmed,
     };
 
-    await upsertSettings(ctx, SETTINGS_KEYS.TEMPLATES, nextValue);
-    return readMergedSettings(ctx);
+    await upsertSettings(ctx, boutiqueId, SETTINGS_KEYS.TEMPLATES, nextValue);
+    return readMergedSettings(ctx, boutiqueId);
   },
 });
 
@@ -563,9 +619,11 @@ export const updateTemplate = mutation({
  * middleware.js's fail-open path always has a real URL to redirect to.
  */
 export const getTemplateCardUrls = query({
-  args: {},
-  handler: async (ctx) => {
-    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.TEMPLATE_CARDS);
+  args: { slug: v.optional(v.string()) },
+  handler: async (ctx, { slug }) => {
+    const boutique = await resolvePublicBoutiqueForSettings(ctx, slug);
+    if (!boutique) return mergeTemplateCards(undefined);
+    const doc = await getSettingsDoc(ctx, boutique._id, SETTINGS_KEYS.TEMPLATE_CARDS);
     const stored = doc?.value as Partial<Record<TemplateCardKey, string>> | undefined;
     return mergeTemplateCards(stored);
   },
@@ -589,13 +647,14 @@ export const setTemplateCardUrl = mutation({
     url: v.string(),
   },
   handler: async (ctx, { userId, token, type, url }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.TEMPLATE_CARDS);
+    const existing = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.TEMPLATE_CARDS);
     const stored = existing?.value as Partial<Record<TemplateCardKey, string>> | undefined;
     const current = mergeTemplateCards(stored); // spread the full current state first
     const nextValue: Record<TemplateCardKey, string> = { ...current, [type]: url }; // override only the changed field
-    await upsertSettings(ctx, SETTINGS_KEYS.TEMPLATE_CARDS, nextValue);
+    await upsertSettings(ctx, boutiqueId, SETTINGS_KEYS.TEMPLATE_CARDS, nextValue);
     return nextValue;
   },
 });
@@ -612,9 +671,10 @@ export const getWhatsAppTemplates = query({
     token: v.string(),
   },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const doc = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
     const stored = doc?.value as
       | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
       | undefined;
@@ -641,9 +701,10 @@ export const setWhatsAppTemplate = mutation({
     config: whatsAppTemplateConfigValidator,
   },
   handler: async (ctx, { userId, token, type, config }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const existing = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
     const stored = existing?.value as
       | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
       | undefined;
@@ -652,7 +713,7 @@ export const setWhatsAppTemplate = mutation({
       ...current,
       [type]: config, // override only the changed field
     };
-    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
+    await upsertSettings(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
     return nextValue;
   },
 });
@@ -682,9 +743,10 @@ export const clearWhatsAppTemplate = mutation({
     type: whatsAppTemplateTypeValidator,
   },
   handler: async (ctx, { userId, token, type }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
+    const existing = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATES);
     const stored = existing?.value as
       | Partial<Record<WhatsAppTemplateType, WhatsAppTemplateConfig>>
       | undefined;
@@ -693,7 +755,7 @@ export const clearWhatsAppTemplate = mutation({
       ...current,
       [type]: null, // override only the changed field, back to "not configured"
     };
-    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
+    await upsertSettings(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATES, nextValue);
     return nextValue;
   },
 });
@@ -711,9 +773,10 @@ export const getWhatsAppTemplateConfig = query({
     token: v.string(),
   },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const doc = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
+    const doc = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
     const stored = doc?.value as
       | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
       | undefined;
@@ -741,9 +804,10 @@ export const setWhatsAppTemplateConfig = mutation({
     config: whatsAppTemplateConfigFieldsValidator,
   },
   handler: async (ctx, { userId, token, type, config }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const existing = await getSettingsDoc(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
+    const existing = await getSettingsDoc(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG);
     const stored = existing?.value as
       | Partial<Record<WhatsAppTemplateType, Partial<WhatsAppTemplateConfigFields>>>
       | undefined;
@@ -752,7 +816,7 @@ export const setWhatsAppTemplateConfig = mutation({
       ...current,
       [type]: config, // override only the changed field
     };
-    await upsertSettings(ctx, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG, nextValue);
+    await upsertSettings(ctx, boutiqueId, SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG, nextValue);
     return nextValue;
   },
 });
@@ -768,12 +832,16 @@ export const resetSettings = mutation({
     token: v.string(),
   },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
-    const docs = await ctx.db.query("settings").collect();
+    const docs = await ctx.db
+      .query("settings")
+      .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId))
+      .collect();
     for (const doc of docs) {
       await ctx.db.delete(doc._id);
     }
-    return readMergedSettings(ctx);
+    return readMergedSettings(ctx, boutiqueId);
   },
 });

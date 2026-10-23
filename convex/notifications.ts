@@ -1,5 +1,6 @@
 import { mutation, query } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
+import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
 
 /**
@@ -25,6 +26,18 @@ import { requireMerchantSession } from "./auth";
  * customers.ts.
  */
 
+type UserDoc = import("./_generated/dataModel").Doc<"users">;
+
+/**
+ * Module-private; mirrors convex/customers.ts and convex/lookbooks.ts.
+ */
+function requireMerchantBoutique(merchant: UserDoc): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
+
 /** Notification rows older than this are considered expired and excluded from reads. */
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -38,11 +51,12 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 export const getNotifications = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const cutoff = Date.now() - THIRTY_DAYS_MS;
     const rows = await ctx.db
       .query("notifications")
-      .withIndex("by_created_at", (q) => q.gte("created_at", cutoff))
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId).gte("created_at", cutoff))
       .order("desc")
       .collect();
     return rows;
@@ -58,11 +72,12 @@ export const getNotifications = query({
 export const markAllSeen = mutation({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const cutoff = Date.now() - THIRTY_DAYS_MS;
     const rows = await ctx.db
       .query("notifications")
-      .withIndex("by_created_at", (q) => q.gte("created_at", cutoff))
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId).gte("created_at", cutoff))
       .collect();
     const unseen = rows.filter((r) => !r.seen);
     await Promise.all(unseen.map((r) => ctx.db.patch(r._id, { seen: true })));
@@ -80,7 +95,13 @@ export const markAllSeen = mutation({
 export const deleteNotification = mutation({
   args: { notificationId: v.id("notifications"), userId: v.id("users"), token: v.string() },
   handler: async (ctx, { notificationId, userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const row = await ctx.db.get(notificationId);
+    // A missing id, another boutique's id and an id without boutique_id all get the same silent no-op (rule 2).
+    if (!row || row.boutique_id === undefined || row.boutique_id !== boutiqueId) {
+      return { ok: true };
+    }
     await ctx.db.delete(notificationId);
     return { ok: true };
   },

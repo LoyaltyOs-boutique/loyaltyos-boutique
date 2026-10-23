@@ -1,5 +1,6 @@
 import { action, internalAction, internalMutation, internalQuery, mutation, query } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
+import type { Id } from "./_generated/dataModel";
 import { internal, api } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
 import {
@@ -43,6 +44,17 @@ import {
  */
 
 type EventDoc = import("./_generated/dataModel").Doc<"events">;
+type UserDoc = import("./_generated/dataModel").Doc<"users">;
+
+/**
+ * Module-private; mirrors convex/customers.ts and convex/lookbooks.ts.
+ */
+function requireMerchantBoutique(merchant: UserDoc): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
 
 /** Merchant/public view of an event doc — currently identical (no secrets on this table). */
 function toEventView(doc: EventDoc) {
@@ -79,7 +91,8 @@ export const createEvent = mutation({
     draft_text: v.optional(v.string()),
   },
   handler: async (ctx, { userId, token, designer_name, event_datetime, vvip_only, description, draft_text }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const id = await ctx.db.insert("events", {
       designer_name: designer_name.trim(),
@@ -89,6 +102,7 @@ export const createEvent = mutation({
       draft_text: draft_text?.trim() || undefined,
       status: "draft",
       created_at: Date.now(),
+      boutique_id: boutiqueId,
     });
     const doc = await ctx.db.get(id);
     return doc ? toEventView(doc) : null;
@@ -108,10 +122,11 @@ export const createEvent = mutation({
 export const getEvents = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
     const events = await ctx.db
       .query("events")
-      .withIndex("by_event_datetime")
+      .withIndex("by_boutique_event_datetime", (q) => q.eq("boutique_id", boutiqueId))
       .order("asc")
       .collect();
     return events.map(toEventView);
@@ -122,7 +137,13 @@ export const getEvents = query({
 export const deleteEvent = mutation({
   args: { userId: v.id("users"), token: v.string(), id: v.id("events") },
   handler: async (ctx, { userId, token, id }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    const event = await ctx.db.get(id);
+    // A missing id, another boutique's id and an id without boutique_id all get the same silent no-op (rule 2).
+    if (!event || event.boutique_id === undefined || event.boutique_id !== boutiqueId) {
+      return;
+    }
     await ctx.db.delete(id);
   },
 });
@@ -261,7 +282,11 @@ export const generateEventDraftPublic = action({
     eventTitle: v.optional(v.string()),
   },
   handler: async (ctx, { userId, token, eventId, eventTitle }): Promise<string | null> => {
-    await ctx.runQuery(internal.events.checkMerchantSession, { userId, token });
+    const { boutiqueId } = await ctx.runQuery(internal.events.checkMerchantSession, { userId, token });
+    const event = await ctx.runQuery(internal.events.getEventForDispatchInternal, { eventId });
+    if (!event || event.boutique_id === undefined || event.boutique_id !== boutiqueId) {
+      return null;
+    }
     return await ctx.runAction(internal.events.generateEventDraft, { eventId, eventTitle });
   },
 });
@@ -281,8 +306,9 @@ export const generateEventDraftPublic = action({
 export const checkMerchantSession = internalQuery({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return null;
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+    return { boutiqueId };
   },
 });
 
@@ -297,19 +323,19 @@ export const checkMerchantSession = internalQuery({
  * no in-memory filter step, no full-table scan (design doc (g), Option 2).
  */
 export const getDispatchRecipientsInternal = internalQuery({
-  args: { vvipOnly: v.boolean() },
-  handler: async (ctx, { vvipOnly }) => {
+  args: { boutiqueId: v.id("boutiques"), vvipOnly: v.boolean() },
+  handler: async (ctx, { boutiqueId, vvipOnly }) => {
     const recipients = vvipOnly
       ? await ctx.db
           .query("users")
-          .withIndex("by_role_consent_vvip", (q) =>
-            q.eq("role", "customer").eq("whatsapp_consent", true).eq("vvip", true),
+          .withIndex("by_boutique_role_consent_vvip", (q) =>
+            q.eq("boutique_id", boutiqueId).eq("role", "customer").eq("whatsapp_consent", true).eq("vvip", true),
           )
           .collect()
       : await ctx.db
           .query("users")
-          .withIndex("by_role_consent_vvip", (q) =>
-            q.eq("role", "customer").eq("whatsapp_consent", true),
+          .withIndex("by_boutique_role_consent_vvip", (q) =>
+            q.eq("boutique_id", boutiqueId).eq("role", "customer").eq("whatsapp_consent", true),
           )
           .collect();
     // Packet A (2026-10-01, decision 5) — a soft-deleted customer must never
@@ -369,10 +395,12 @@ export const dispatchEvent = action({
     eventId: v.id("events"),
   },
   handler: async (ctx, { userId, token, eventId }) => {
-    await ctx.runQuery(internal.events.checkMerchantSession, { userId, token });
+    const { boutiqueId } = await ctx.runQuery(internal.events.checkMerchantSession, { userId, token });
 
     const event = await ctx.runQuery(internal.events.getEventForDispatchInternal, { eventId });
-    if (!event) throw new Error("Event not found.");
+    if (!event || event.boutique_id === undefined || event.boutique_id !== boutiqueId) {
+      throw new Error("Event not found.");
+    }
 
     const messageText = (event.draft_text ?? "").trim();
     if (!messageText) {
@@ -380,6 +408,7 @@ export const dispatchEvent = action({
     }
 
     const recipients = await ctx.runQuery(internal.events.getDispatchRecipientsInternal, {
+      boutiqueId,
       vvipOnly: event.vvip_only,
     });
 
@@ -502,6 +531,10 @@ export const getEventAccess = query({
 
     const customer = await ctx.db.get(customerId);
     if (!customer || customer.role !== "customer") return null;
+
+    if (event.boutique_id === undefined || customer.boutique_id === undefined || event.boutique_id !== customer.boutique_id) {
+      return null;
+    }
 
     const nowMs = now ?? Date.now();
     const unlocked = nowMs >= event.event_datetime - 5 * 60_000;

@@ -176,7 +176,9 @@ async function seedOneBoutique(
       tier: TIERS[i],
       magic_token: randomHex64(),
       magic_token_created_at: now,
-      whatsapp_consent: i === 0,
+      whatsapp_consent: i === 0 || i === 1,
+      ...(i === 0 ? { vvip: true } : {}),
+      ...(i === 1 ? { vvip: false } : {}),
       boutique_id: boutiqueId,
     });
     customerIds.push(id);
@@ -288,6 +290,17 @@ async function seedOneBoutique(
   });
   counts.events += 1;
 
+  await ctx.db.insert("events", {
+    designer_name: `${TEST_PREFIX}Designer VVIP`,
+    event_datetime: now + 86_400_000,
+    vvip_only: true,
+    description: `${TEST_PREFIX}vvip event ${cfg.label}`,
+    status: "draft",
+    created_at: now,
+    boutique_id: boutiqueId,
+  });
+  counts.events += 1;
+
   await ctx.db.insert("notifications", {
     customer_id: firstCustomerId,
     occasion: "birthday",
@@ -295,6 +308,17 @@ async function seedOneBoutique(
     message: `${TEST_PREFIX}notification ${cfg.label}`,
     created_at: now,
     seen: false,
+    boutique_id: boutiqueId,
+  });
+  counts.notifications += 1;
+
+  await ctx.db.insert("notifications", {
+    customer_id: firstCustomerId,
+    occasion: "anniversary",
+    occasion_date: "2026-2-20",
+    message: `${TEST_PREFIX}seen notification ${cfg.label}`,
+    created_at: now,
+    seen: true,
     boutique_id: boutiqueId,
   });
   counts.notifications += 1;
@@ -399,6 +423,7 @@ export const seedLegacyRows = internalMutation({
         tier: TIERS[i],
         magic_token: randomHex64(),
         magic_token_created_at: now,
+        ...(i === 0 ? { whatsapp_consent: true } : {}),
       });
       customerIds.push(id);
       counts.users += 1;

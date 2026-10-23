@@ -193,6 +193,7 @@ export const insertDraft = internalMutation({
     draftText: v.string(),
   },
   handler: async (ctx, { customerId, occasion, occasionDate, draftText }) => {
+    const customer = await ctx.db.get(customerId);
     await ctx.db.insert("ai_message_drafts", {
       customer_id: customerId,
       occasion,
@@ -200,6 +201,7 @@ export const insertDraft = internalMutation({
       draft_text: draftText,
       generated_at: Date.now(),
       status: "pending",
+      ...(customer?.boutique_id !== undefined ? { boutique_id: customer.boutique_id } : {}),
     });
   },
 });
@@ -365,6 +367,7 @@ export const insertNotification = internalMutation({
     message: v.string(),
   },
   handler: async (ctx, { customerId, occasion, occasionDate, message }) => {
+    const customer = await ctx.db.get(customerId);
     await ctx.db.insert("notifications", {
       customer_id: customerId,
       occasion,
@@ -372,6 +375,7 @@ export const insertNotification = internalMutation({
       message,
       created_at: Date.now(),
       seen: false,
+      ...(customer?.boutique_id !== undefined ? { boutique_id: customer.boutique_id } : {}),
     });
   },
 });
