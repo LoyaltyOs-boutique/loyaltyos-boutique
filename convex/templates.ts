@@ -1,8 +1,9 @@
 import { action, internalQuery } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import { put } from "@vercel/blob";
 import { internal } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
+import type { Id, Doc } from "./_generated/dataModel";
 
 /**
  * Templates section — Video/Image/PDF Send (Phase 1, structure only)
@@ -17,6 +18,19 @@ import { requireMerchantSession } from "./auth";
  */
 
 /**
+ * Multi-boutique Phase 1 — own copy of the same guard ai.ts/whatsapp.ts each
+ * keep privately: requireMerchantSession confirms the caller IS a merchant,
+ * this additionally guarantees that merchant has a boutique_id, so the
+ * uploaded media's Blob pathname can be namespaced per-boutique below.
+ */
+function requireMerchantBoutique(merchant: Doc<"users">): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
+
+/**
  * Merchant Session Lock (2026-09-01) — internal helper for
  * generateTemplateMediaUploadUrl. Actions have no ctx.db, so
  * requireMerchantSession (which needs ctx.db.get) cannot be called directly
@@ -26,12 +40,22 @@ import { requireMerchantSession } from "./auth";
  * Throws (via requireMerchantSession) rather than returning a boolean, so
  * the action's runQuery call rejects and generateTemplateMediaUploadUrl
  * never proceeds to the Blob upload for an unauthenticated/expired caller.
+ *
+ * Multi-boutique Phase 1 — also resolves the merchant's boutique_id and
+ * loads that boutique's own slug, returned so the caller can namespace the
+ * uploaded media's Blob pathname by boutique (same pattern lookbooks.ts's
+ * generatePdfUploadUrl already uses for PDFs).
  */
 export const checkMerchantSession = internalQuery({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return null;
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+
+    const boutique = await ctx.db.get(boutiqueId);
+    if (!boutique) throw new ConvexError("Not authorized");
+
+    return { boutiqueId, slug: boutique.slug };
   },
 });
 
@@ -61,7 +85,7 @@ export const generateTemplateMediaUploadUrl = action({
     contentType: v.string(),
   },
   handler: async (ctx, { userId, token, file, filename, contentType }) => {
-    await ctx.runQuery(internal.templates.checkMerchantSession, { userId, token });
+    const { slug } = await ctx.runQuery(internal.templates.checkMerchantSession, { userId, token });
 
     // Renamed from `token` to `blobToken` — the merchant session arg above
     // already owns the name `token` in this scope (same collision + same
@@ -75,7 +99,10 @@ export const generateTemplateMediaUploadUrl = action({
 
     let url: string;
     try {
-      const blob = await put(filename, file, {
+      // Multi-boutique Phase 1 — namespaced by slug, same pattern
+      // lookbooks.ts's generatePdfUploadUrl already uses for PDFs, so two
+      // boutiques uploading a same-named file can never collide/overwrite.
+      const blob = await put(`${slug}/${filename}`, file, {
         access: "public",
         token: blobToken,
         contentType,

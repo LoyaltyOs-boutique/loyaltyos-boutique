@@ -62,6 +62,9 @@ type BoutiqueSeedConfig = {
   sharedMobile: string;
   sharedName: string;
   probeValue: string;
+  /** Multi-boutique Phase 1 — fake WhatsApp creds for an optional boutique_secrets row (never real credentials). */
+  fakeAccessToken: string;
+  fakePhoneNumberId: string;
 };
 
 const BOUTIQUE_CONFIGS: BoutiqueSeedConfig[] = [
@@ -77,6 +80,8 @@ const BOUTIQUE_CONFIGS: BoutiqueSeedConfig[] = [
     sharedMobile: "0000000050",
     sharedName: `${TEST_PREFIX}Shared A`,
     probeValue: "alpha",
+    fakeAccessToken: "MBTEST-fake-token-alpha",
+    fakePhoneNumberId: "MBTEST-fake-phone-alpha",
   },
   {
     label: "Beta",
@@ -90,6 +95,8 @@ const BOUTIQUE_CONFIGS: BoutiqueSeedConfig[] = [
     sharedMobile: "0000000050",
     sharedName: `${TEST_PREFIX}Shared B`,
     probeValue: "beta",
+    fakeAccessToken: "MBTEST-fake-token-beta",
+    fakePhoneNumberId: "MBTEST-fake-phone-beta",
   },
 ];
 
@@ -97,6 +104,7 @@ const TIERS: Array<"silver" | "gold" | "platinum"> = ["silver", "gold", "platinu
 
 type SeedCounts = {
   boutiques: number;
+  boutique_secrets: number;
   users: number;
   lookbooks: number;
   catalogue_items: number;
@@ -116,6 +124,7 @@ type SeedCounts = {
 function emptyCounts(): SeedCounts {
   return {
     boutiques: 0,
+    boutique_secrets: 0,
     users: 0,
     lookbooks: 0,
     catalogue_items: 0,
@@ -140,6 +149,7 @@ async function seedOneBoutique(
   passwordHash: string,
   now: number,
   counts: SeedCounts,
+  withSecrets: boolean,
 ): Promise<void> {
   const boutiqueId = await ctx.db.insert("boutiques", {
     name: cfg.name,
@@ -152,6 +162,18 @@ async function seedOneBoutique(
     updated_at: now,
   });
   counts.boutiques += 1;
+
+  // Multi-boutique Phase 1 — optional boutique_secrets row (Spec 3.2's
+  // per-boutique WhatsApp credential table), fake/never-real values only.
+  // Never seeds any WhatsApp template settings — that stays out of scope.
+  if (withSecrets) {
+    await ctx.db.insert("boutique_secrets", {
+      boutique_id: boutiqueId,
+      whatsapp_access_token: cfg.fakeAccessToken,
+      whatsapp_phone_number_id: cfg.fakePhoneNumberId,
+    });
+    counts.boutique_secrets += 1;
+  }
 
   const merchantName = `${TEST_PREFIX}Merchant ${cfg.label}`;
   await ctx.db.insert("users", {
@@ -358,8 +380,8 @@ async function seedOneBoutique(
 }
 
 export const seedMultiBoutiqueTestData = internalMutation({
-  args: { password: v.string() },
-  handler: async (ctx, { password }) => {
+  args: { password: v.string(), withSecrets: v.optional(v.boolean()) },
+  handler: async (ctx, { password, withSecrets }) => {
     await assertSeedAllowed(ctx);
 
     if (password.length < 8) {
@@ -391,7 +413,7 @@ export const seedMultiBoutiqueTestData = internalMutation({
     const counts = emptyCounts();
     for (const cfg of BOUTIQUE_CONFIGS) {
       const isDefault = cfg.label === "Alpha" ? !defaultExists : false;
-      await seedOneBoutique(ctx, { ...cfg, isDefault }, passwordHash, now, counts);
+      await seedOneBoutique(ctx, { ...cfg, isDefault }, passwordHash, now, counts, withSecrets ?? false);
     }
     return counts;
   },

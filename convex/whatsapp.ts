@@ -1,8 +1,10 @@
 import { action, internalQuery } from "./_generated/server";
-import { v } from "convex/values";
+import type { QueryCtx } from "./_generated/server";
+import { v, ConvexError } from "convex/values";
 import { internal, api } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
-import type { Id } from "./_generated/dataModel";
+import { getDefaultBoutique } from "./boutiques";
+import type { Doc, Id } from "./_generated/dataModel";
 
 /**
  * WhatsApp Cloud API integration — Templates section (server-side send).
@@ -100,6 +102,71 @@ async function postToGraphApi(
 // ============================================================================
 
 /**
+ * Multi-boutique Phase 1 — own copy of the same guard ai.ts/templates.ts
+ * each keep privately: requireMerchantSession confirms the caller IS a
+ * merchant, this additionally guarantees that merchant has a boutique_id to
+ * scope every WhatsApp send by. Not shared/exported — each file keeps its
+ * own copy deliberately (see ai.ts's identical helper for the same
+ * reasoning).
+ */
+function requireMerchantBoutique(merchant: Doc<"users">): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
+
+/**
+ * Multi-boutique Phase 1 — per-boutique WhatsApp credential resolution.
+ * Three possible outcomes, in priority order:
+ *   1. "boutique_secrets" — this boutique has its own row in boutique_secrets
+ *      (Spec 3.2's per-boutique WhatsApp credential table) — use it.
+ *   2. "env_default" — no boutique_secrets row, but this IS the platform's
+ *      default boutique (today's live "85 Lansdowne") — fall back to the
+ *      existing process.env WHATSAPP_ACCESS_TOKEN/WHATSAPP_PHONE_NUMBER_ID,
+ *      preserving today's live behavior with zero config changes required.
+ *   3. "none" — no boutique_secrets row AND not the default boutique — this
+ *      boutique has no WhatsApp credentials configured at all.
+ *
+ * C4 (review change): the env_default branch's accessToken/phoneNumberId are
+ * typed `string | null` (straight from `?? null`, no cast) rather than cast
+ * to a non-null string — callers already guard with `if (!session.accessToken)`
+ * before using them as non-null, so the type stays honest with no cast
+ * anywhere in this file.
+ */
+type WhatsAppCredentials =
+  | { credentialSource: "boutique_secrets"; accessToken: string; phoneNumberId: string }
+  | { credentialSource: "env_default"; accessToken: string | null; phoneNumberId: string | null }
+  | { credentialSource: "none"; accessToken: null; phoneNumberId: null };
+
+async function resolveWhatsAppCredentials(
+  ctx: QueryCtx,
+  boutiqueId: Id<"boutiques">,
+): Promise<WhatsAppCredentials> {
+  const row = await ctx.db
+    .query("boutique_secrets")
+    .withIndex("by_boutique", (q) => q.eq("boutique_id", boutiqueId))
+    .first();
+
+  if (row) {
+    return {
+      credentialSource: "boutique_secrets",
+      accessToken: row.whatsapp_access_token,
+      phoneNumberId: row.whatsapp_phone_number_id,
+    };
+  }
+
+  const defaultBoutique = await getDefaultBoutique(ctx);
+  if (defaultBoutique && defaultBoutique._id === boutiqueId) {
+    const accessToken = process.env.WHATSAPP_ACCESS_TOKEN ?? null;
+    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID ?? null;
+    return { credentialSource: "env_default", accessToken, phoneNumberId };
+  }
+
+  return { credentialSource: "none", accessToken: null, phoneNumberId: null };
+}
+
+/**
  * Merchant Session Lock (2026-09-01) — internal helper shared by both actions
  * below. Actions have no ctx.db, so requireMerchantSession (which needs
  * ctx.db.get) cannot be called directly from an action — it is wrapped in
@@ -112,12 +179,25 @@ async function postToGraphApi(
  * Throws (via requireMerchantSession) rather than returning a boolean, so the
  * action's runQuery call rejects and the action never proceeds to the
  * WhatsApp Graph API call for an unauthenticated/expired caller.
+ *
+ * Multi-boutique Phase 1 — also resolves the merchant's boutique_id, loads
+ * that boutique's own slug, and resolves its WhatsApp credentials (per-
+ * boutique boutique_secrets row, or the env-var default for the platform
+ * default boutique, or none) — all in this one call, so every caller gets
+ * everything it needs without a second round-trip.
  */
 export const checkMerchantSession = internalQuery({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return null;
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+
+    const boutique = await ctx.db.get(boutiqueId);
+    if (!boutique) throw new ConvexError("Not authorized");
+
+    const creds = await resolveWhatsAppCredentials(ctx, boutiqueId);
+
+    return { boutiqueId, slug: boutique.slug, ...creds };
   },
 });
 
@@ -156,20 +236,25 @@ export const sendWhatsAppTemplateMessage = action({
     bodyParams: v.optional(v.array(v.string())),
   },
   handler: async (ctx, { userId, token, to, templateName, languageCode, imageUrl, bodyParams }) => {
-    await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+    const session = await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
 
-    // Guard-clauses — read secrets inside the handler, fail clearly if unset.
+    // Multi-boutique Phase 1 — credentials now come from the per-boutique
+    // session resolution above (boutique_secrets, or the env-var default for
+    // the platform default boutique, or none), not a direct process.env read.
+    if (session.credentialSource === "none") {
+      throw new Error("WhatsApp is not configured for this boutique.");
+    }
     // Renamed from `token` to `waAccessToken` — the merchant session arg above
     // already owns the name `token` in this scope (same collision + same fix
     // as generateTemplateMediaUploadUrl's BLOB_READ_WRITE_TOKEN var rename to
     // `blobToken` in convex/templates.ts).
-    const waAccessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    const waAccessToken = session.accessToken;
     if (!waAccessToken) {
       throw new Error(
         "[sendWhatsAppTemplateMessage] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.",
       );
     }
-    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+    const phoneNumberId = session.phoneNumberId;
     if (!phoneNumberId) {
       throw new Error(
         "[sendWhatsAppTemplateMessage] WHATSAPP_PHONE_NUMBER_ID is not set in the Convex deployment environment.",
@@ -240,17 +325,22 @@ export const sendWhatsAppServiceMessage = action({
     imageUrl: v.optional(v.string()),
   },
   handler: async (ctx, { userId, token, to, type, text, imageUrl }) => {
-    await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+    const session = await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
 
+    // Multi-boutique Phase 1 — same three-branch credential check as
+    // sendWhatsAppTemplateMessage, using this boutique's resolved session.
+    if (session.credentialSource === "none") {
+      throw new Error("WhatsApp is not configured for this boutique.");
+    }
     // Same secret-reading/guard-clause pattern as sendWhatsAppTemplateMessage.
     // Renamed from `token` to `waAccessToken` — same collision + fix as above.
-    const waAccessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+    const waAccessToken = session.accessToken;
     if (!waAccessToken) {
       throw new Error(
         "[sendWhatsAppServiceMessage] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.",
       );
     }
-    const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+    const phoneNumberId = session.phoneNumberId;
     if (!phoneNumberId) {
       throw new Error(
         "[sendWhatsAppServiceMessage] WHATSAPP_PHONE_NUMBER_ID is not set in the Convex deployment environment.",
@@ -407,14 +497,17 @@ export const sendAllUpcomingOccasionMessages = action({
     token: v.string(),
   },
   handler: async (ctx, { userId, token }) => {
-    await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+    const session = await ctx.runQuery(internal.whatsapp.checkMerchantSession, { userId, token });
+    const boutiqueId = session.boutiqueId;
 
     // Step 1 — fetch tomorrow's (days_until === 1) birthday + anniversary
     // hits via the existing no-session internal query (same one the daily
-    // AI-drafts cron already uses) — reused as-is, not duplicated.
+    // AI-drafts cron already uses) — reused as-is, not duplicated. boutiqueId
+    // is passed explicitly now so this bulk send only ever touches THIS
+    // merchant's own boutique's customers.
     const [birthdayHits, anniversaryHits] = await Promise.all([
-      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday" }),
-      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary" }),
+      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday", boutiqueId }),
+      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary", boutiqueId }),
     ]);
     const tomorrowBirthdays = birthdayHits.filter((h) => h.days_until === 1);
     const tomorrowAnniversaries = anniversaryHits.filter((h) => h.days_until === 1);
@@ -480,13 +573,15 @@ export const sendAllUpcomingOccasionMessages = action({
       try {
         // Step 3a — AI draft: combined uses the single-Gemini-call combined
         // draft, single-occasion uses the existing per-occasion draft. Both
-        // are called EXACTLY as they exist today (zero changes).
+        // are called with boutiqueId threaded through (multi-boutique Phase 1)
+        // but are otherwise EXACTLY as they exist today (zero logic changes).
         const draftText: string | null = r.combined
-          ? await ctx.runAction(internal.ai.generateCombinedMessageDraft, { customerName: r.name, tier: r.tier })
+          ? await ctx.runAction(internal.ai.generateCombinedMessageDraft, { customerName: r.name, tier: r.tier, boutiqueId })
           : await ctx.runAction(internal.ai.generateMessageDraft, {
               customerName: r.name,
               tier: r.tier,
               occasion: r.occasion as "birthday" | "anniversary",
+              boutiqueId,
             });
 
         if (!draftText) {
@@ -498,7 +593,7 @@ export const sendAllUpcomingOccasionMessages = action({
         // Step 3b — Cloud API send. Option 1 (spec): the full AI draft is the
         // template's sole body parameter — a placeholder assumption flagged
         // in the spec for whoever configures the real Meta template.
-        await postToGraphApiViaSend(r.mobile, template.name, template.language, draftText);
+        await postToGraphApiViaSend(session, r.mobile, template.name, template.language, draftText);
 
         // Step 3c — record the decision(s). Combined recipients need BOTH
         // legs recorded (mirrors the Today View combined flow, which also
@@ -574,20 +669,27 @@ export const sendAllUpcomingOccasionMessages = action({
  * function — a plain in-module async helper, called directly (no
  * ctx.runAction indirection needed since it lives in this same file and
  * shares module scope with postToGraphApi/toWaPhone/GRAPH_API_VERSION).
+ *
+ * Multi-boutique Phase 1 — `session` (the resolved WhatsApp credentials for
+ * the calling merchant's boutique, from checkMerchantSession) is now the
+ * first parameter instead of a direct process.env read, mirroring the same
+ * three-branch check the two public actions above now use.
  */
 async function postToGraphApiViaSend(
+  session: { credentialSource: "boutique_secrets" | "env_default" | "none"; accessToken: string | null; phoneNumberId: string | null },
   to: string,
   templateName: string,
   languageCode: string,
   draftText: string,
 ): Promise<{ ok: true; messageId: string }> {
-  // Secrets are re-read here (not passed in) — same "read inside the handler,
-  // never module scope" discipline as sendWhatsAppTemplateMessage above.
-  const waAccessToken = process.env.WHATSAPP_ACCESS_TOKEN;
+  if (session.credentialSource === "none") {
+    throw new Error("WhatsApp is not configured for this boutique.");
+  }
+  const waAccessToken = session.accessToken;
   if (!waAccessToken) {
     throw new Error("[sendAllUpcomingOccasionMessages] WHATSAPP_ACCESS_TOKEN is not set in the Convex deployment environment.");
   }
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const phoneNumberId = session.phoneNumberId;
   if (!phoneNumberId) {
     throw new Error("[sendAllUpcomingOccasionMessages] WHATSAPP_PHONE_NUMBER_ID is not set in the Convex deployment environment.");
   }

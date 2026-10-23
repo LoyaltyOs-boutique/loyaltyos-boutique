@@ -1,10 +1,10 @@
 import { action, internalAction, internalMutation, internalQuery, query } from "./_generated/server";
-import { v } from "convex/values";
+import { v, ConvexError } from "convex/values";
 import { internal } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
 import { SETTINGS_KEYS, type WhatsAppTemplateType } from "./settings";
-import { getDefaultBoutique } from "./boutiques";
-import type { Id } from "./_generated/dataModel";
+import { getDefaultBoutique, assertSameBoutique } from "./boutiques";
+import type { Doc, Id } from "./_generated/dataModel";
 
 /**
  * Gemini AI integration — Phase A plumbing only.
@@ -34,6 +34,10 @@ import type { Id } from "./_generated/dataModel";
  *
  * Until that env var is set, callGemini() logs a clear message and resolves
  * to { success: false } immediately — no fetch call is attempted.
+ *
+ * Multi-boutique Phase 1 note: GEMINI_API_KEY stays a single platform-wide
+ * key read from process.env exactly as today — a deliberate Phase 1
+ * decision, boutique_secrets has no Gemini field, no schema change.
  */
 
 // ============================================================================
@@ -276,6 +280,23 @@ export async function callGemini(prompt: string): Promise<GeminiResult> {
 // ============================================================================
 
 /**
+ * Multi-boutique Phase 1 — every merchant-only function in this file must
+ * act only within its own boutique. requireMerchantSession already confirms
+ * the caller IS a merchant; this helper additionally guarantees that
+ * merchant has a boutique_id to scope reads/writes by. A merchant row with
+ * no boutique_id is a data-integrity problem this task cannot fix silently —
+ * surfacing it as "Not authorized" (same message requireMerchantSession
+ * itself already uses for other auth failures) keeps the error vocabulary
+ * small and avoids leaking internal state to the caller.
+ */
+function requireMerchantBoutique(merchant: Doc<"users">): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
+
+/**
  * Merchant Session Lock (2026-09-01 pattern) — actions have no ctx.db, so
  * requireMerchantSession (which needs ctx.db.get) cannot be called directly
  * from an action. Wrapped in this internalQuery and invoked via
@@ -284,12 +305,31 @@ export async function callGemini(prompt: string): Promise<GeminiResult> {
  * rather than returning a boolean, so the action's runQuery call rejects and
  * the action never proceeds to the Gemini call for an unauthenticated or
  * expired caller.
+ *
+ * Multi-boutique Phase 1 — also resolves and returns the merchant's
+ * boutique_id so every caller can scope its subsequent reads/writes.
+ * Optional `customerId` (C1 review change): when given, this same call also
+ * performs the ownership check that a hypothetical separate
+ * "getCustomerForBoutiqueCheckInternal" query would otherwise have needed —
+ * loads the customer and asserts it belongs to the SAME boutique as the
+ * merchant, via assertSameBoutique (./boutiques), which throws the identical
+ * Error("not_found") whether the customer is missing, belongs to another
+ * boutique, or has no boutique_id at all. Keeping this in one function
+ * avoids a second requireMerchantSession call site for the same public
+ * action.
  */
 export const checkMerchantSession = internalQuery({
-  args: { userId: v.id("users"), token: v.string() },
-  handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
-    return null;
+  args: { userId: v.id("users"), token: v.string(), customerId: v.optional(v.id("users")) },
+  handler: async (ctx, { userId, token, customerId }) => {
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
+
+    if (customerId !== undefined) {
+      const customer = await ctx.db.get(customerId);
+      assertSameBoutique(customer, boutiqueId);
+    }
+
+    return { boutiqueId };
   },
 });
 
@@ -341,6 +381,30 @@ export const getWhatsAppTemplateConfigInternal = internalQuery({
 });
 
 /**
+ * getBoutiqueNameInternal — Multi-boutique Phase 1 (C2 review change). Resolves
+ * the boutique the same optional/fallback-to-default way
+ * getWhatsAppTemplateConfigInternal does, and returns the name Gemini prompts
+ * should address the boutique by, plus whether it is the platform's default
+ * boutique (today's live "85 Lansdowne").
+ *
+ * `isDefault` exists ONLY to preserve the live boutique's existing prompt
+ * wording byte-for-byte ("...a luxury fashion boutique in Kolkata.") without
+ * hardcoding "Kolkata" for every boutique on the platform. The city/location
+ * should come from real boutique data once a future phase (Phase 5) adds a
+ * location field — for now this is a deliberate, narrowly-scoped stand-in.
+ */
+export const getBoutiqueNameInternal = internalQuery({
+  args: { boutiqueId: v.optional(v.id("boutiques")) },
+  handler: async (ctx, { boutiqueId }): Promise<{ name: string; isDefault: boolean } | null> => {
+    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
+    if (!resolvedBoutiqueId) return null;
+    const boutique = await ctx.db.get(resolvedBoutiqueId);
+    if (!boutique) return null;
+    return { name: boutique.name, isDefault: boutique.is_default };
+  },
+});
+
+/**
  * generateMessageDraft — Phase 3 Feature A. Builds a Gemini prompt for one
  * customer's upcoming birthday/anniversary and returns the drafted message
  * text, or null on ANY failure (never throws — matches Phase 2's
@@ -363,8 +427,9 @@ export const generateMessageDraft = internalAction({
     customerName: v.string(),
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
+    boutiqueId: v.optional(v.id("boutiques")),
   },
-  handler: async (ctx, { customerName, tier, occasion }): Promise<string | null> => {
+  handler: async (ctx, { customerName, tier, occasion, boutiqueId }): Promise<string | null> => {
     // Promo context — merchant's configured Discount/Coupon/Valid-Days for
     // this occasion type, read via the internal (no-session) settings path
     // above. Empty strings are a valid "not configured" state (matches
@@ -372,6 +437,7 @@ export const generateMessageDraft = internalAction({
     // simply omits a promo line when none of the three fields are filled in.
     const promo = await ctx.runQuery(internal.ai.getWhatsAppTemplateConfigInternal, {
       type: occasion,
+      boutiqueId,
     });
 
     const hasPromo = Boolean(promo.discountPercent || promo.couponCode || promo.validDays);
@@ -380,6 +446,14 @@ export const generateMessageDraft = internalAction({
       : "";
 
     const occasionLabel = occasion === "birthday" ? "birthday" : "wedding anniversary";
+
+    // Multi-boutique Phase 1 (C2) — resolve the boutique's display name +
+    // whether it is the platform default, so the prompt's opening line stays
+    // byte-identical for the live "85 Lansdowne" boutique while still
+    // generalizing correctly for any other boutique.
+    const boutiqueInfo = await ctx.runQuery(internal.ai.getBoutiqueNameInternal, { boutiqueId });
+    const safeBoutiqueName = truncateForPrompt(boutiqueInfo?.name ?? "our boutique", PROMPT_FIELD_MAX.NAME);
+    const isDefault = boutiqueInfo?.isDefault ?? false;
 
     // Truncate every free-text field at the point of use — DB values are
     // untouched, only this local prompt-building copy is capped.
@@ -393,7 +467,7 @@ export const generateMessageDraft = internalAction({
     // delimited data block. Nothing here interleaves free text into the
     // instruction sentences themselves.
     const prompt = [
-      `You are writing a short, warm WhatsApp message on behalf of "85 Lansdowne", a luxury fashion boutique in Kolkata.`,
+      `You are writing a short, warm WhatsApp message on behalf of "${safeBoutiqueName}", a luxury fashion boutique${isDefault ? " in Kolkata" : ""}.`,
       `Write a warm, on-brand, personal-sounding ${occasionLabel} message for the customer described in the DATA section below (2-4 sentences, no emoji overload, luxury tone, not generic/spammy). Address the customer by the name given in the DATA section and naturally reflect their tier and occasion.`,
       promoLine,
       `Return ONLY the message text — no preamble, no quotation marks, no explanation.`,
@@ -475,7 +549,10 @@ export const generateMessageDraftPublic = action({
     ctx,
     { userId, token, customerId, customerName, tier, occasion, occasionDate, forceRegenerate },
   ): Promise<string | null> => {
-    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+    // Multi-boutique Phase 1 (C1) — one checkMerchantSession call does both
+    // the merchant-session check AND the customer-ownership check (passing
+    // customerId), instead of a second separate internalQuery.
+    const { boutiqueId } = await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token, customerId });
 
     // Step 1 — cache check FIRST, no Gemini call on a hit. Skipped entirely
     // when forceRegenerate is set (the Regenerate control wants a fresh draft).
@@ -494,6 +571,7 @@ export const generateMessageDraftPublic = action({
       customerName,
       tier,
       occasion,
+      boutiqueId,
     });
 
     // Step 4 — a real Gemini failure must NOT be cached (see doc comment above).
@@ -511,6 +589,7 @@ export const generateMessageDraftPublic = action({
         occasion,
         occasionDate,
         draftText,
+        boutiqueId,
       });
     } else {
       await ctx.runMutation(internal.crons.insertDraft, {
@@ -547,12 +626,13 @@ export const overwriteCachedDraft = internalMutation({
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasionDate: v.string(),
     draftText: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { customerId, occasion, occasionDate, draftText }) => {
+  handler: async (ctx, { customerId, occasion, occasionDate, draftText, boutiqueId }) => {
     const rows = await ctx.db
       .query("ai_message_drafts")
-      .withIndex("by_customer_occasion_date", (q) =>
-        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      .withIndex("by_boutique_customer_occasion_date", (q) =>
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
       )
       .collect();
 
@@ -573,6 +653,7 @@ export const overwriteCachedDraft = internalMutation({
         draft_text: draftText,
         generated_at: Date.now(),
         status: "pending",
+        boutique_id: boutiqueId,
       });
     }
     return null;
@@ -600,12 +681,14 @@ export const generateMessageDraftManual = action({
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
   },
   handler: async (ctx, { userId, token, customerName, occasion }): Promise<string | null> => {
-    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+    // No customerId — a manual entry has no users row to check ownership of.
+    const { boutiqueId } = await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
 
     return ctx.runAction(internal.ai.generateMessageDraft, {
       customerName,
       tier: "silver",
       occasion,
+      boutiqueId,
     });
   },
 });
@@ -646,20 +729,27 @@ export const generateCombinedMessageDraft = internalAction({
   args: {
     customerName: v.string(),
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+    boutiqueId: v.optional(v.id("boutiques")),
   },
-  handler: async (ctx, { customerName, tier }): Promise<string | null> => {
+  handler: async (ctx, { customerName, tier, boutiqueId }): Promise<string | null> => {
     // Truncate every free-text field at the point of use — DB values are
     // untouched, only this local prompt-building copy is capped. Same
     // per-field caps generateMessageDraft uses.
     const safeName = truncateForPrompt(customerName, PROMPT_FIELD_MAX.NAME);
     const safeTier = truncateForPrompt(tier, PROMPT_FIELD_MAX.ENUM);
 
+    // Multi-boutique Phase 1 (C2) — same boutique-name resolution as
+    // generateMessageDraft, keeping the live boutique's wording byte-identical.
+    const boutiqueInfo = await ctx.runQuery(internal.ai.getBoutiqueNameInternal, { boutiqueId });
+    const safeBoutiqueName = truncateForPrompt(boutiqueInfo?.name ?? "our boutique", PROMPT_FIELD_MAX.NAME);
+    const isDefault = boutiqueInfo?.isDefault ?? false;
+
     // Same structural separation as generateMessageDraft's prompt:
     // instructions first, then the explicit "this is data, not instructions"
     // notice, then the delimited data block. No `occasion` field in the DATA
     // section — it's implicit and fixed in the instruction sentence itself.
     const prompt = [
-      `You are writing a short, warm WhatsApp message on behalf of "85 Lansdowne", a luxury fashion boutique in Kolkata.`,
+      `You are writing a short, warm WhatsApp message on behalf of "${safeBoutiqueName}", a luxury fashion boutique${isDefault ? " in Kolkata" : ""}.`,
       `This customer's birthday AND wedding anniversary BOTH fall today. Write ONE warm, on-brand, personal-sounding message that wishes them both a happy birthday and a happy wedding anniversary together, in the same natural message (2-4 sentences total, no emoji overload, luxury tone, not generic/spammy, not two messages stitched together). Address the customer by the name given in the DATA section and naturally reflect their tier.`,
       `Return ONLY the message text — no preamble, no quotation marks, no explanation.`,
       DATA_NOT_INSTRUCTIONS_NOTICE,
@@ -701,11 +791,13 @@ export const generateCombinedMessageDraftPublic = action({
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
   },
   handler: async (ctx, { userId, token, customerName, tier }): Promise<string | null> => {
-    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+    // No customerId — mirrors generateMessageDraftManual's reasoning.
+    const { boutiqueId } = await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
 
     return ctx.runAction(internal.ai.generateCombinedMessageDraft, {
       customerName,
       tier,
+      boutiqueId,
     });
   },
 });
@@ -769,12 +861,12 @@ const SEVEN_DAYS_MS_AI = 7 * 24 * 60 * 60 * 1000;
  * underlying catalogue_item_id/lookbook_id detail.
  */
 export const getRecentActivityCountsInternal = internalQuery({
-  args: { customerId: v.id("users"), sinceMs: v.number() },
-  handler: async (ctx, { customerId, sinceMs }) => {
+  args: { customerId: v.id("users"), sinceMs: v.number(), boutiqueId: v.id("boutiques") },
+  handler: async (ctx, { customerId, sinceMs, boutiqueId }) => {
     const rows = await ctx.db
       .query("customer_activity_events")
-      .withIndex("by_customer_created_at", (q) =>
-        q.eq("customer_id", customerId).gte("created_at", sinceMs),
+      .withIndex("by_boutique_customer_created_at", (q) =>
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).gte("created_at", sinceMs),
       )
       .collect();
 
@@ -813,11 +905,11 @@ export const getRecentActivityCountsInternal = internalQuery({
  * same way generateMessageDraft already handles it below.
  */
 export const getPurchaseSummaryInternal = internalQuery({
-  args: { customerId: v.id("users") },
-  handler: async (ctx, { customerId }) => {
+  args: { customerId: v.id("users"), boutiqueId: v.id("boutiques") },
+  handler: async (ctx, { customerId, boutiqueId }) => {
     const orders = await ctx.db
       .query("orders")
-      .withIndex("by_user", (q) => q.eq("user_id", customerId))
+      .withIndex("by_boutique_user", (q) => q.eq("boutique_id", boutiqueId).eq("user_id", customerId))
       .collect();
     const totalSpendPaise = orders.reduce((sum, o) => sum + o.final_total, 0);
     return { orderCount: orders.length, totalSpendPaise };
@@ -851,16 +943,29 @@ export const generateCustomerActivitySummary = internalAction({
     customerId: v.id("users"),
     customerName: v.string(),
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
+    boutiqueId: v.optional(v.id("boutiques")),
   },
-  handler: async (ctx, { customerId, customerName, tier }): Promise<string | null> => {
+  handler: async (ctx, { customerId, customerName, tier, boutiqueId }): Promise<string | null> => {
+    // Multi-boutique Phase 1 — resolve once to the default boutique when no
+    // explicit boutiqueId is supplied (crons.ts has no per-boutique loop yet).
+    // If nothing resolves at all (no boutiqueId AND no default boutique
+    // exists), fail gracefully with null — matches this function's existing
+    // "null on any failure" contract, same as a Gemini failure would.
+    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
+    if (!resolvedBoutiqueId) return null;
+
     // Aggregate activity picture — last 7 days, indexed per-customer read.
     const activity = await ctx.runQuery(internal.ai.getRecentActivityCountsInternal, {
       customerId,
       sinceMs: Date.now() - SEVEN_DAYS_MS_AI,
+      boutiqueId: resolvedBoutiqueId,
     });
 
     // Purchase-history aggregate — read directly from `orders`, not duplicated.
-    const purchases = await ctx.runQuery(internal.ai.getPurchaseSummaryInternal, { customerId });
+    const purchases = await ctx.runQuery(internal.ai.getPurchaseSummaryInternal, {
+      customerId,
+      boutiqueId: resolvedBoutiqueId,
+    });
     const totalSpendRupees = Math.floor(purchases.totalSpendPaise / 100);
 
     // Truncate every free-text field at the point of use — same discipline
@@ -869,6 +974,12 @@ export const generateCustomerActivitySummary = internalAction({
     // "defense in depth" reasoning for ENUM fields).
     const safeName = truncateForPrompt(customerName, PROMPT_FIELD_MAX.NAME);
     const safeTier = truncateForPrompt(tier, PROMPT_FIELD_MAX.ENUM);
+
+    // Multi-boutique Phase 1 (C2) — same boutique-name resolution as
+    // generateMessageDraft, keeping the live boutique's wording byte-identical.
+    const boutiqueInfo = await ctx.runQuery(internal.ai.getBoutiqueNameInternal, { boutiqueId: resolvedBoutiqueId });
+    const safeBoutiqueName = truncateForPrompt(boutiqueInfo?.name ?? "our boutique", PROMPT_FIELD_MAX.NAME);
+    const isDefault = boutiqueInfo?.isDefault ?? false;
 
     // Activity/purchase counts are all plain numbers computed server-side
     // (never user-supplied free text), so they are interpolated directly —
@@ -883,7 +994,7 @@ export const generateCustomerActivitySummary = internalAction({
         : `Purchase history: no orders yet.`;
 
     const prompt = [
-      `You are writing a short, internal note for the staff of "85 Lansdowne", a luxury fashion boutique in Kolkata, about one of their loyalty customers.`,
+      `You are writing a short, internal note for the staff of "${safeBoutiqueName}", a luxury fashion boutique${isDefault ? " in Kolkata" : ""}, about one of their loyalty customers.`,
       `Write a brief (2-3 sentences), factual, merchant-facing summary of this customer's recent engagement and purchase history, in a professional tone. This note is for STAFF EYES ONLY — it will never be sent to the customer, so do not address them directly or write it as a message to them.`,
       `Base the summary ONLY on the DATA section below (the customer's name/tier and the activity/purchase figures) — do not invent details not present in the data.`,
       `Return ONLY the summary text — no preamble, no quotation marks, no explanation.`,
@@ -908,22 +1019,35 @@ export const generateCustomerActivitySummary = internalAction({
 /**
  * upsertActivitySummary — internal mutation, one row PER CUSTOMER in
  * customer_activity_summaries: patches the existing row if one exists for
- * this customer_id (queried via the by_customer index, never a scan),
- * otherwise inserts a new one. Matches schema.ts's own "upserted, never
- * accumulated as history" comment on that table.
+ * this customer_id (queried via the by_boutique_customer index, never a
+ * scan), otherwise inserts a new one. Matches schema.ts's own "upserted,
+ * never accumulated as history" comment on that table.
  *
  * Called only from crons.ts's generateDailyActivitySummaries, once per
  * active customer, after a non-null generateCustomerActivitySummary result.
+ *
+ * Multi-boutique Phase 1 (C3) — resolves to the default boutique when no
+ * explicit boutiqueId is supplied. If NEITHER resolves (no boutiqueId AND no
+ * default boutique exists), returns null IMMEDIATELY — no read, no write of
+ * any kind. This is deliberate: there is no safe, honest boutique_id to
+ * stamp on an insert in that case, so the function does nothing rather than
+ * guessing or casting an undefined value into the id type.
  */
 export const upsertActivitySummary = internalMutation({
   args: {
     customerId: v.id("users"),
     summaryText: v.string(),
+    boutiqueId: v.optional(v.id("boutiques")),
   },
-  handler: async (ctx, { customerId, summaryText }) => {
+  handler: async (ctx, { customerId, summaryText, boutiqueId }) => {
+    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
+    if (!resolvedBoutiqueId) return null;
+
     const existing = await ctx.db
       .query("customer_activity_summaries")
-      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .withIndex("by_boutique_customer", (q) =>
+        q.eq("boutique_id", resolvedBoutiqueId).eq("customer_id", customerId),
+      )
       .first();
 
     if (existing) {
@@ -936,6 +1060,7 @@ export const upsertActivitySummary = internalMutation({
         customer_id: customerId,
         summary_text: summaryText,
         generated_at: Date.now(),
+        boutique_id: resolvedBoutiqueId,
       });
     }
     return null;
@@ -970,12 +1095,13 @@ export const getActiveCustomers = query({
     ctx,
     { userId, token, days },
   ): Promise<Array<{ customerId: Id<"users">; name: string; activityCount: number; latestSummary: string | null }>> => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const since = Date.now() - (days ?? 7) * 24 * 60 * 60 * 1000;
     const events = await ctx.db
       .query("customer_activity_events")
-      .withIndex("by_created_at", (q) => q.gte("created_at", since))
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId).gte("created_at", since))
       .collect();
 
     // Group + count in memory — bounded by one window's event volume, not
@@ -993,7 +1119,7 @@ export const getActiveCustomers = query({
 
       const summaryRow = await ctx.db
         .query("customer_activity_summaries")
-        .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+        .withIndex("by_boutique_customer", (q) => q.eq("boutique_id", boutiqueId).eq("customer_id", customerId))
         .first();
 
       results.push({
@@ -1040,11 +1166,11 @@ const ACTIVITY_SUMMARY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
  * established for the sibling draft-cache feature.
  */
 export const getCachedActivitySummaryInternal = internalQuery({
-  args: { customerId: v.id("users") },
-  handler: async (ctx, { customerId }): Promise<{ summaryText: string; generatedAt: number } | null> => {
+  args: { customerId: v.id("users"), boutiqueId: v.id("boutiques") },
+  handler: async (ctx, { customerId, boutiqueId }): Promise<{ summaryText: string; generatedAt: number } | null> => {
     const row = await ctx.db
       .query("customer_activity_summaries")
-      .withIndex("by_customer", (q) => q.eq("customer_id", customerId))
+      .withIndex("by_boutique_customer", (q) => q.eq("boutique_id", boutiqueId).eq("customer_id", customerId))
       .first();
     if (!row) return null;
     return { summaryText: row.summary_text, generatedAt: row.generated_at };
@@ -1093,11 +1219,13 @@ export const generateActivitySummaryPublic = action({
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
   },
   handler: async (ctx, { userId, token, customerId, customerName, tier }): Promise<string | null> => {
-    await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token });
+    // Multi-boutique Phase 1 (C1) — one checkMerchantSession call does both
+    // the merchant-session check AND the customer-ownership check.
+    const { boutiqueId } = await ctx.runQuery(internal.ai.checkMerchantSession, { userId, token, customerId });
 
     // Step 2 — cache check FIRST, with an explicit 24h staleness check (no
     // tuple identity to lean on here, unlike the draft cache).
-    const cached = await ctx.runQuery(internal.ai.getCachedActivitySummaryInternal, { customerId });
+    const cached = await ctx.runQuery(internal.ai.getCachedActivitySummaryInternal, { customerId, boutiqueId });
     if (cached && Date.now() - cached.generatedAt < ACTIVITY_SUMMARY_CACHE_TTL_MS) {
       return cached.summaryText;
     }
@@ -1108,6 +1236,7 @@ export const generateActivitySummaryPublic = action({
       customerId,
       customerName,
       tier,
+      boutiqueId,
     });
 
     // Step 5 — a real Gemini failure must NOT be cached (see doc comment above).
@@ -1115,7 +1244,7 @@ export const generateActivitySummaryPublic = action({
 
     // Step 4 — cache the fresh summary (upsert correctly overwrites any
     // existing stale row) before returning it.
-    await ctx.runMutation(internal.ai.upsertActivitySummary, { customerId, summaryText });
+    await ctx.runMutation(internal.ai.upsertActivitySummary, { customerId, summaryText, boutiqueId });
 
     return summaryText;
   },
