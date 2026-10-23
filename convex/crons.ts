@@ -2,6 +2,7 @@ import { cronJobs } from "convex/server";
 import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { internalAction, internalMutation, internalQuery } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 
 /**
  * LoyaltyOS Boutique — Daily AI WhatsApp draft-generation cron (Phase 3, Feature A).
@@ -121,12 +122,13 @@ export const hasExistingDraft = internalQuery({
     customerId: v.id("users"),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasionDate: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { customerId, occasion, occasionDate }) => {
+  handler: async (ctx, { customerId, occasion, occasionDate, boutiqueId }) => {
     const rows = await ctx.db
       .query("ai_message_drafts")
-      .withIndex("by_customer_occasion_date", (q) =>
-        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      .withIndex("by_boutique_customer_occasion_date", (q) =>
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
       )
       .collect();
     return rows.some((r) => r.status !== "discarded");
@@ -157,12 +159,13 @@ export const getCachedDraftTextInternal = internalQuery({
     customerId: v.id("users"),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasionDate: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { customerId, occasion, occasionDate }): Promise<string | null> => {
+  handler: async (ctx, { customerId, occasion, occasionDate, boutiqueId }): Promise<string | null> => {
     const rows = await ctx.db
       .query("ai_message_drafts")
-      .withIndex("by_customer_occasion_date", (q) =>
-        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      .withIndex("by_boutique_customer_occasion_date", (q) =>
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
       )
       .collect();
 
@@ -191,9 +194,9 @@ export const insertDraft = internalMutation({
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
     occasionDate: v.string(),
     draftText: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { customerId, occasion, occasionDate, draftText }) => {
-    const customer = await ctx.db.get(customerId);
+  handler: async (ctx, { customerId, occasion, occasionDate, draftText, boutiqueId }) => {
     await ctx.db.insert("ai_message_drafts", {
       customer_id: customerId,
       occasion,
@@ -201,7 +204,7 @@ export const insertDraft = internalMutation({
       draft_text: draftText,
       generated_at: Date.now(),
       status: "pending",
-      ...(customer?.boutique_id !== undefined ? { boutique_id: customer.boutique_id } : {}),
+      boutique_id: boutiqueId,
     });
   },
 });
@@ -241,67 +244,87 @@ type EligibleCustomer = {
 export const generateDailyDrafts = internalAction({
   args: {},
   handler: async (ctx): Promise<{ scanned: number; eligible: number; drafted: number }> => {
-    // Step 1 — indexed, tomorrow-only candidate fetch (matches the existing
-    // "tomorrow" tabs' window in Customers.jsx: days_until === 1).
-    const [birthdayHits, anniversaryHits] = await Promise.all([
-      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday" }),
-      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary" }),
-    ]);
+    let totalScanned = 0;
+    let totalEligible = 0;
+    let totalDrafted = 0;
 
-    const candidates: Array<{ hit: EligibleCustomer; occasion: "birthday" | "anniversary" }> = [
-      ...birthdayHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "birthday" as const })),
-      ...anniversaryHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "anniversary" as const })),
-    ].filter(({ hit }) => hit.days_until === 1);
+    // Multi-boutique Phase 1 — every step below is unchanged per-boutique
+    // logic, now run once per active boutique instead of once globally.
+    // NOTE: revisit this loop's wall-clock cost (Convex action time limit)
+    // once more than a handful of boutiques are onboarded — see the same
+    // note on generateDailyNotifications below; not repeated on every loop.
+    for (const boutique of await ctx.runQuery(internal.crons.listActiveBoutiquesInternal, {})) {
+      const boutiqueId = boutique._id;
 
-    let eligibleCount = 0;
-    let draftedCount = 0;
+      // Step 1 — indexed, tomorrow-only candidate fetch (matches the existing
+      // "tomorrow" tabs' window in Customers.jsx: days_until === 1).
+      const [birthdayHits, anniversaryHits] = await Promise.all([
+        ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday", boutiqueId }),
+        ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary", boutiqueId }),
+      ]);
 
-    for (const { hit, occasion } of candidates) {
-      // Step 2 — consent gate BEFORE any Gemini call. A customer without
-      // whatsapp_consent is skipped here, before generateMessageDraft is
-      // ever invoked for them — no Gemini call is attempted.
-      if (hit.whatsapp_consent !== true) continue;
-      if (!hit.occasion_date) continue; // defensive — should never happen, see findUpcomingInternal's comment
+      const candidates: Array<{ hit: EligibleCustomer; occasion: "birthday" | "anniversary" }> = [
+        ...birthdayHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "birthday" as const })),
+        ...anniversaryHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "anniversary" as const })),
+      ].filter(({ hit }) => hit.days_until === 1);
 
-      eligibleCount += 1;
+      let eligibleCount = 0;
+      let draftedCount = 0;
 
-      // Step 3 — duplicate-prevention via the by_customer_occasion_date
-      // index: skip if a draft already exists for this exact tuple, so
-      // re-running the cron never regenerates/duplicates.
-      const alreadyHasDraft = await ctx.runQuery(internal.crons.hasExistingDraft, {
-        customerId: hit._id,
-        occasion,
-        occasionDate: hit.occasion_date,
-      });
-      if (alreadyHasDraft) continue;
+      for (const { hit, occasion } of candidates) {
+        // Step 2 — consent gate BEFORE any Gemini call. A customer without
+        // whatsapp_consent is skipped here, before generateMessageDraft is
+        // ever invoked for them — no Gemini call is attempted.
+        if (hit.whatsapp_consent !== true) continue;
+        if (!hit.occasion_date) continue; // defensive — should never happen, see findUpcomingInternal's comment
 
-      // Step 4 — cap: stop generating new drafts once this run's batch limit
-      // is reached, per §7's "capped batch per run" scalability principle
-      // (eligibility is still counted above, for observability).
-      if (draftedCount >= MAX_DRAFTS_PER_RUN) continue;
+        eligibleCount += 1;
 
-      const draftText: string | null = await ctx.runAction(internal.ai.generateMessageDraft, {
-        customerName: hit.name,
-        tier: hit.tier,
-        occasion,
-      });
-
-      if (draftText) {
-        await ctx.runMutation(internal.crons.insertDraft, {
+        // Step 3 — duplicate-prevention via the by_customer_occasion_date
+        // index: skip if a draft already exists for this exact tuple, so
+        // re-running the cron never regenerates/duplicates.
+        const alreadyHasDraft = await ctx.runQuery(internal.crons.hasExistingDraft, {
           customerId: hit._id,
           occasion,
           occasionDate: hit.occasion_date,
-          draftText,
+          boutiqueId,
         });
-        draftedCount += 1;
+        if (alreadyHasDraft) continue;
+
+        // Step 4 — cap: stop generating new drafts once this run's batch limit
+        // is reached, per §7's "capped batch per run" scalability principle
+        // (eligibility is still counted above, for observability).
+        if (draftedCount >= MAX_DRAFTS_PER_RUN) continue;
+
+        const draftText: string | null = await ctx.runAction(internal.ai.generateMessageDraft, {
+          customerName: hit.name,
+          tier: hit.tier,
+          occasion,
+          boutiqueId,
+        });
+
+        if (draftText) {
+          await ctx.runMutation(internal.crons.insertDraft, {
+            customerId: hit._id,
+            occasion,
+            occasionDate: hit.occasion_date,
+            draftText,
+            boutiqueId,
+          });
+          draftedCount += 1;
+        }
+
+        // Pacing — sequential, spaced-out Gemini calls (see SECTION 1's
+        // documented judgment call), not a tight concurrent/back-to-back loop.
+        await delay(GEMINI_CALL_DELAY_MS);
       }
 
-      // Pacing — sequential, spaced-out Gemini calls (see SECTION 1's
-      // documented judgment call), not a tight concurrent/back-to-back loop.
-      await delay(GEMINI_CALL_DELAY_MS);
+      totalScanned += candidates.length;
+      totalEligible += eligibleCount;
+      totalDrafted += draftedCount;
     }
 
-    return { scanned: candidates.length, eligible: eligibleCount, drafted: draftedCount };
+    return { scanned: totalScanned, eligible: totalEligible, drafted: totalDrafted };
   },
 });
 
@@ -340,12 +363,13 @@ export const hasExistingNotification = internalQuery({
     // the sole new caller that passes "weekly_activity".
     occasion: v.union(v.literal("birthday"), v.literal("anniversary"), v.literal("weekly_activity")),
     occasionDate: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { customerId, occasion, occasionDate }) => {
+  handler: async (ctx, { customerId, occasion, occasionDate, boutiqueId }) => {
     const existing = await ctx.db
       .query("notifications")
-      .withIndex("by_customer_occasion_date", (q) =>
-        q.eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
+      .withIndex("by_boutique_customer_occasion_date", (q) =>
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId).eq("occasion", occasion).eq("occasion_date", occasionDate),
       )
       .first();
     return existing !== null;
@@ -365,9 +389,9 @@ export const insertNotification = internalMutation({
     occasion: v.union(v.literal("birthday"), v.literal("anniversary"), v.literal("weekly_activity")),
     occasionDate: v.string(),
     message: v.string(),
+    boutiqueId: v.id("boutiques"),
   },
-  handler: async (ctx, { customerId, occasion, occasionDate, message }) => {
-    const customer = await ctx.db.get(customerId);
+  handler: async (ctx, { customerId, occasion, occasionDate, message, boutiqueId }) => {
     await ctx.db.insert("notifications", {
       customer_id: customerId,
       occasion,
@@ -375,7 +399,7 @@ export const insertNotification = internalMutation({
       message,
       created_at: Date.now(),
       seen: false,
-      ...(customer?.boutique_id !== undefined ? { boutique_id: customer.boutique_id } : {}),
+      boutique_id: boutiqueId,
     });
   },
 });
@@ -385,6 +409,13 @@ export const insertNotification = internalMutation({
  * days. Range-reads via by_created_at (no full-table scan) and deletes each
  * match. Run once at the end of generateDailyNotifications — this is the
  * feature's "auto-expiry, no separate cron needed" mechanism.
+ *
+ * Multi-boutique Phase 1 — deliberately stays GLOBAL (unscoped by
+ * boutique_id), unlike every other function in this file: it's a pure
+ * age-based cleanup, the same 30-day rule applies identically to every
+ * boutique, it returns nothing to any caller, and a boutique's own rows are
+ * never mixed into another boutique's data by this delete — so there is no
+ * cross-boutique data exposure here to fix.
  */
 export const deleteExpiredNotifications = internalMutation({
   args: {},
@@ -420,46 +451,63 @@ export const deleteExpiredNotifications = internalMutation({
 export const generateDailyNotifications = internalAction({
   args: {},
   handler: async (ctx): Promise<{ scanned: number; created: number; expiredDeleted: number }> => {
-    // Step 1 — same indexed, tomorrow-only candidate fetch generateDailyDrafts uses.
-    const [birthdayHits, anniversaryHits] = await Promise.all([
-      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday" }),
-      ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary" }),
-    ]);
+    let totalScanned = 0;
+    let totalCreated = 0;
 
-    const candidates: Array<{ hit: EligibleCustomer; occasion: "birthday" | "anniversary" }> = [
-      ...birthdayHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "birthday" as const })),
-      ...anniversaryHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "anniversary" as const })),
-    ].filter(({ hit }) => hit.days_until === 1);
+    // Multi-boutique Phase 1 — every step below is unchanged per-boutique
+    // logic, now run once per active boutique instead of once globally.
+    // NOTE: revisit this loop's wall-clock cost (Convex action time limit)
+    // once more than a handful of boutiques are onboarded.
+    for (const boutique of await ctx.runQuery(internal.crons.listActiveBoutiquesInternal, {})) {
+      const boutiqueId = boutique._id;
 
-    let createdCount = 0;
+      // Step 1 — same indexed, tomorrow-only candidate fetch generateDailyDrafts uses.
+      const [birthdayHits, anniversaryHits] = await Promise.all([
+        ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "birthday", boutiqueId }),
+        ctx.runQuery(internal.customers.findUpcomingInternal, { days: 1, field: "anniversary", boutiqueId }),
+      ]);
 
-    for (const { hit, occasion } of candidates) {
-      if (!hit.occasion_date) continue; // defensive — should never happen, see findUpcomingInternal's comment
+      const candidates: Array<{ hit: EligibleCustomer; occasion: "birthday" | "anniversary" }> = [
+        ...birthdayHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "birthday" as const })),
+        ...anniversaryHits.map((h) => ({ hit: h as EligibleCustomer, occasion: "anniversary" as const })),
+      ].filter(({ hit }) => hit.days_until === 1);
 
-      // Step 3 — duplicate-prevention via the by_customer_occasion_date index.
-      const alreadyExists = await ctx.runQuery(internal.crons.hasExistingNotification, {
-        customerId: hit._id,
-        occasion,
-        occasionDate: hit.occasion_date,
-      });
-      if (alreadyExists) continue;
+      let createdCount = 0;
 
-      // Step 4 — generic, non-AI message string.
-      const message = `${hit.name}'s ${occasion} is tomorrow!`;
+      for (const { hit, occasion } of candidates) {
+        if (!hit.occasion_date) continue; // defensive — should never happen, see findUpcomingInternal's comment
 
-      await ctx.runMutation(internal.crons.insertNotification, {
-        customerId: hit._id,
-        occasion,
-        occasionDate: hit.occasion_date,
-        message,
-      });
-      createdCount += 1;
+        // Step 3 — duplicate-prevention via the by_customer_occasion_date index.
+        const alreadyExists = await ctx.runQuery(internal.crons.hasExistingNotification, {
+          customerId: hit._id,
+          occasion,
+          occasionDate: hit.occasion_date,
+          boutiqueId,
+        });
+        if (alreadyExists) continue;
+
+        // Step 4 — generic, non-AI message string.
+        const message = `${hit.name}'s ${occasion} is tomorrow!`;
+
+        await ctx.runMutation(internal.crons.insertNotification, {
+          customerId: hit._id,
+          occasion,
+          occasionDate: hit.occasion_date,
+          message,
+          boutiqueId,
+        });
+        createdCount += 1;
+      }
+
+      totalScanned += candidates.length;
+      totalCreated += createdCount;
     }
 
-    // Step 5 — sweep expired rows once at the end of this run.
+    // Step 5 — sweep expired rows once at the end of this run (global, see
+    // deleteExpiredNotifications' own doc comment — unchanged, called once).
     const { deleted: expiredDeleted } = await ctx.runMutation(internal.crons.deleteExpiredNotifications, {});
 
-    return { scanned: candidates.length, created: createdCount, expiredDeleted };
+    return { scanned: totalScanned, created: totalCreated, expiredDeleted };
   },
 });
 
@@ -522,11 +570,11 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
  * with zero extra code once that tracking is wired up.
  */
 export const getRecentActivityCustomerIdsInternal = internalQuery({
-  args: { sinceMs: v.number() },
-  handler: async (ctx, { sinceMs }) => {
+  args: { sinceMs: v.number(), boutiqueId: v.id("boutiques") },
+  handler: async (ctx, { sinceMs, boutiqueId }) => {
     const rows = await ctx.db
       .query("customer_activity_events")
-      .withIndex("by_created_at", (q) => q.gte("created_at", sinceMs))
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId).gte("created_at", sinceMs))
       .collect();
     return rows.map((r) => r.customer_id);
   },
@@ -575,64 +623,81 @@ export const getCustomerNameInternal = internalQuery({
 export const generateWeeklyActivityNotifications = internalAction({
   args: {},
   handler: async (ctx): Promise<{ activeCustomers: number; notified: number }> => {
-    // Step 1 — indexed 7-day global read, then group+count in memory (bounded
-    // by one week's event volume, not the full table).
-    const customerIds = await ctx.runQuery(internal.crons.getRecentActivityCustomerIdsInternal, {
-      sinceMs: Date.now() - SEVEN_DAYS_MS,
-    });
+    let totalActiveCustomers = 0;
+    let totalNotified = 0;
 
-    const countByCustomer = new Map<string, number>();
-    for (const id of customerIds) {
-      countByCustomer.set(id, (countByCustomer.get(id) ?? 0) + 1);
+    // Multi-boutique Phase 1 — every step below is unchanged per-boutique
+    // logic, now run once per active boutique instead of once globally.
+    // NOTE: revisit this loop's wall-clock cost (Convex action time limit)
+    // once more than a handful of boutiques are onboarded.
+    for (const boutique of await ctx.runQuery(internal.crons.listActiveBoutiquesInternal, {})) {
+      const boutiqueId = boutique._id;
+
+      // Step 1 — indexed 7-day global read, then group+count in memory (bounded
+      // by one week's event volume, not the full table).
+      const customerIds = await ctx.runQuery(internal.crons.getRecentActivityCustomerIdsInternal, {
+        sinceMs: Date.now() - SEVEN_DAYS_MS,
+        boutiqueId,
+      });
+
+      const countByCustomer = new Map<string, number>();
+      for (const id of customerIds) {
+        countByCustomer.set(id, (countByCustomer.get(id) ?? 0) + 1);
+      }
+
+      // Step 2 — sort most-active-first, cap to the top N.
+      const topActive = Array.from(countByCustomer.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, MAX_WEEKLY_ACTIVE_NOTIFICATIONS);
+
+      // Step 3 — this week's Monday, "M-D" format (matches parseMD's format
+      // used by birthday/anniversary occasion_date elsewhere in this file).
+      const now = new Date();
+      const dayOfWeek = now.getUTCDay(); // 0=Sunday..6=Saturday
+      const diffToMonday = (dayOfWeek + 6) % 7; // days since most recent Monday
+      const monday = new Date(now.getTime() - diffToMonday * 24 * 60 * 60 * 1000);
+      const mondayDate = `${monday.getUTCMonth() + 1}-${monday.getUTCDate()}`;
+
+      let notifiedCount = 0;
+
+      for (const [customerIdStr] of topActive) {
+        const customerId = customerIdStr as import("./_generated/dataModel").Id<"users">;
+
+        // Step 4 — duplicate-prevention via the by_customer_occasion_date
+        // index, same hasExistingNotification helper generateDailyNotifications
+        // uses, now covering "weekly_activity" too.
+        const alreadyExists = await ctx.runQuery(internal.crons.hasExistingNotification, {
+          customerId,
+          occasion: "weekly_activity",
+          occasionDate: mondayDate,
+          boutiqueId,
+        });
+        if (alreadyExists) continue;
+
+        // Step 5 — generic, non-AI message string with the real customer name
+        // (single-document by-_id lookup, not a scan), matching
+        // generateDailyNotifications' `${hit.name}'s ${occasion} is tomorrow!`
+        // naming convention. `count` intentionally not included in the message
+        // text (design doc keeps this a plain templated string); the
+        // per-customer activityCount is surfaced elsewhere (getActiveCustomers,
+        // not built in this task) for merchants who want the numeric detail.
+        const name = await ctx.runQuery(internal.crons.getCustomerNameInternal, { customerId });
+
+        await ctx.runMutation(internal.crons.insertNotification, {
+          customerId,
+          occasion: "weekly_activity",
+          occasionDate: mondayDate,
+          message: `${name} was highly active this week!`,
+          boutiqueId,
+        });
+        notifiedCount += 1;
+      }
+
+      totalActiveCustomers += countByCustomer.size;
+      totalNotified += notifiedCount;
     }
 
-    // Step 2 — sort most-active-first, cap to the top N.
-    const topActive = Array.from(countByCustomer.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, MAX_WEEKLY_ACTIVE_NOTIFICATIONS);
-
-    // Step 3 — this week's Monday, "M-D" format (matches parseMD's format
-    // used by birthday/anniversary occasion_date elsewhere in this file).
-    const now = new Date();
-    const dayOfWeek = now.getUTCDay(); // 0=Sunday..6=Saturday
-    const diffToMonday = (dayOfWeek + 6) % 7; // days since most recent Monday
-    const monday = new Date(now.getTime() - diffToMonday * 24 * 60 * 60 * 1000);
-    const mondayDate = `${monday.getUTCMonth() + 1}-${monday.getUTCDate()}`;
-
-    let notifiedCount = 0;
-
-    for (const [customerIdStr] of topActive) {
-      const customerId = customerIdStr as import("./_generated/dataModel").Id<"users">;
-
-      // Step 4 — duplicate-prevention via the by_customer_occasion_date
-      // index, same hasExistingNotification helper generateDailyNotifications
-      // uses, now covering "weekly_activity" too.
-      const alreadyExists = await ctx.runQuery(internal.crons.hasExistingNotification, {
-        customerId,
-        occasion: "weekly_activity",
-        occasionDate: mondayDate,
-      });
-      if (alreadyExists) continue;
-
-      // Step 5 — generic, non-AI message string with the real customer name
-      // (single-document by-_id lookup, not a scan), matching
-      // generateDailyNotifications' `${hit.name}'s ${occasion} is tomorrow!`
-      // naming convention. `count` intentionally not included in the message
-      // text (design doc keeps this a plain templated string); the
-      // per-customer activityCount is surfaced elsewhere (getActiveCustomers,
-      // not built in this task) for merchants who want the numeric detail.
-      const name = await ctx.runQuery(internal.crons.getCustomerNameInternal, { customerId });
-
-      await ctx.runMutation(internal.crons.insertNotification, {
-        customerId,
-        occasion: "weekly_activity",
-        occasionDate: mondayDate,
-        message: `${name} was highly active this week!`,
-      });
-      notifiedCount += 1;
-    }
-
-    return { activeCustomers: countByCustomer.size, notified: notifiedCount };
+    return { activeCustomers: totalActiveCustomers, notified: totalNotified };
   },
 });
 
@@ -713,46 +778,94 @@ export const getCustomerTierInternal = internalQuery({
 export const generateDailyActivitySummaries = internalAction({
   args: {},
   handler: async (ctx): Promise<{ activeCustomers: number; summarized: number }> => {
-    // Step 1 — same indexed 7-day global read the weekly cron uses.
-    const customerIds = await ctx.runQuery(internal.crons.getRecentActivityCustomerIdsInternal, {
-      sinceMs: Date.now() - SEVEN_DAYS_MS,
-    });
+    let totalActiveCustomers = 0;
+    let totalSummarized = 0;
 
-    // Step 2 — dedup to distinct customers.
-    const distinctCustomerIds = Array.from(new Set(customerIds));
+    // Multi-boutique Phase 1 — every step below is unchanged per-boutique
+    // logic, now run once per active boutique instead of once globally.
+    // NOTE: revisit this loop's wall-clock cost (Convex action time limit)
+    // once more than a handful of boutiques are onboarded.
+    for (const boutique of await ctx.runQuery(internal.crons.listActiveBoutiquesInternal, {})) {
+      const boutiqueId = boutique._id;
 
-    let summarizedCount = 0;
-
-    for (const customerId of distinctCustomerIds) {
-      // Step 3 — cap: stop generating new summaries once this run's batch
-      // limit is reached (mirrors generateDailyDrafts' identical cap check).
-      if (summarizedCount >= MAX_ACTIVITY_SUMMARIES_PER_RUN) break;
-
-      // Step 4 — fetch the two fields generateCustomerActivitySummary's args
-      // require beyond customerId itself.
-      const name = await ctx.runQuery(internal.crons.getCustomerNameInternal, { customerId });
-      const tier = await ctx.runQuery(internal.crons.getCustomerTierInternal, { customerId });
-
-      const summaryText: string | null = await ctx.runAction(internal.ai.generateCustomerActivitySummary, {
-        customerId,
-        customerName: name,
-        tier,
+      // Step 1 — same indexed 7-day global read the weekly cron uses.
+      const customerIds = await ctx.runQuery(internal.crons.getRecentActivityCustomerIdsInternal, {
+        sinceMs: Date.now() - SEVEN_DAYS_MS,
+        boutiqueId,
       });
 
-      if (summaryText) {
-        await ctx.runMutation(internal.ai.upsertActivitySummary, {
+      // Step 2 — dedup to distinct customers.
+      const distinctCustomerIds = Array.from(new Set(customerIds));
+
+      let summarizedCount = 0;
+
+      for (const customerId of distinctCustomerIds) {
+        // Step 3 — cap: stop generating new summaries once this run's batch
+        // limit is reached (mirrors generateDailyDrafts' identical cap check).
+        if (summarizedCount >= MAX_ACTIVITY_SUMMARIES_PER_RUN) break;
+
+        // Step 4 — fetch the two fields generateCustomerActivitySummary's args
+        // require beyond customerId itself.
+        const name = await ctx.runQuery(internal.crons.getCustomerNameInternal, { customerId });
+        const tier = await ctx.runQuery(internal.crons.getCustomerTierInternal, { customerId });
+
+        const summaryText: string | null = await ctx.runAction(internal.ai.generateCustomerActivitySummary, {
           customerId,
-          summaryText,
+          customerName: name,
+          tier,
+          boutiqueId,
         });
-        summarizedCount += 1;
+
+        if (summaryText) {
+          await ctx.runMutation(internal.ai.upsertActivitySummary, {
+            customerId,
+            summaryText,
+            boutiqueId,
+          });
+          summarizedCount += 1;
+        }
+
+        // Pacing — sequential, spaced-out Gemini calls, same fixed delay
+        // generateDailyDrafts already uses (SECTION 1), not a new value.
+        await delay(GEMINI_CALL_DELAY_MS);
       }
 
-      // Pacing — sequential, spaced-out Gemini calls, same fixed delay
-      // generateDailyDrafts already uses (SECTION 1), not a new value.
-      await delay(GEMINI_CALL_DELAY_MS);
+      totalActiveCustomers += distinctCustomerIds.length;
+      totalSummarized += summarizedCount;
     }
 
-    return { activeCustomers: distinctCustomerIds.length, summarized: summarizedCount };
+    return { activeCustomers: totalActiveCustomers, summarized: totalSummarized };
+  },
+});
+
+// ============================================================================
+// SECTION 5D — Multi-boutique Phase 1: per-boutique cron fan-out helper
+//
+// Every cron body above (generateDailyDrafts, generateDailyNotifications,
+// generateWeeklyActivityNotifications, generateDailyActivitySummaries) now
+// loops over EVERY active boutique on the platform, running its existing,
+// unmodified per-customer logic once per boutique rather than once globally.
+// This is the single query that drives that loop.
+// ============================================================================
+
+/**
+ * listActiveBoutiquesInternal — every boutique with status:"active", for the
+ * four daily/weekly cron bodies to iterate over. `status` is a genuine
+ * two-value union ("active" | "suspended") already defined on the boutiques
+ * table (schema.ts) — this is a real filter on existing data, not an
+ * invented one. A suspended boutique simply gets skipped by every cron until
+ * it's reactivated; no cron special-cases suspension beyond this filter.
+ *
+ * Unindexed `.collect()` is acceptable here: boutiques has exactly one row
+ * per boutique on the platform (not per-customer or per-event), so this
+ * table stays small even at real scale — nothing like the per-customer
+ * tables elsewhere in this file that need indexed range reads.
+ */
+export const listActiveBoutiquesInternal = internalQuery({
+  args: {},
+  handler: async (ctx): Promise<Array<{ _id: Id<"boutiques">; slug: string }>> => {
+    const all = await ctx.db.query("boutiques").collect();
+    return all.filter((b) => b.status === "active").map((b) => ({ _id: b._id, slug: b.slug }));
   },
 });
 

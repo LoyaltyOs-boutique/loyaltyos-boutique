@@ -6,9 +6,24 @@
 // "Decisions" section, item 1.
 
 import { query } from "./_generated/server";
-import { v } from "convex/values";
-import type { Id } from "./_generated/dataModel";
+import { v, ConvexError } from "convex/values";
+import type { Doc, Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
+
+/**
+ * Multi-boutique Phase 1 — every merchant-only function in this file must
+ * act only within its own boutique. requireMerchantSession already confirms
+ * the caller IS a merchant; this helper additionally guarantees that
+ * merchant has a boutique_id to scope reads/writes by. Same pattern
+ * ai.ts/whatsapp.ts/templates.ts already use — "Not authorized" keeps the
+ * error vocabulary small rather than leaking internal state to the caller.
+ */
+function requireMerchantBoutique(merchant: Doc<"users">): Id<"boutiques"> {
+  if (merchant.boutique_id === undefined) {
+    throw new ConvexError("Not authorized");
+  }
+  return merchant.boutique_id;
+}
 
 // Caller-supplied limit clamp for getRecentCustomerActivity — never trust a
 // client-passed value directly (spec: "clamp server-side, don't trust the
@@ -38,22 +53,29 @@ const MAX_ACTIVITY_LIMIT = 100;
 export const getDashboardSummary = query({
   args: { userId: v.id("users"), token: v.string() },
   handler: async (ctx, { userId, token }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const customers = await ctx.db
       .query("users")
-      .withIndex("by_role_name_lower", (q) => q.eq("role", "customer"))
+      .withIndex("by_boutique_role_name_lower", (q) => q.eq("boutique_id", boutiqueId).eq("role", "customer"))
       .filter((q) => q.neq(q.field("is_deleted"), true))
       .collect();
 
-    const ledgerRows = await ctx.db.query("points_ledger").collect();
+    const ledgerRows = await ctx.db
+      .query("points_ledger")
+      .withIndex("by_boutique_customer", (q) => q.eq("boutique_id", boutiqueId))
+      .collect();
     const pointsFromLedger = ledgerRows.reduce(
       (total, row) => (row.delta > 0 ? total + row.delta : total),
       0,
     );
 
     // Purchase points: points_earned across every purchase record.
-    const purchaseRows = await ctx.db.query("orders").collect();
+    const purchaseRows = await ctx.db
+      .query("orders")
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId))
+      .collect();
     const pointsFromPurchases = purchaseRows.reduce(
       (total, row) => total + (row.points_earned ?? 0),
       0,
@@ -63,7 +85,7 @@ export const getDashboardSummary = query({
     // approved condition convex/platformStats.ts uses (status "approved").
     const approvedReviews = await ctx.db
       .query("reviews")
-      .withIndex("by_status", (q) => q.eq("status", "approved"))
+      .withIndex("by_boutique_status", (q) => q.eq("boutique_id", boutiqueId).eq("status", "approved"))
       .collect();
     const pointsFromReviews = approvedReviews.reduce(
       (total, row) => total + (row.points_awarded ?? 0),
@@ -107,7 +129,8 @@ export const getRecentCustomerActivity = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, { userId, token, limit }) => {
-    await requireMerchantSession(ctx, userId, token);
+    const merchant = await requireMerchantSession(ctx, userId, token);
+    const boutiqueId = requireMerchantBoutique(merchant);
 
     const cappedLimit = Math.max(
       1,
@@ -117,14 +140,19 @@ export const getRecentCustomerActivity = query({
     // Bounded, indexed read — newest first, at most cappedLimit rows.
     const activityEvents = await ctx.db
       .query("customer_activity_events")
-      .withIndex("by_created_at")
+      .withIndex("by_boutique_created_at", (q) => q.eq("boutique_id", boutiqueId))
       .order("desc")
       .take(cappedLimit);
 
     // No usable created_at index on reviews for this read shape — read
-    // every row of this small collection and age-sort in memory (see doc
-    // comment above).
-    const allReviews = await ctx.db.query("reviews").collect();
+    // every row of this small collection (now scoped to this boutique) and
+    // age-sort in memory (see doc comment above). Same breadth as before
+    // (all statuses), just scoped to one boutique via the leading field of
+    // by_boutique_status.
+    const allReviews = await ctx.db
+      .query("reviews")
+      .withIndex("by_boutique_status", (q) => q.eq("boutique_id", boutiqueId))
+      .collect();
     const reviewRows = allReviews
       .slice()
       .sort((a, b) => b.created_at - a.created_at)
@@ -142,7 +170,11 @@ export const getRecentCustomerActivity = query({
       if (
         customer &&
         customer.role === "customer" &&
-        customer.is_deleted !== true
+        customer.is_deleted !== true &&
+        // Defensive — should be structurally guaranteed already by the
+        // scoped reads above (activityEvents/reviewRows are both read via a
+        // boutique_id-equality index), but cheap to assert here too.
+        customer.boutique_id === boutiqueId
       ) {
         customerNameById.set(idString, customer.name);
       }

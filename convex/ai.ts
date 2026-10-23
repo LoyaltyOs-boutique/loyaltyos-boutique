@@ -3,7 +3,7 @@ import { v, ConvexError } from "convex/values";
 import { internal } from "./_generated/api";
 import { requireMerchantSession } from "./auth";
 import { SETTINGS_KEYS, type WhatsAppTemplateType } from "./settings";
-import { getDefaultBoutique, assertSameBoutique } from "./boutiques";
+import { assertSameBoutique } from "./boutiques";
 import type { Doc, Id } from "./_generated/dataModel";
 
 /**
@@ -358,16 +358,13 @@ export const checkMerchantSession = internalQuery({
 export const getWhatsAppTemplateConfigInternal = internalQuery({
   args: {
     type: v.union(v.literal("anniversary"), v.literal("birthday")),
-    boutiqueId: v.optional(v.id("boutiques")),
+    boutiqueId: v.id("boutiques"),
   },
   handler: async (ctx, { type, boutiqueId }) => {
-    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
-    const doc = resolvedBoutiqueId
-      ? await ctx.db
-          .query("settings")
-          .withIndex("by_boutique_key", (q) => q.eq("boutique_id", resolvedBoutiqueId).eq("key", SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG))
-          .first()
-      : null;
+    const doc = await ctx.db
+      .query("settings")
+      .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", SETTINGS_KEYS.WHATSAPP_TEMPLATE_CONFIG))
+      .first();
     const stored = doc?.value as
       | Partial<Record<WhatsAppTemplateType, { discountPercent?: string; couponCode?: string; validDays?: string }>>
       | undefined;
@@ -394,11 +391,9 @@ export const getWhatsAppTemplateConfigInternal = internalQuery({
  * location field — for now this is a deliberate, narrowly-scoped stand-in.
  */
 export const getBoutiqueNameInternal = internalQuery({
-  args: { boutiqueId: v.optional(v.id("boutiques")) },
+  args: { boutiqueId: v.id("boutiques") },
   handler: async (ctx, { boutiqueId }): Promise<{ name: string; isDefault: boolean } | null> => {
-    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
-    if (!resolvedBoutiqueId) return null;
-    const boutique = await ctx.db.get(resolvedBoutiqueId);
+    const boutique = await ctx.db.get(boutiqueId);
     if (!boutique) return null;
     return { name: boutique.name, isDefault: boutique.is_default };
   },
@@ -427,7 +422,7 @@ export const generateMessageDraft = internalAction({
     customerName: v.string(),
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
     occasion: v.union(v.literal("birthday"), v.literal("anniversary")),
-    boutiqueId: v.optional(v.id("boutiques")),
+    boutiqueId: v.id("boutiques"),
   },
   handler: async (ctx, { customerName, tier, occasion, boutiqueId }): Promise<string | null> => {
     // Promo context — merchant's configured Discount/Coupon/Valid-Days for
@@ -561,6 +556,7 @@ export const generateMessageDraftPublic = action({
         customerId,
         occasion,
         occasionDate,
+        boutiqueId,
       });
       if (cached) return cached;
     }
@@ -597,6 +593,7 @@ export const generateMessageDraftPublic = action({
         occasion,
         occasionDate,
         draftText,
+        boutiqueId,
       });
     }
 
@@ -729,7 +726,7 @@ export const generateCombinedMessageDraft = internalAction({
   args: {
     customerName: v.string(),
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
-    boutiqueId: v.optional(v.id("boutiques")),
+    boutiqueId: v.id("boutiques"),
   },
   handler: async (ctx, { customerName, tier, boutiqueId }): Promise<string | null> => {
     // Truncate every free-text field at the point of use — DB values are
@@ -943,28 +940,20 @@ export const generateCustomerActivitySummary = internalAction({
     customerId: v.id("users"),
     customerName: v.string(),
     tier: v.union(v.literal("silver"), v.literal("gold"), v.literal("platinum")),
-    boutiqueId: v.optional(v.id("boutiques")),
+    boutiqueId: v.id("boutiques"),
   },
   handler: async (ctx, { customerId, customerName, tier, boutiqueId }): Promise<string | null> => {
-    // Multi-boutique Phase 1 — resolve once to the default boutique when no
-    // explicit boutiqueId is supplied (crons.ts has no per-boutique loop yet).
-    // If nothing resolves at all (no boutiqueId AND no default boutique
-    // exists), fail gracefully with null — matches this function's existing
-    // "null on any failure" contract, same as a Gemini failure would.
-    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
-    if (!resolvedBoutiqueId) return null;
-
     // Aggregate activity picture — last 7 days, indexed per-customer read.
     const activity = await ctx.runQuery(internal.ai.getRecentActivityCountsInternal, {
       customerId,
       sinceMs: Date.now() - SEVEN_DAYS_MS_AI,
-      boutiqueId: resolvedBoutiqueId,
+      boutiqueId,
     });
 
     // Purchase-history aggregate — read directly from `orders`, not duplicated.
     const purchases = await ctx.runQuery(internal.ai.getPurchaseSummaryInternal, {
       customerId,
-      boutiqueId: resolvedBoutiqueId,
+      boutiqueId,
     });
     const totalSpendRupees = Math.floor(purchases.totalSpendPaise / 100);
 
@@ -977,7 +966,7 @@ export const generateCustomerActivitySummary = internalAction({
 
     // Multi-boutique Phase 1 (C2) — same boutique-name resolution as
     // generateMessageDraft, keeping the live boutique's wording byte-identical.
-    const boutiqueInfo = await ctx.runQuery(internal.ai.getBoutiqueNameInternal, { boutiqueId: resolvedBoutiqueId });
+    const boutiqueInfo = await ctx.runQuery(internal.ai.getBoutiqueNameInternal, { boutiqueId });
     const safeBoutiqueName = truncateForPrompt(boutiqueInfo?.name ?? "our boutique", PROMPT_FIELD_MAX.NAME);
     const isDefault = boutiqueInfo?.isDefault ?? false;
 
@@ -1026,27 +1015,23 @@ export const generateCustomerActivitySummary = internalAction({
  * Called only from crons.ts's generateDailyActivitySummaries, once per
  * active customer, after a non-null generateCustomerActivitySummary result.
  *
- * Multi-boutique Phase 1 (C3) — resolves to the default boutique when no
- * explicit boutiqueId is supplied. If NEITHER resolves (no boutiqueId AND no
- * default boutique exists), returns null IMMEDIATELY — no read, no write of
- * any kind. This is deliberate: there is no safe, honest boutique_id to
- * stamp on an insert in that case, so the function does nothing rather than
- * guessing or casting an undefined value into the id type.
+ * Multi-boutique Phase 1 — `boutiqueId` is now REQUIRED: the sole caller
+ * (crons.ts's generateDailyActivitySummaries) resolves and passes its own
+ * boutique explicitly via the per-boutique cron loop, so the
+ * getDefaultBoutique(ctx) fallback (C3) this function previously used is no
+ * longer needed and has been removed.
  */
 export const upsertActivitySummary = internalMutation({
   args: {
     customerId: v.id("users"),
     summaryText: v.string(),
-    boutiqueId: v.optional(v.id("boutiques")),
+    boutiqueId: v.id("boutiques"),
   },
   handler: async (ctx, { customerId, summaryText, boutiqueId }) => {
-    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
-    if (!resolvedBoutiqueId) return null;
-
     const existing = await ctx.db
       .query("customer_activity_summaries")
       .withIndex("by_boutique_customer", (q) =>
-        q.eq("boutique_id", resolvedBoutiqueId).eq("customer_id", customerId),
+        q.eq("boutique_id", boutiqueId).eq("customer_id", customerId),
       )
       .first();
 
@@ -1060,7 +1045,7 @@ export const upsertActivitySummary = internalMutation({
         customer_id: customerId,
         summary_text: summaryText,
         generated_at: Date.now(),
-        boutique_id: resolvedBoutiqueId,
+        boutique_id: boutiqueId,
       });
     }
     return null;

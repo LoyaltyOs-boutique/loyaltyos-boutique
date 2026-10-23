@@ -665,25 +665,22 @@ export const getUpcomingAnniversaries = query({
  * return (including whatsapp_consent, the gate the cron filters on before
  * ever calling Gemini — see crons.ts).
  *
- * D-c (Batch 6 audit) — `boutiqueId` is OPTIONAL: today's callers (crons.ts,
- * whatsapp.ts) are not changed in this batch and still call with no
- * boutiqueId, so they fall back to getDefaultBoutique(ctx) — the single
- * is_default:true row, which is exactly the one boutique a pre-multi-boutique
- * deployment has, so this fallback is a no-op for every caller today. Batches
- * 11/12 will pass the resolved boutique explicitly and make the arg required.
- * When there is no default boutique at all, returns [] — the SAME empty
- * array this function already returns today when nothing is upcoming.
+ * Multi-boutique Phase 1 (crons.ts per-boutique fan-out) — `boutiqueId` is
+ * now REQUIRED: every caller (crons.ts's four cron bodies, whatsapp.ts) has
+ * been updated to resolve and pass its own boutique explicitly, so the
+ * getDefaultBoutique(ctx) fallback this function previously used (D-c, Batch
+ * 6 audit) is no longer needed and has been removed. A caller with no
+ * boutique context to supply is a bug at the call site, not something this
+ * function should silently paper over with a default-boutique guess.
  */
 export const findUpcomingInternal = internalQuery({
   args: {
     days: v.optional(v.number()),
     field: v.union(v.literal("birthday"), v.literal("anniversary")),
-    boutiqueId: v.optional(v.id("boutiques")),
+    boutiqueId: v.id("boutiques"),
   },
   handler: async (ctx, { days, field, boutiqueId }) => {
-    const resolvedBoutiqueId = boutiqueId ?? (await getDefaultBoutique(ctx))?._id;
-    if (!resolvedBoutiqueId) return []; // same empty-result shape as "nothing upcoming"
-    const hits = await findUpcoming(ctx, resolvedBoutiqueId, days ?? 7, field);
+    const hits = await findUpcoming(ctx, boutiqueId, days ?? 7, field);
     // P0-1 fix (2026-09-09): occasion_date now comes straight from
     // findUpcoming()'s own QueueHit.occasionDate — the canonical "YYYY-M-D"
     // key (real matched year + unpadded month/day) computed ONCE, at the

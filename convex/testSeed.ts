@@ -24,6 +24,51 @@ function isTestMobile(m: string): boolean {
 }
 
 /**
+ * "Tomorrow" in IST, computed the EXACT SAME WAY customers.ts's
+ * upcomingWindow()/findUpcoming() compute it (see that file's IST fix
+ * comment, customers.ts:169-186) — so a seeded birthday here is guaranteed
+ * to land in findUpcomingInternal's `days: 1` window instead of guessing at
+ * a timezone independently. Shifts the UTC instant by the fixed +5:30 IST
+ * offset before reading the calendar Y/M/D, then adds one day.
+ *
+ * SAME constant/logic as customers.ts's own IST_OFFSET_MS + the `i=1` case
+ * of its upcomingWindow() loop — reproduced here (not imported) because
+ * upcomingWindow/IST_OFFSET_MS are private (unexported) to customers.ts, and
+ * this test-only file is explicitly out of scope for exporting new surface
+ * from that file.
+ */
+function tomorrowIST(now = new Date()): { month: number; day: number } {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // same fixed offset as customers.ts's IST_OFFSET_MS
+  const istNow = new Date(now.getTime() + IST_OFFSET_MS);
+  const tomorrow = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate() + 1));
+  return { month: tomorrow.getUTCMonth() + 1, day: tomorrow.getUTCDate() };
+}
+
+/**
+ * Zero-padded "MM-DD" derivation — copied inline from customers.ts's private
+ * (unexported) toMD()/parseMD() pair (customers.ts:144-167), reproduced
+ * verbatim rather than imported since neither helper is exported from that
+ * file and exporting new surface from customers.ts is out of this task's
+ * scope. Side-by-side with the original to prove the match:
+ *
+ *   ORIGINAL (customers.ts):
+ *     function toMD(s) {
+ *       const parsed = parseMD(s); // /^(\d{1,2})-(\d{1,2})$/ on s.trim()
+ *       if (!parsed) return undefined;
+ *       const [month, day] = parsed;
+ *       return `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+ *     }
+ *
+ *   COPY (this file, specialized to the already-validated month/day numbers
+ *   tomorrowIST() returns, so the parseMD regex-parse step is unnecessary
+ *   here — the zero-pad formatting line itself is byte-identical):
+ *     `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+ */
+function toMDString(month: number, day: number): string {
+  return `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/**
  * Both locks shared by every function in this file, run before any write:
  * LOCK 1 — the ALLOW_TEST_SEED deployment env var must be exactly "true".
  * LOCK 2 — refuse immediately if ANY users row is not itself MBTEST-marked
@@ -201,6 +246,16 @@ async function seedOneBoutique(
       whatsapp_consent: i === 0 || i === 1,
       ...(i === 0 ? { vvip: true } : {}),
       ...(i === 1 ? { vvip: false } : {}),
+      // Birthday addition (E2) — ONLY customerIds[0] (the whatsapp_consent:
+      // true customer), a real "tomorrow" (IST, same calc as
+      // customers.ts's findUpcoming) match for findUpcomingInternal / the
+      // notification cron. No anniversary field — birthday only, per spec.
+      ...(i === 0
+        ? (() => {
+            const { month, day } = tomorrowIST();
+            return { birthday: `${month}-${day}`, birthday_md: toMDString(month, day) };
+          })()
+        : {}),
       boutique_id: boutiqueId,
     });
     customerIds.push(id);
