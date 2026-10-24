@@ -45,7 +45,30 @@ http.route({
       return reply(401, { error: "unauthorized" });
     }
 
-    return reply(200, await ctx.runQuery(internal.platformStats.computeStats, {}));
+    // Multi-boutique Phase 1 (proposal) — optional query-string params.
+    // `mode` may only be absent or "list"; anything else is a 400 before
+    // computeStats is even called. With no query string at all (today's
+    // exact Platform Admin call), `boutique` and `list` are both omitted
+    // from the args object below, so computeStats takes its S1 no-parameter
+    // branch exactly as it does today.
+    const url = new URL(req.url);
+    const boutique = url.searchParams.get("boutique");
+    const mode = url.searchParams.get("mode");
+    if (mode !== null && mode !== "list") {
+      return reply(400, { error: "bad_request" });
+    }
+
+    const result = await ctx.runQuery(internal.platformStats.computeStats, {
+      ...(boutique !== null ? { boutique } : {}),
+      ...(mode === "list" ? { list: true } : {}),
+    });
+
+    if (result && typeof result === "object" && "error" in result) {
+      if (result.error === "unknown_boutique") return reply(404, { error: "unknown_boutique" });
+      if (result.error === "bad_request") return reply(400, { error: "bad_request" });
+    }
+
+    return reply(200, result);
   }),
 });
 
