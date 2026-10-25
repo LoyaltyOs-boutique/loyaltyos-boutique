@@ -2,7 +2,7 @@ import { internalMutation, type MutationCtx } from "./_generated/server";
 import { v } from "convex/values";
 import bcrypt from "bcryptjs";
 import type { Id } from "./_generated/dataModel";
-import { getDefaultBoutique } from "./boutiques";
+import { getBoutiqueBySlug, getDefaultBoutique } from "./boutiques";
 
 /**
  * LoyaltyOS Boutique — multi-boutique test data (Phase 1 Batch 2).
@@ -435,8 +435,8 @@ async function seedOneBoutique(
 }
 
 export const seedMultiBoutiqueTestData = internalMutation({
-  args: { password: v.string(), withSecrets: v.optional(v.boolean()) },
-  handler: async (ctx, { password, withSecrets }) => {
+  args: { password: v.string(), withSecrets: v.optional(v.boolean()), nonDefault: v.optional(v.boolean()) },
+  handler: async (ctx, { password, withSecrets, nonDefault }) => {
     await assertSeedAllowed(ctx);
 
     if (password.length < 8) {
@@ -457,7 +457,7 @@ export const seedMultiBoutiqueTestData = internalMutation({
 
     // Alpha is the default only when no default boutique exists yet, so the
     // backend never has two defaults (getDefaultBoutique uses .unique()).
-    const defaultExists = (await getDefaultBoutique(ctx)) !== null;
+    const defaultExists = nonDefault === true || (await getDefaultBoutique(ctx)) !== null;
 
     // Same bcryptjs sync hashing convex/auth.ts's merchantLogin verifies
     // against (bcrypt.compareSync) — never logged, returned, or stored
@@ -475,9 +475,91 @@ export const seedMultiBoutiqueTestData = internalMutation({
 });
 
 export const seedLegacyRows = internalMutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { withDuplicates: v.optional(v.boolean()), conflictsOnly: v.optional(v.boolean()) },
+  handler: async (ctx, { withDuplicates, conflictsOnly }) => {
+    // Duplicates must be seeded BEFORE migrations.createDefaultBoutique (so
+    // their _creationTime predates the boutique, like real pre-Phase-1 data),
+    // while conflicts must be seeded AFTER it (so the legacy half's
+    // _creationTime postdates the boutique, like a real deploy-to-backfill
+    // window collision) — hence these are now two separate call modes
+    // instead of one combined flag handling both shapes in a single call.
+    if (withDuplicates === true && conflictsOnly === true) {
+      throw new Error("use withDuplicates and conflictsOnly in separate calls");
+    }
+
     await assertSeedAllowed(ctx);
+
+    if (conflictsOnly === true) {
+      const target = await getBoutiqueBySlug(ctx, "85-lansdowne");
+      if (!target) {
+        throw new Error(
+          "withConflicts requires the 85-lansdowne boutique to exist first: run migrations.createDefaultBoutique",
+        );
+      }
+      const boutiqueId = target._id;
+
+      for await (const row of ctx.db.query("users")) {
+        if (row.name.startsWith(`${TEST_PREFIX}Legacy Conflict `)) {
+          throw new Error("conflict rows already seeded: run wipeMultiBoutiqueTestData first");
+        }
+      }
+
+      const now = Date.now();
+      const counts = emptyCounts();
+
+      // Conflict pair 1 — a legacy customer (no boutique_id) whose mobile collides
+      // with an already-scoped 85-lansdowne customer created during the same window
+      // backfillBoutiqueId's conflict detection (migrations.ts) is built to catch.
+      const conflictMobile = "0000000064";
+      const scopedConflictName = `${TEST_PREFIX}Legacy Conflict Scoped`;
+      await ctx.db.insert("users", {
+        role: "customer",
+        name: scopedConflictName,
+        name_lower: scopedConflictName.toLowerCase(),
+        mobile: conflictMobile,
+        tier: "silver",
+        magic_token: randomHex64(),
+        magic_token_created_at: now,
+        boutique_id: boutiqueId,
+      });
+      counts.users += 1;
+
+      const legacyConflictName = `${TEST_PREFIX}Legacy Conflict Legacy`;
+      await ctx.db.insert("users", {
+        role: "customer",
+        name: legacyConflictName,
+        name_lower: legacyConflictName.toLowerCase(),
+        mobile: conflictMobile,
+        tier: "silver",
+        magic_token: randomHex64(),
+        magic_token_created_at: now,
+        // No boutique_id — must be detected as colliding with the scoped row
+        // above and left unpatched.
+      });
+      counts.users += 1;
+
+      // Conflict pair 2 — a legacy settings row whose key collides with an
+      // already-scoped 85-lansdowne settings row.
+      const conflictKey = "mbtest_legacy_conflict_probe";
+      await ctx.db.insert("settings", {
+        key: conflictKey,
+        value: { legacyConflictScoped: true },
+        updated_at: now,
+        boutique_id: boutiqueId,
+      });
+      counts.settings += 1;
+
+      await ctx.db.insert("settings", {
+        key: conflictKey,
+        value: { legacyConflictLegacy: true },
+        updated_at: now,
+        // No boutique_id — must be detected as colliding with the scoped row
+        // above (same key, same target boutique) and left unpatched.
+      });
+      counts.settings += 1;
+
+      return counts;
+    }
 
     for await (const row of ctx.db.query("users")) {
       if (row.name.startsWith(`${TEST_PREFIX}Legacy `)) {
@@ -621,6 +703,57 @@ export const seedLegacyRows = internalMutation({
     });
     counts.customer_activity_summaries += 1;
 
+    if (withDuplicates === true) {
+      // Legacy-legacy duplicate pair — TWO legacy rows (neither has
+      // boutique_id, neither has any already-scoped counterpart) sharing the
+      // same mobile, and two legacy settings rows sharing the same key. This
+      // is the "old duplicate data, both rows pre-date the boutique concept"
+      // shape — NEITHER row has a scoped match to collide with at the moment
+      // the backfill starts, so both must get backfilled normally by
+      // backfillBoutiqueId, proving the conflict rule does not block
+      // ordinary pre-existing duplicates, only genuine during-the-window
+      // collisions with an already-scoped row.
+      const dupMobile = "0000000065";
+      const dupNameA = `${TEST_PREFIX}Legacy Dup A`;
+      await ctx.db.insert("users", {
+        role: "customer",
+        name: dupNameA,
+        name_lower: dupNameA.toLowerCase(),
+        mobile: dupMobile,
+        tier: "silver",
+        magic_token: randomHex64(),
+        magic_token_created_at: now,
+      });
+      counts.users += 1;
+
+      const dupNameB = `${TEST_PREFIX}Legacy Dup B`;
+      await ctx.db.insert("users", {
+        role: "customer",
+        name: dupNameB,
+        name_lower: dupNameB.toLowerCase(),
+        mobile: dupMobile,
+        tier: "silver",
+        magic_token: randomHex64(),
+        magic_token_created_at: now,
+      });
+      counts.users += 1;
+
+      const dupKey = "mbtest_legacy_dup_probe";
+      await ctx.db.insert("settings", {
+        key: dupKey,
+        value: { dup: "a" },
+        updated_at: now,
+      });
+      counts.settings += 1;
+
+      await ctx.db.insert("settings", {
+        key: dupKey,
+        value: { dup: "b" },
+        updated_at: now,
+      });
+      counts.settings += 1;
+    }
+
     return counts;
   },
 });
@@ -726,7 +859,9 @@ export const wipeMultiBoutiqueTestData = internalMutation({
       if (
         (row.boutique_id !== undefined && markedBoutiqueIds.has(row.boutique_id)) ||
         row.key === "mbtest_probe" ||
-        row.key === "mbtest_legacy_probe"
+        row.key === "mbtest_legacy_probe" ||
+        row.key === "mbtest_legacy_conflict_probe" ||
+        row.key === "mbtest_legacy_dup_probe"
       ) {
         await ctx.db.delete(row._id);
         counts.settings += 1;

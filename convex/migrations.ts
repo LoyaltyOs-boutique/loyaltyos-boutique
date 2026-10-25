@@ -85,14 +85,69 @@ export const backfillBoutiqueId = internalMutation({
     let isDone = true;
     let continueCursor: string | null = null;
 
+    // A legacy row is skipped (never patched, never deleted, never merged) only
+    // when an ALREADY-SCOPED row at the target boutique shares its
+    // mobile/email/key AND that scoped row's _creationTime is greater than the
+    // target boutique's own _creationTime (target._creationTime) — meaning it
+    // was created during the live window between the boutique existing and the
+    // backfill finishing (the real risk from ordinary app usage during that
+    // window), as opposed to an old legacy row that the backfill itself already
+    // patched earlier in this same run (whose original _creationTime predates
+    // the boutique and is therefore NOT greater than target._creationTime) — so
+    // two old pre-Phase-1 duplicate rows sharing a mobile/email/key both get
+    // backfilled exactly as the app already treats them today, and only a
+    // genuine new-during-the-window collision is held back.
+    let conflictsUsersMobile = 0;
+    let conflictsUsersEmail = 0;
+    let conflictsSettingsKey = 0;
+
     switch (table) {
       case "users": {
         const r = await ctx.db.query("users").paginate({ cursor: cursor ?? null, numItems });
         for (const row of r.page) {
           scanned += 1;
           if (row.boutique_id === undefined) {
-            await ctx.db.patch(row._id, { boutique_id: boutiqueId });
-            patched += 1;
+            const mobile = row.mobile;
+            const email = row.email;
+            let collides = false;
+
+            if (mobile) {
+              const mobileMatches = await ctx.db
+                .query("users")
+                .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutiqueId).eq("mobile", mobile))
+                .collect();
+              if (
+                mobileMatches.some(
+                  (m) => m._id !== row._id && m._creationTime > target._creationTime,
+                )
+              ) {
+                collides = true;
+                conflictsUsersMobile += 1;
+              }
+            }
+
+            if (!collides && email) {
+              const emailMatches = await ctx.db
+                .query("users")
+                .withIndex("by_email", (q) => q.eq("email", email))
+                .collect();
+              if (
+                emailMatches.some(
+                  (m) =>
+                    m._id !== row._id &&
+                    m.boutique_id === boutiqueId &&
+                    m._creationTime > target._creationTime,
+                )
+              ) {
+                collides = true;
+                conflictsUsersEmail += 1;
+              }
+            }
+
+            if (!collides) {
+              await ctx.db.patch(row._id, { boutique_id: boutiqueId });
+              patched += 1;
+            }
           }
         }
         isDone = r.isDone;
@@ -156,8 +211,21 @@ export const backfillBoutiqueId = internalMutation({
         for (const row of r.page) {
           scanned += 1;
           if (row.boutique_id === undefined) {
-            await ctx.db.patch(row._id, { boutique_id: boutiqueId });
-            patched += 1;
+            const key = row.key;
+            const keyMatches = await ctx.db
+              .query("settings")
+              .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", key))
+              .collect();
+            if (
+              keyMatches.some(
+                (m) => m._id !== row._id && m._creationTime > target._creationTime,
+              )
+            ) {
+              conflictsSettingsKey += 1;
+            } else {
+              await ctx.db.patch(row._id, { boutique_id: boutiqueId });
+              patched += 1;
+            }
           }
         }
         isDone = r.isDone;
@@ -281,7 +349,17 @@ export const backfillBoutiqueId = internalMutation({
       });
     }
 
-    return { scanned, patched, isDone };
+    return {
+      scanned,
+      patched,
+      conflicts: conflictsUsersMobile + conflictsUsersEmail + conflictsSettingsKey,
+      conflictDetail: {
+        usersMobile: conflictsUsersMobile,
+        usersEmail: conflictsUsersEmail,
+        settingsKey: conflictsSettingsKey,
+      },
+      isDone,
+    };
   },
 });
 
@@ -361,6 +439,56 @@ export const countMissingBoutiqueId = internalQuery({
       if (row.boutique_id === undefined) customer_activity_summaries += 1;
     }
 
+    const target = await getBoutiqueBySlug(ctx, DEFAULT_SLUG);
+    let conflictUsers = 0;
+    let conflictSettings = 0;
+    if (target) {
+      const boutiqueId = target._id;
+      for await (const row of ctx.db.query("users")) {
+        if (row.boutique_id !== undefined) continue;
+        const mobile = row.mobile;
+        const email = row.email;
+        let collides = false;
+        if (mobile) {
+          const mobileMatches = await ctx.db
+            .query("users")
+            .withIndex("by_boutique_mobile", (q) => q.eq("boutique_id", boutiqueId).eq("mobile", mobile))
+            .collect();
+          if (mobileMatches.some((m) => m._id !== row._id && m._creationTime > target._creationTime)) {
+            collides = true;
+          }
+        }
+        if (!collides && email) {
+          const emailMatches = await ctx.db
+            .query("users")
+            .withIndex("by_email", (q) => q.eq("email", email))
+            .collect();
+          if (
+            emailMatches.some(
+              (m) => m._id !== row._id && m.boutique_id === boutiqueId && m._creationTime > target._creationTime,
+            )
+          ) {
+            collides = true;
+          }
+        }
+        if (collides) conflictUsers += 1;
+      }
+      for await (const row of ctx.db.query("settings")) {
+        if (row.boutique_id !== undefined) continue;
+        const key = row.key;
+        const keyMatches = await ctx.db
+          .query("settings")
+          .withIndex("by_boutique_key", (q) => q.eq("boutique_id", boutiqueId).eq("key", key))
+          .collect();
+        if (keyMatches.some((m) => m._id !== row._id && m._creationTime > target._creationTime)) {
+          conflictSettings += 1;
+        }
+      }
+    }
+    // No default boutique yet: nothing to collide against, both stay 0 — matches
+    // backfillBoutiqueId's own precondition (it throws without a default boutique;
+    // this read-only function instead reports 0/0 so it stays safe to poll anytime).
+
     return {
       users,
       lookbooks,
@@ -376,6 +504,7 @@ export const countMissingBoutiqueId = internalQuery({
       notifications,
       customer_activity_events,
       customer_activity_summaries,
+      conflicts: { users: conflictUsers, settings: conflictSettings },
     };
   },
 });
