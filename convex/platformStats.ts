@@ -61,10 +61,10 @@ type StatsFields = {
   firstRecordAt: number | null;
 };
 
-/** The empty-tables reply (S1) — same shape a non-existent default boutique
- *  would produce if every read below ran against zero rows. Used both when
- *  there is no default boutique (no-parameter mode) and is derived, not
- *  hand-rolled, so it can never drift from the real computation's shape. */
+/** The empty-tables reply (S1): the same 11 fields with zero counts, null
+ *  times and 7 zero-count IST days, used when there is no default boutique
+ *  (no-parameter mode). It is written by hand, so keep its keys in the same
+ *  order as statsForBoutique's return whenever either one changes. */
 function emptyStats(now: number): StatsFields {
   const perDay = new Map<string, number>();
   const todayStart = istDayStart(now);

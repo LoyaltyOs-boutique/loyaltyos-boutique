@@ -482,8 +482,9 @@ async function upsertSettings(
  * The effective (merged) settings — the single response shape for
  * getSettings and every settings mutation.
  *
- * The settings table is bounded by design (one doc per known key, ~2 rows),
- * so `.collect()` is safe here and the table cannot grow with usage.
+ * The settings table is bounded by design (one doc per known key per
+ * boutique, so a handful of rows per boutique), so `.collect()` is safe
+ * here and the table cannot grow with usage.
  */
 async function readMergedSettings(ctx: QueryCtx | MutationCtx, boutiqueId: Id<"boutiques">) {
   const docs = await ctx.db

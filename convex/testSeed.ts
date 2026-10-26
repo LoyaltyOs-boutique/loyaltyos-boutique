@@ -493,7 +493,7 @@ export const seedLegacyRows = internalMutation({
       const target = await getBoutiqueBySlug(ctx, "85-lansdowne");
       if (!target) {
         throw new Error(
-          "withConflicts requires the 85-lansdowne boutique to exist first: run migrations.createDefaultBoutique",
+          "conflictsOnly requires the 85-lansdowne boutique to exist first: run migrations.createDefaultBoutique",
         );
       }
       const boutiqueId = target._id;
