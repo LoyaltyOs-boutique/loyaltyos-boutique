@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { getData, subscribe, allCatalogue, addCatalogueItem, updateCatalogueItem, removeCatalogueItem, getLookbooksForSelector, uploadPdfLookbook, createLookbook, getLookbookById, uploadTemplateMedia, hydrateCatalogue, deleteLookbook, friendlyError } from '../../lib/db.js';
 import { classifyFile, addEntries, moveEntry, removeEntry, fromPiece, validateList } from '../../lib/mediaList.js';
 import { BRAND } from '../../data/seed.js';
-import { inr } from '../../lib/util.js';
+import { inr, cls } from '../../lib/util.js';
 import { SectionTitle, Empty, Modal } from '../../components/ui.jsx';
 import { ProductGallery } from '../../components/ProductGallery.jsx';
 
@@ -69,6 +69,10 @@ export default function Catalogue() {
   useEffect(() => { hydrateCatalogue(); }, []);
 
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
+  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+  // Manual Entry size type: 'none' (default, no boxes), 'free' (one box), 'sized' (M/L/XL/XXL).
+  const [manualSizeType, setManualSizeType] = useState('none');
+  const [manualStock, setManualStock] = useState({ M: '', L: '', XL: '', XXL: '', FREE: '' });
   // Manual Entry — drag-drop media upload (mirrors Templates.jsx's MediaCard
   // onMediaFile pattern), auto-fills manual.image_url on success.
   const [mediaUploading, setMediaUploading] = useState(false);
@@ -87,6 +91,15 @@ export default function Catalogue() {
   const [editMediaUploading, setEditMediaUploading] = useState(false);
   const [editImageUrl, setEditImageUrl] = useState('');
   const editMediaRef = useRef(null);
+  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+  // Edit stock modal: which piece.id is open, its chosen size type, its box values,
+  // a saving flag with a ref guard against a double Save click, and an error line.
+  const [stockPieceId, setStockPieceId] = useState(null);
+  const [stockType, setStockType] = useState('none');
+  const [stockValues, setStockValues] = useState({ M: '', L: '', XL: '', XXL: '', FREE: '' });
+  const [stockSaving, setStockSaving] = useState(false);
+  const stockSavingRef = useRef(false);
+  const [stockErr, setStockErr] = useState('');
   // Step C — Manual Entry "Add to" target: 'all' = Current catalogue (no lookbook_id),
   // '__new__' = create a new designer lookbook (name from newLookbookName), else an existing lookbook _id.
   const [addTo, setAddTo] = useState('all');
@@ -263,8 +276,97 @@ export default function Catalogue() {
     };
     const editingItem = items.find((i) => i.id === editPieceId);
 
+  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+  // which box keys a size type shows: 'sized' uses M/L/XL/XXL, 'free' uses FREE,
+  // 'none' shows no boxes.
+  const stockKeysFor = (type) => (type === 'sized' ? ['M', 'L', 'XL', 'XXL'] : type === 'free' ? ['FREE'] : []);
+
+  // Design spec 2026-11-15 — turn the typed box values for a size type into the
+  // { size_mode, stock } pair the backend wants, or an error string if any shown
+  // box is not a whole number from 0 to 9999. Returns { stock } with only the
+  // relevant keys; the caller decides whether to send size_mode too.
+  const buildStock = (type, values) => {
+    const keys = stockKeysFor(type);
+    const stock = {};
+    for (const key of keys) {
+      const raw = String(values[key] ?? '').trim();
+      const n = raw === '' ? 0 : Number(raw);
+      if (!Number.isInteger(n) || n < 0 || n > 9999) {
+        return { error: 'Each stock count must be a whole number from 0 to 9999.' };
+      }
+      stock[key] = n;
+    }
+    return { stock };
+  };
+
+  // Design spec 2026-11-15 — one short summary for a merchant card: nothing for
+  // a piece with no size type, "M 2 · L 0 · XL 1 · XXL 0" for sized, "Free 3" for
+  // free, and "Out of stock" when every shown count is 0.
+  const stockLine = (piece) => {
+    if (!piece.size_mode) return '';
+    const s = piece.stock || {};
+    const keys = stockKeysFor(piece.size_mode);
+    const counts = keys.map((key) => Number(s[key]) || 0);
+    if (counts.every((c) => c === 0)) return 'Out of stock';
+    if (piece.size_mode === 'free') return `Free ${counts[0]}`;
+    return keys.map((key, idx) => `${key} ${counts[idx]}`).join(' · ');
+  };
+
+  const openEditStock = (piece) => {
+    setStockPieceId(piece.id);
+    // A piece already carrying a size type keeps it; a legacy piece opens on 'none'.
+    setStockType(piece.size_mode || 'none');
+    const s = piece.stock || {};
+    setStockValues({
+      M: s.M != null ? String(s.M) : '',
+      L: s.L != null ? String(s.L) : '',
+      XL: s.XL != null ? String(s.XL) : '',
+      XXL: s.XXL != null ? String(s.XXL) : '',
+      FREE: s.FREE != null ? String(s.FREE) : '',
+    });
+    setStockErr('');
+    setStockSaving(false);
+    stockSavingRef.current = false;
+  };
+  const closeEditStock = () => {
+    setStockPieceId(null);
+    setStockErr('');
+    setStockSaving(false);
+    stockSavingRef.current = false;
+  };
+  const saveEditStock = async () => {
+    if (stockSavingRef.current) return; // guard a second Save click
+    // 'No size' has no size type and no stock keys to set, so there is nothing to
+    // write — just close. A piece already sized/free can never reach this branch.
+    if (stockType === 'none') { closeEditStock(); return; }
+    const built = buildStock(stockType, stockValues);
+    if (built.error) { setStockErr(built.error); return; }
+    stockSavingRef.current = true;
+    setStockSaving(true);
+    setStockErr('');
+    try {
+      await updateCatalogueItem(stockPieceId, { size_mode: stockType, stock: built.stock });
+      closeEditStock();
+    } catch (err) {
+      setStockErr(friendlyError(err));
+    } finally {
+      stockSavingRef.current = false;
+      setStockSaving(false);
+    }
+  };
+  const stockPiece = items.find((i) => i.id === stockPieceId);
+
   const addManual = async () => {
     if (!manual.title || !manual.price) return;
+    // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+    // when a size type is chosen, every shown box must be a whole number 0..9999.
+    // 'none' sends neither size_mode nor stock, so the call stays exactly as today.
+    let sizeExtra = {};
+    if (manualSizeType !== 'none') {
+      const built = buildStock(manualSizeType, manualStock);
+      if (built.error) { setMediaMsg(built.error); return; }
+      sizeExtra = { size_mode: manualSizeType, stock: built.stock };
+    }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
     // a typed Image URL that was never explicitly "Add"-ed still joins the gallery here.
     let galleryList = manualMedia;
@@ -293,8 +395,8 @@ export default function Catalogue() {
     // A non-empty gallery sends media (+ its own cover); an empty gallery keeps
     // today's single-image_url behaviour exactly, including an empty image_url.
     const payload = galleryList.length > 0
-      ? { title: manual.title, price: manual.price, instagram_link: manual.instagram_link, source: 'manual', media: galleryList, image_url: galleryList[0].url, ...(lookbook_id ? { lookbook_id } : {}) }
-      : { ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}) };
+      ? { title: manual.title, price: manual.price, instagram_link: manual.instagram_link, source: 'manual', media: galleryList, image_url: galleryList[0].url, ...(lookbook_id ? { lookbook_id } : {}), ...sizeExtra }
+      : { ...manual, source: 'manual', ...(lookbook_id ? { lookbook_id } : {}), ...sizeExtra };
     const res = addCatalogueItem(payload);
     // Missing-session case: surface the error (via the Manual-entry mediaMsg line)
     // and do NOT clear the form / show success — the item was never saved.
@@ -303,6 +405,9 @@ export default function Catalogue() {
     setManualMedia([]);
     setAddTo('all');
     setNewLookbookName('');
+    // Design spec 2026-11-15 — reset the size type to the default after a save.
+    setManualSizeType('none');
+    setManualStock({ M: '', L: '', XL: '', XXL: '', FREE: '' });
   };
   // Shared drag-drop upload loop, mirrors Templates.jsx MediaCard's
   // onMediaFile (try/catch/finally, uploading/msg state). Design spec:
@@ -530,6 +635,26 @@ export default function Catalogue() {
             <MediaEditor list={manualMedia} onChange={setManualMedia} />
             <div><label className="label">Instagram link (optional)</label><input className="input" value={manual.instagram_link} onChange={(e) => setManual({ ...manual, instagram_link: e.target.value })} /></div>
             <div>
+              <label className="label">Size type</label>
+              <div className="flex gap-2 flex-wrap">
+                {[['none', 'No size'], ['free', 'Free size'], ['sized', 'Sized']].map(([val, lbl]) => (
+                  <button key={val} type="button" onClick={() => setManualSizeType(val)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', manualSizeType === val ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {manualSizeType === 'free' && (
+              <div><label className="label">Stock</label><input className="input" type="number" min="0" step="1" value={manualStock.FREE} onChange={(e) => setManualStock({ ...manualStock, FREE: e.target.value })} /></div>
+            )}
+            {manualSizeType === 'sized' && (
+              <div className="grid grid-cols-2 gap-3">
+                {['M', 'L', 'XL', 'XXL'].map((sz) => (
+                  <div key={sz}><label className="label">{sz}</label><input className="input" type="number" min="0" step="1" value={manualStock[sz]} onChange={(e) => setManualStock({ ...manualStock, [sz]: e.target.value })} /></div>
+                ))}
+              </div>
+            )}
+            <div>
               <label className="label">Add to</label>
               <select className="input" value={addTo} onChange={(e) => setAddTo(e.target.value)}>
                 <option value="all">Current catalogue</option>
@@ -642,8 +767,12 @@ export default function Catalogue() {
                       <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 11.5v7A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-7" /><path d="M14.5 9 21 2.5" /><path d="M15.5 2.5H21V8" /></svg>
                     </a>
                   </div>
+                  {stockLine(i) && <div className="text-xs text-steel mt-2">{stockLine(i)}</div>}
                   {i.convexId && (
                     <button onClick={() => openEditPhotos(i)} className="btn-ghost w-full mt-3">Edit photos</button>
+                  )}
+                  {i.convexId && (
+                    <button onClick={() => openEditStock(i)} className="btn-ghost w-full mt-3">Edit stock</button>
                   )}
                   <div className="flex items-center gap-2 mt-2">
                     <button onClick={() => alert('Coming soon')} className="btn-ink !py-1 !px-2 text-[9px] flex-1">
@@ -700,6 +829,37 @@ export default function Catalogue() {
             <div className="flex items-center gap-2">
               <button onClick={saveEditPhotos} disabled={editSaving || editMediaUploading} className="btn-ink flex-1">{editSaving ? 'Saving…' : 'Save'}</button>
               <button onClick={closeEditPhotos} disabled={editSaving} className="btn-ghost flex-1">Cancel</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {stockPieceId && stockPiece && (
+        <Modal open onClose={closeEditStock} title={`Edit stock — ${stockPiece.title}`}>
+          <div className="space-y-3">
+            <div>
+              <label className="label">Size type</label>
+              <div className="flex gap-2 flex-wrap">
+                {(stockPiece.size_mode ? [['free', 'Free size'], ['sized', 'Sized']] : [['none', 'No size'], ['free', 'Free size'], ['sized', 'Sized']]).map(([val, lbl]) => (
+                  <button key={val} type="button" onClick={() => setStockType(val)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockType === val ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {stockType === 'free' && (
+              <div><label className="label">Stock</label><input className="input" type="number" min="0" step="1" value={stockValues.FREE} onChange={(e) => setStockValues({ ...stockValues, FREE: e.target.value })} /></div>
+            )}
+            {stockType === 'sized' && (
+              <div className="grid grid-cols-2 gap-3">
+                {['M', 'L', 'XL', 'XXL'].map((sz) => (
+                  <div key={sz}><label className="label">{sz}</label><input className="input" type="number" min="0" step="1" value={stockValues[sz]} onChange={(e) => setStockValues({ ...stockValues, [sz]: e.target.value })} /></div>
+                ))}
+              </div>
+            )}
+            {stockErr && <div className="text-xs text-gold mt-2">{stockErr}</div>}
+            <div className="flex items-center gap-2">
+              <button onClick={saveEditStock} disabled={stockSaving} className="btn-ink flex-1">{stockSaving ? 'Saving…' : 'Save'}</button>
+              <button onClick={closeEditStock} disabled={stockSaving} className="btn-ghost flex-1">Cancel</button>
             </div>
           </div>
         </Modal>

@@ -45,4 +45,11 @@ export const rateLimiter = new RateLimiter(components.rateLimiter, {
   // reviews (product + GMB + testimonial in one session) through without
   // friction.
   createReviewByUser: { kind: "token bucket", rate: 20, period: HOUR, capacity: 5 },
+
+  // placeOrderRequest — public, magic-link-gated customer order placement
+  // (orderRequests.ts). Keyed by the customer's own user_id. 5 orders / minute,
+  // capacity 5 lets a legitimate burst (a customer placing a couple of orders
+  // in quick succession) through while blocking automated oversell abuse.
+  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md.
+  placeOrderByCustomer: { kind: "token bucket", rate: 5, period: MINUTE, capacity: 5 },
 });

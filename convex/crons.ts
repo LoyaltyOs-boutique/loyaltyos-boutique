@@ -505,10 +505,13 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
  * getActiveCustomers' documented shape in the design doc (§b.4).
  *
  * "Active" threshold judgment call (stated explicitly per task instructions):
- * ANY of the three currently-tracked action types (like / cart_add /
- * lookbook_view) qualifies — at least ONE event in the last 7 days is enough
- * to count as "active this week". No minimum count, no requirement to hit
- * all three types. This matches the design doc's own framing ("who's
+ * ANY tracked action type (like / cart_add / lookbook_view, and — added by
+ * the Customer Orders feature, design spec 2026-11-15 — order_placed)
+ * qualifies — at least ONE event in the last 7 days is enough to count as
+ * "active this week". This query applies NO action-type filter (it reads
+ * every row in the 7-day window), so order_placed rows are counted toward the
+ * most-active scoring automatically alongside the existing actions, with no
+ * code change. No minimum count, no requirement to hit all types. This matches the design doc's own framing ("who's
  * active") as a presence signal, not an engagement-depth threshold — the
  * activityCount surfaced to the merchant (via getActiveCustomers, a
  * separate query, not built in this task) is what conveys depth, not this

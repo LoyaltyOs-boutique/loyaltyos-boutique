@@ -85,7 +85,11 @@ type ActivityItem = {
   id: string;
   customerId: Id<"users">;
   customerName: string;
-  kind: "like" | "cart_add" | "lookbook_view" | "event_link_click" | "review";
+  // "order_placed" added by the Customer Orders feature (design spec
+  // 2026-11-15) — the frontend maps this kind to an order line in Recent
+  // Activity. It arrives via row.action on customer_activity_events, same as
+  // the other activity kinds.
+  kind: "like" | "cart_add" | "lookbook_view" | "event_link_click" | "order_placed" | "review";
   itemTitle?: string;
   createdAt: number;
 };

@@ -34,6 +34,7 @@ import Campaigns from './pages/merchant/Campaigns.jsx';
 import Catalogue from './pages/merchant/Catalogue.jsx';
 import Templates from './pages/merchant/Templates.jsx';
 import PointsLedger from './pages/merchant/PointsLedger.jsx';
+import Orders from './pages/merchant/Orders.jsx';
 import Settings from './pages/merchant/Settings.jsx';
 import Onboarding from './pages/merchant/Onboarding.jsx';
 
@@ -82,6 +83,7 @@ export default function App() {
           path="/merchant/points-ledger"
           element={<MerchantGuard><Shell><PointsLedger /></Shell></MerchantGuard>}
         />
+        <Route path="/merchant/orders" element={<MerchantGuard><Shell><Orders /></Shell></MerchantGuard>} />
         <Route
           path="/merchant/settings"
           element={<MerchantGuard><Shell><Settings /></Shell></MerchantGuard>}

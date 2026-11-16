@@ -169,6 +169,26 @@ export default defineSchema({
     instagram_link: v.optional(v.string()),
     size: v.optional(v.string()), // Gate 2 — e.g. "S", "M", "L", "Free Size"
     colour: v.optional(v.string()), // Gate 2 — e.g. "Ivory", "Blush"
+    // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md (D1)
+    // How a piece is sized for customer ordering:
+    //   "sized" = separate per-size stock (M/L/XL/XXL), size selector shown, CUSTOM allowed
+    //   "free"  = single FREE stock count, no size selector
+    //   unset   = legacy piece — quantity only, no stock limit, no size (behaves as before)
+    // Optional so every existing row stays valid and unchanged.
+    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"))),
+    // Per-size stock counts (integers). Only the keys relevant to size_mode are
+    // set: "sized" uses M/L/XL/XXL, "free" uses FREE. Decremented atomically
+    // when an order is placed (orderRequests.placeOrderRequest) and restored on
+    // cancel. Legacy pieces (size_mode unset) leave this undefined = unlimited.
+    stock: v.optional(
+      v.object({
+        M: v.optional(v.number()),
+        L: v.optional(v.number()),
+        XL: v.optional(v.number()),
+        XXL: v.optional(v.number()),
+        FREE: v.optional(v.number()),
+      }),
+    ),
     // Design spec: docs/superpowers/specs/2026-09-25-lookbook-delete-design.md
     // Soft-delete pair (decision 1) — set by deleteLookbook's cascade when the
     // parent lookbook is deleted; missing/false = active.
@@ -188,6 +208,75 @@ export default defineSchema({
       ),
     ),
   }).index("by_lookbook", ["lookbook_id"]),
+
+  /**
+   * Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md (D4)
+   *
+   * order_requests — customer-placed orders from the magic-link lookbook, with
+   * chosen size, quantity and optional custom-size measurements. A NEW table,
+   * deliberately SEPARATE from `orders`: that table and all 9+ of its readers
+   * (points, revenue, AI purchase summary, platformStats) are not touched. No
+   * loyalty points are awarded for these orders yet (D6 — deferred to Razorpay).
+   *
+   * Prices are stored in PAISE (server reads them from catalogue_items, never
+   * trusts the browser — D9). payment_status is always "not_collected" until
+   * Razorpay exists (D10). Measurements are saved on the order only, never
+   * written back to the customer profile (D7).
+   */
+  order_requests: defineTable({
+    customer_id: v.id("users"),
+    items: v.array(
+      v.object({
+        catalogue_item_id: v.id("catalogue_items"),
+        title: v.string(), // snapshot of the piece title at order time
+        price_paise: v.number(), // PAISE — server-sourced from catalogue_items.price
+        // "NONE" = legacy piece (no size); "FREE" = free-size piece;
+        // M/L/XL/XXL = sized stock; "CUSTOM" = made-to-order (no stock).
+        size: v.union(
+          v.literal("M"),
+          v.literal("L"),
+          v.literal("XL"),
+          v.literal("XXL"),
+          v.literal("FREE"),
+          v.literal("CUSTOM"),
+          v.literal("NONE"),
+        ),
+        qty: v.number(), // integer 1..10
+        // Present only for CUSTOM lines (D7/D8). unit records cm or in.
+        measurements: v.optional(
+          v.object({
+            unit: v.union(v.literal("cm"), v.literal("in")),
+            bust: v.number(),
+            waist: v.number(),
+            hip: v.number(),
+            shoulder: v.number(),
+            top_length: v.number(),
+            sleeve_length: v.optional(v.number()),
+            armhole: v.optional(v.number()),
+            bottom_length: v.optional(v.number()),
+            height: v.optional(v.number()),
+            notes: v.optional(v.string()),
+          }),
+        ),
+      }),
+    ),
+    subtotal_paise: v.number(), // PAISE — sum of price_paise * qty across lines
+    payment_preference: v.union(v.literal("online"), v.literal("offline")),
+    payment_status: v.literal("not_collected"), // always this until Razorpay (D10)
+    status: v.union(v.literal("placed"), v.literal("cancelled")),
+    cancelled_at: v.optional(v.number()), // epoch ms — set only when cancelled
+    created_at: v.number(), // epoch ms — Date.now() at placement
+    // Lowercased concatenation of customer name + mobile + all titles, used by
+    // the search_orders full-text index for the merchant Orders tab search (D11).
+    search_text: v.string(),
+  })
+    // Date-window read for the merchant Orders tab (newest first).
+    .index("by_created_at", ["created_at"])
+    // Per-customer history, same shape as points_ledger/activity "equality then
+    // range" convention.
+    .index("by_customer_created_at", ["customer_id", "created_at"])
+    // Full-text search over the stored search_text for the Orders tab search box.
+    .searchIndex("search_orders", { searchField: "search_text" }),
 
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */
   orders: defineTable({
@@ -462,8 +551,13 @@ export default defineSchema({
       v.literal("like"),
       v.literal("lookbook_view"),
       v.literal("event_link_click"),
+      // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md (D12)
+      // Inserted by orderRequests.placeOrderRequest so Recent Activity, the
+      // weekly most-active scoring and the AI activity summary include orders.
+      // Not written by activity.ts trackActivity (that mutation is unchanged).
+      v.literal("order_placed"),
     ),
-    catalogue_item_id: v.optional(v.id("catalogue_items")), // cart_add / like
+    catalogue_item_id: v.optional(v.id("catalogue_items")), // cart_add / like / order_placed
     lookbook_id: v.optional(v.id("lookbooks")),              // lookbook_view
     event_id: v.optional(v.id("events")),                    // event_link_click
     created_at: v.number(), // epoch ms

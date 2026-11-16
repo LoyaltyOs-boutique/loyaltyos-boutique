@@ -776,16 +776,22 @@ export const getRecentActivityCountsInternal = internalQuery({
     let likes = 0;
     let cartAdds = 0;
     let lookbookViews = 0;
+    let ordersPlaced = 0;
     for (const row of rows) {
       if (row.action === "like") likes += 1;
       else if (row.action === "cart_add") cartAdds += 1;
       else if (row.action === "lookbook_view") lookbookViews += 1;
+      else if (row.action === "order_placed") ordersPlaced += 1;
       // event_link_click intentionally not surfaced in the summary prompt —
-      // not part of the "likes/cart-adds/lookbook-views" picture this task
-      // scopes; nothing currently writes that action type either (Part 1's
-      // documented gap).
+      // not part of the "likes/cart-adds/lookbook-views/orders" picture this
+      // task scopes; nothing currently writes that action type either (Part
+      // 1's documented gap).
     }
-    return { likes, cartAdds, lookbookViews };
+    // ordersPlaced (design spec 2026-11-15) — counts "order_placed" activity
+    // rows inserted by orderRequests.placeOrderRequest. These are the NEW
+    // order_requests, not the existing `orders` table (which the separate
+    // getPurchaseSummaryInternal still reads unchanged).
+    return { likes, cartAdds, lookbookViews, ordersPlaced };
   },
 });
 
@@ -871,7 +877,7 @@ export const generateCustomerActivitySummary = internalAction({
     // generateMessageDraft takes with its own numeric-shaped promo fields.
     const activitySummaryLine =
       `In the last 7 days: ${activity.likes} like(s), ${activity.cartAdds} cart-add(s), ` +
-      `${activity.lookbookViews} lookbook view(s).`;
+      `${activity.lookbookViews} lookbook view(s), ${activity.ordersPlaced} order(s) placed.`;
     const purchaseSummaryLine =
       purchases.orderCount > 0
         ? `Purchase history: ${purchases.orderCount} order(s) totalling approximately ₹${totalSpendRupees}.`

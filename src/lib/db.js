@@ -941,6 +941,42 @@ export function awardPoints(customer_id, delta, reason_type, note) {
 }
 
 /**
+ * Build Step 4 — three merchant bridges over convex/orderRequests.ts. Same
+ * PROPAGATE-real-errors pattern as recordMessageAction/awardPoints above:
+ * reject "Not logged in" with no session so the caller can show the real text
+ * through friendlyError. The merchant functions take the session as top-level
+ * userId/token args, so the merchantSessionArgs() result is spread straight in.
+ */
+export function fetchOrderRequestsByDate({ fromMs, toMs, cursor, numItems }) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.query(api.orderRequests.getOrderRequestsByDate, {
+    fromMs,
+    toMs,
+    paginationOpts: { numItems, cursor: cursor ?? null },
+    ...session,
+  });
+}
+
+export function searchOrderRequestsRemote(query) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.query(api.orderRequests.searchOrderRequests, { query, ...session });
+}
+
+export function cancelOrderRequestRemote(orderId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.mutation(api.orderRequests.cancelOrderRequest, { orderId, ...session });
+}
+
+/**
  * Activity Ledger fix (2026-09-02) — getPointsHistory bridge + hydrate.
  *
  * Root cause: convex/customers.ts's awardPoints mutation writes every manual
@@ -1422,7 +1458,7 @@ export function deleteLookbook(id) {
 }
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
-export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media }) {
+export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media, size_mode, stock }) {
   // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
   // when a gallery is provided, the cover mirrors media[0].url, same as the backend.
   if (Array.isArray(media) && media.length > 0) image_url = media[0].url;
@@ -1451,6 +1487,8 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
     likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
     lookbook_id,
     media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+    size_mode, // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+    stock,
   };
   state.catalogueItems.unshift(item);
   pushEvent('owner', 'catalogue', `New lookbook item added · ${title} (₹${item.price})`);
@@ -1473,6 +1511,10 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
       image_url: image_url || '',
       instagram_link: instagram_link || undefined,
       ...(media ? { media } : {}), // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+      // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+      // send size type and stock only when the caller supplied them.
+      ...(size_mode ? { size_mode } : {}),
+      ...(stock ? { stock } : {}),
       ...addSession,
     }).then((cvxId) => {
       // Stamp the real ID so subsequent deletes/updates target Convex
@@ -1480,7 +1522,10 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
       if (idx >= 0) {
         state.catalogueItems[idx].convexId = cvxId;
         state.catalogueItems[idx].id = cvxId; // Swap local ID for Convex ID
-        persist();
+        // Notify subscribers too, not persist alone: the merchant's per-piece
+        // Edit buttons key off the real Convex id, so a fresh add must re-render
+        // right away rather than waiting for a reload.
+        emit();
       }
     }).catch(() => { /* offline — keep local */ });
   }
@@ -1513,6 +1558,10 @@ export function updateCatalogueItem(id, patch) {
       } else if (p.image_url !== undefined) {
         state.catalogueItems[idx].image_url = p.image_url;
       }
+      // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+      // mirror the saved size type and stock onto the local item, same as above.
+      if (p.size_mode !== undefined) state.catalogueItems[idx].size_mode = p.size_mode;
+      if (p.stock !== undefined) state.catalogueItems[idx].stock = p.stock;
       emit();
     }
   });
@@ -1588,6 +1637,8 @@ export function hydrateCatalogue(force) {
             likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
             lookbook_id: lb._id,
             media: i.media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+            size_mode: i.size_mode, // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+            stock: i.stock,
           })));
         }
       }
@@ -1823,6 +1874,40 @@ export function checkout({ userId, items, pointsApplied, paymentMethod }) {
   }
 
   return order;
+}
+
+/**
+ * Send a real customer purchase to Convex (async). Magic-link gated, NOT a
+ * merchant call — the customer's own browser carries only the 180-day magic
+ * link, read the same way hydrateCustomerCatalogue's caller reads it (the
+ * saved customer session's id + token). Mirrors the backend request mutation:
+ * sends id, token, items and the payment choice only, and NEVER a price — the
+ * server sources every price from the database (D9).
+ * Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md.
+ *
+ * `lines` are the bag lines built on Lookbook.jsx; each carries the piece's
+ * Convex id, chosen size, qty and (for CUSTOM only) measurements. Returns the
+ * server result shape unchanged, or a friendly failure for the no-session and
+ * network-failure cases.
+ */
+export function placeOrderRemote({ lines, paymentPreference }) {
+  const client = getConvex();
+  const session = getCustomerSession();
+  if (!client || !session) {
+    return Promise.resolve({ ok: false, error: 'Please reopen your link from WhatsApp.' });
+  }
+  const items = lines.map((l) => ({
+    catalogue_item_id: l.convexId,
+    size: l.size,
+    qty: l.qty,
+    ...(l.size === 'CUSTOM' && l.measurements ? { measurements: l.measurements } : {}),
+  }));
+  return client.mutation(api.orderRequests.placeOrderRequest, {
+    id: session.id,
+    token: session.token,
+    items,
+    payment_preference: paymentPreference,
+  }).catch((err) => ({ ok: false, error: friendlyError(err) }));
 }
 
 /** Get all orders (async). MERCHANT-ONLY (Merchant Session Lock). */
@@ -2348,6 +2433,7 @@ const ACTIVITY_KIND_TO_LOCAL_TYPE = {
   cart_add: 'purchase',
   lookbook_view: 'catalogue',
   event_link_click: 'campaign',
+  order_placed: 'purchase',
 };
 
 // Short plain-English text per activity kind — omits the item name whenever
@@ -2358,6 +2444,7 @@ function activityItemText(kind, itemTitle) {
   if (kind === 'cart_add') return itemTitle ? `Added ${itemTitle} to cart` : 'Added an item to cart';
   if (kind === 'lookbook_view') return 'Viewed a lookbook';
   if (kind === 'event_link_click') return 'Opened an event link';
+  if (kind === 'order_placed') return itemTitle ? `Placed an order · ${itemTitle}` : 'Placed an order';
   return 'Submitted a review'; // kind === 'review'
 }
 

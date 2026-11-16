@@ -72,6 +72,60 @@ function validateMedia(media: MediaItem[]) {
 }
 
 /**
+ * Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+ * Shared validator shape for the optional per-size stock object on a catalogue
+ * item, used by both addCatalogueItem and updateCatalogueItem so they never
+ * drift.
+ */
+const STOCK_ARG = v.object({
+  M: v.optional(v.number()),
+  L: v.optional(v.number()),
+  XL: v.optional(v.number()),
+  XXL: v.optional(v.number()),
+  FREE: v.optional(v.number()),
+});
+
+type StockArg = {
+  M?: number;
+  L?: number;
+  XL?: number;
+  XXL?: number;
+  FREE?: number;
+};
+
+/**
+ * Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+ * Validates an optional size_mode + stock pair before insert/patch. Every
+ * stock value must be an integer 0..9999. "free" pieces may only set FREE;
+ * "sized" pieces may only set M/L/XL/XXL. Legacy pieces (size_mode unset) must
+ * not carry stock at all. Throws a ConvexError on any violation so the caller
+ * writes nothing.
+ */
+function validateStockMode(sizeMode: "sized" | "free" | undefined, stock: StockArg | undefined) {
+  if (stock === undefined) return; // no stock to validate
+  if (sizeMode === undefined) {
+    throw new ConvexError("Set a size type before adding stock numbers.");
+  }
+  const sizedKeys: Array<keyof StockArg> = ["M", "L", "XL", "XXL"];
+  const freeKeys: Array<keyof StockArg> = ["FREE"];
+  const allowed = sizeMode === "free" ? freeKeys : sizedKeys;
+  for (const key of ["M", "L", "XL", "XXL", "FREE"] as Array<keyof StockArg>) {
+    const value = stock[key];
+    if (value === undefined) continue;
+    if (!allowed.includes(key)) {
+      throw new ConvexError(
+        sizeMode === "free"
+          ? "A free-size piece only has one stock count."
+          : "A sized piece uses M, L, XL and XXL stock counts.",
+      );
+    }
+    if (!Number.isInteger(value) || value < 0 || value > 9999) {
+      throw new ConvexError("Each stock count must be a whole number from 0 to 9999.");
+    }
+  }
+}
+
+/**
  * Packet A (2026-10-01) — finds or lazily creates the one "Current catalogue"
  * home lookbook (kind: "catalogue"). Not an exported query/mutation/action —
  * a plain helper, only callable from inside an already-guarded mutation in
@@ -239,6 +293,10 @@ export const getCustomerCatalogue = query({
       lookbook_id: Id<"lookbooks">;
       // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
       media?: MediaItem[];
+      // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
+      // the customer lookbook needs these to show the size selector and respect stock.
+      size_mode?: "sized" | "free";
+      stock?: StockArg;
     }> = [];
 
     // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2) —
@@ -261,6 +319,8 @@ export const getCustomerCatalogue = query({
           source: lb.source || "manual",
           lookbook_id: lb._id,
           media: item.media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
+          size_mode: item.size_mode, // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+          stock: item.stock,
         });
       }
     }
@@ -385,9 +445,15 @@ export const addCatalogueItem = mutation({
     instagram_link: v.optional(v.string()),
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
     media: v.optional(v.array(MEDIA_ITEM)),
+    // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"))),
+    stock: v.optional(STOCK_ARG),
   },
   handler: async (ctx, { userId, token, ...args }) => {
     await requireMerchantSession(ctx, userId, token);
+
+    // Validate the size/stock pair before any write (design spec 2026-11-15).
+    validateStockMode(args.size_mode, args.stock);
 
     // Packet A (2026-10-01, decision 2) — resolve a missing lookbook_id to
     // the home lookbook, finding or creating it in the same transaction, so
@@ -422,6 +488,9 @@ export const updateCatalogueItem = mutation({
     instagram_link: v.optional(v.string()),
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
     media: v.optional(v.array(MEDIA_ITEM)),
+    // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
+    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"))),
+    stock: v.optional(STOCK_ARG),
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
     await requireMerchantSession(ctx, userId, token);
@@ -429,6 +498,12 @@ export const updateCatalogueItem = mutation({
     const existing = await ctx.db.get(id);
     if (!existing || existing.is_deleted === true) {
       throw new ConvexError("This piece has been deleted.");
+    }
+    // Design spec 2026-11-15 — validate stock against the size_mode this patch
+    // leaves the row in (the new one if being set, otherwise the existing one).
+    if (patch.stock !== undefined || patch.size_mode !== undefined) {
+      const effectiveMode = patch.size_mode ?? existing.size_mode;
+      validateStockMode(effectiveMode, patch.stock);
     }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
     // validate the gallery and mirror the cover into image_url when provided.

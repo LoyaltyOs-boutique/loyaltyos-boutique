@@ -8,6 +8,7 @@ import {
   getData, subscribe, customerLedger,
   validateMagicToken, syncMagicLinkCustomer,
   trackCartAdd, trackLookbookView, hydrateCustomerCatalogue,
+  placeOrderRemote,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import { ProductGallery } from '../components/ProductGallery.jsx';
@@ -48,6 +49,19 @@ export default function Lookbook() {
   const [points, setPoints] = useState(0);
   const [payMethod, setPayMethod] = useState('online');
   const [likeAnim, setLikeAnim] = useState(null);
+  // Size & quantity chooser (Customer purchases, Step 3). `choosing` holds the
+  // piece whose chooser is open, or null when closed. The rest are the form
+  // the chooser collects before a bag line is built.
+  const [choosing, setChoosing] = useState(null); // catalogue item | null
+  const [chooseSize, setChooseSize] = useState('NONE'); // M/L/XL/XXL/FREE/CUSTOM/NONE
+  const [chooseQty, setChooseQty] = useState(1);
+  const [chooseMeas, setChooseMeas] = useState({}); // custom-size measurement form
+  const [chooseErr, setChooseErr] = useState('');
+  // Real checkout progress (Convex placeOrderRemote). `placing` both disables
+  // the confirm control and guards a second submit while a request is in
+  // flight; `checkoutErr` shows a failed placement inside the checkout panel.
+  const [placing, setPlacing] = useState(false);
+  const [checkoutErr, setCheckoutErr] = useState('');
   // Race-condition fix (2026-09-17), upgraded 2026-09-19 (see
   // docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md):
   // was a bare boolean that flipped true on ANY hydrateCustomerCatalogue
@@ -218,20 +232,158 @@ export default function Lookbook() {
     )}`;
   };
 
-  const addToCart = (item) => {
+  // Small bag-row label for a line's size. NONE (legacy pieces) shows nothing.
+  const sizeLabel = (size) => {
+    if (size === 'FREE') return 'Free size';
+    if (size === 'CUSTOM') return 'Custom size';
+    if (size === 'NONE') return '';
+    return `Size ${size}`;
+  };
+
+  // How many units of a given piece+size are already sitting in the bag. Custom
+  // lines never merge, so they do not count toward a size's remaining amount.
+  const inBag = (pieceId, size) =>
+    cart.filter((l) => l.pieceId === pieceId && l.size === size && size !== 'CUSTOM')
+      .reduce((s, l) => s + l.qty, 0);
+  // Stock left for one piece+size, respecting what the bag already holds. CUSTOM
+  // and NONE are made to measure / legacy and never run out.
+  const stockLeft = (item, size) => {
+    if (size === 'CUSTOM' || size === 'NONE') return 10;
+    const have = (item.stock && item.stock[size]) || 0;
+    return Math.max(0, have - inBag(item.id, size));
+  };
+  // Largest quantity the chooser may offer for a piece+size (cap 10).
+  const qtyCap = (item, size) => (size === 'CUSTOM' ? 10 : Math.min(10, stockLeft(item, size)));
+  // A free-size or legacy card whose only option is fully taken is sold out.
+  const cardSoldOut = (item) => {
+    if (item.size_mode === 'free') return stockLeft(item, 'FREE') <= 0;
+    return false;
+  };
+
+  // "Add to bag" now opens the chooser for one piece instead of adding at once.
+  const openChooser = (item) => {
+    if (cardSoldOut(item)) return;
+    // For a sized piece, start on the first size that still has stock; if every
+    // size is sold out, use custom size, which is always made to measure.
+    const firstSized = ['M', 'L', 'XL', 'XXL'].find((s) => stockLeft(item, s) > 0) || 'CUSTOM';
+    const firstSize = item.size_mode === 'free' ? 'FREE' : item.size_mode === 'sized' ? firstSized : 'NONE';
+    setChooseSize(firstSize);
+    setChooseQty(1);
+    // Prefill the custom form from the customer's own measurements only when the
+    // page already has real values for them (magic-link customers carry none).
+    const m = customer.measurements || {};
+    setChooseMeas({
+      ...(m.bust ? { bust: m.bust } : {}),
+      ...(m.waist ? { waist: m.waist } : {}),
+      ...(m.hip ? { hip: m.hip } : {}),
+      ...(m.height ? { height: m.height } : {}),
+    });
+    setChooseErr('');
+    setChoosing(item);
+  };
+
+  // Turn the chooser form into a bag line. Non-custom lines of the same piece
+  // and size merge (capped); every custom line stays on its own.
+  const confirmChoose = () => {
+    const item = choosing;
+    if (!item) return;
+    const size = chooseSize;
+    if (size === 'CUSTOM') {
+      const req = ['bust', 'waist', 'hip', 'shoulder', 'top_length'];
+      for (const k of req) {
+        const n = Number(chooseMeas[k]);
+        if (!(n > 0 && n <= 200)) {
+          setChooseErr('Please enter valid measurements (each between 1 and 200).');
+          return;
+        }
+      }
+      if ((chooseMeas.notes || '').length > 300) {
+        setChooseErr('Please keep notes under 300 characters.');
+        return;
+      }
+    } else if (stockLeft(item, size) <= 0) {
+      setChooseErr('Sorry, this size is out of stock.');
+      return;
+    }
+    const num = (x) => (x === '' || x === undefined || x === null ? undefined : Number(x));
+    const measurements = size === 'CUSTOM' ? {
+      unit: 'cm',
+      bust: num(chooseMeas.bust), waist: num(chooseMeas.waist), hip: num(chooseMeas.hip),
+      shoulder: num(chooseMeas.shoulder), top_length: num(chooseMeas.top_length),
+      ...(num(chooseMeas.sleeve_length) !== undefined ? { sleeve_length: num(chooseMeas.sleeve_length) } : {}),
+      ...(num(chooseMeas.armhole) !== undefined ? { armhole: num(chooseMeas.armhole) } : {}),
+      ...(num(chooseMeas.bottom_length) !== undefined ? { bottom_length: num(chooseMeas.bottom_length) } : {}),
+      ...(num(chooseMeas.height) !== undefined ? { height: num(chooseMeas.height) } : {}),
+      ...((chooseMeas.notes || '').trim() ? { notes: chooseMeas.notes.trim() } : {}),
+    } : undefined;
+    const qty = Math.max(1, Math.min(chooseQty, size === 'CUSTOM' ? 10 : qtyCap(item, size)));
+
     setCart((c) => {
-      const ex = c.find((i) => i.id === item.id);
-      return ex ? c.map((i) => (i.id === item.id ? { ...i, qty: i.qty + 1 } : i)) : [...c, { id: item.id, title: item.title, price: item.price, image_url: item.image_url, qty: 1 }];
+      if (size !== 'CUSTOM') {
+        const ex = c.find((l) => l.pieceId === item.id && l.size === size);
+        if (ex) {
+          const capped = Math.min(10, ex.qty + qty, ((item.stock && item.stock[size]) || 10));
+          return c.map((l) => (l === ex ? { ...l, qty: capped } : l));
+        }
+      }
+      return [...c, {
+        lineId: `${item.id}-${size}-${Date.now()}`,
+        pieceId: item.id, convexId: item.id, title: item.title,
+        price: item.price, image_url: item.image_url, size, qty, measurements,
+      }];
     });
     // Customer Activity Intelligence (Part 1): fire-and-forget tracking
     // side-effect, sequential but independent of setCart above — never
-    // awaited, never gates or rolls back the actual cart add.
+    // awaited, never gates or rolls back the actual bag add.
     trackCartAdd(customer.id, item.id);
+    setChoosing(null);
   };
-  const setQty = (id, q) => setCart((c) => c.map((i) => (i.id === id ? { ...i, qty: Math.max(0, q) } : i)).filter((i) => i.qty > 0));
-  const doCheckout = (method) => {
-    const order = checkout({ userId: customer.id, items: cart, pointsApplied: discount, paymentMethod: method });
-    setCart([]); setCheckoutOpen(false); setPayOpen(false); setPoints(0); setLastOrder(order); setView('success');
+
+  // Change a bag line's quantity, holding it inside 1..cap for that piece+size.
+  // The cap is the piece's live stock for that size (custom lines cap at 10).
+  const setLineQty = (lineId, q) => setCart((c) => c
+    .map((l) => {
+      if (l.lineId !== lineId) return l;
+      const piece = catalogue.find((it) => it.id === l.pieceId);
+      const max = l.size === 'CUSTOM'
+        ? 10
+        : Math.min(10, (piece && piece.stock && piece.stock[l.size]) || 10);
+      return { ...l, qty: Math.max(0, Math.min(q, max)) };
+    })
+    .filter((l) => l.qty > 0));
+
+  // Real checkout: send the purchase through Convex (server sources prices and
+  // reserves stock). `method` maps to the payment preference the same way as
+  // before. On success the bag clears and the existing success screen shows a
+  // receipt built from the bag with zero points (no loyalty points on these
+  // purchases yet). On failure the bag is kept and the reason is shown inside
+  // the checkout panel. Either way we re-hydrate so stock on the feed is fresh.
+  const doCheckout = async (method) => {
+    if (placing) return; // double-tap guard
+    setPlacing(true);
+    setCheckoutErr('');
+    const bag = cart;
+    const result = await placeOrderRemote({ lines: bag, paymentPreference: method === 'online' ? 'online' : 'offline' });
+    setPlacing(false);
+    if (lastAuthRef.id && lastAuthRef.token) {
+      hydrateCustomerCatalogue(lastAuthRef.id, lastAuthRef.token, handleCatalogueSettled);
+    }
+    if (!result || !result.ok) {
+      // Keep the bag; surface the reason inside the checkout modal. Close the
+      // Razorpay sim so that modal is the one on screen.
+      setPayOpen(false);
+      setCheckoutErr((result && result.error) || 'Something went wrong — please try again.');
+      return;
+    }
+    const sub = bag.reduce((s, l) => s + l.price * l.qty, 0);
+    setLastOrder({
+      id: String(result.orderId || ''),
+      paymentMethod: method,
+      finalTotal: sub,
+      pointsEarned: 0,
+      items: bag.map((l) => ({ catalogueItemId: l.pieceId, title: l.title, price: l.price })),
+    });
+    setCart([]); setCheckoutOpen(false); setPayOpen(false); setPoints(0); setView('success');
     goldBurst();
   };
 
@@ -347,7 +499,7 @@ export default function Lookbook() {
                       <h3 className="luxe-title text-lg leading-snug">{item.title}</h3>
                       <div className="flex items-center justify-between mt-2">
                         <span className="text-sm font-medium">{inr(item.price)}</span>
-                        <button onClick={() => addToCart(item)} className="btn-outline !py-1.5 !px-3 text-[9px]">Add to bag</button>
+                        <button onClick={() => openChooser(item)} disabled={cardSoldOut(item)} className="btn-outline !py-1.5 !px-3 text-[9px] disabled:opacity-40">{cardSoldOut(item) ? 'Out of stock' : 'Add to bag'}</button>
                       </div>
                       <a href={waLink(item)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
                         Inquire via WhatsApp ✆
@@ -366,8 +518,8 @@ export default function Lookbook() {
                 <p className="text-sm text-steel">No pending product reviews — thank you! 🖤</p>
               ) : (
                 <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {reviewableItems.map((i) => (
-                    <div key={i.catalogueItemId} className="card p-4 flex items-center gap-4">
+                  {reviewableItems.map((i, idx) => (
+                    <div key={`${i.catalogueItemId}-${idx}`} className="card p-4 flex items-center gap-4">
                       <img src={catalogue.find((c) => c.id === i.catalogueItemId)?.image_url || ''} className="h-16 w-14 object-cover border border-line" alt="" />
                       <div className="min-w-0 flex-1">
                         <div className="text-sm font-medium truncate">{i.title}</div>
@@ -412,16 +564,17 @@ export default function Lookbook() {
               <>
                 <div className="space-y-3">
                   {cart.map((i) => (
-                    <div key={i.id} className="card p-4 flex items-center gap-4">
+                    <div key={i.lineId} className="card p-4 flex items-center gap-4">
                       <img src={i.image_url} alt="" className="h-20 w-16 object-cover border border-line" />
                       <div className="flex-1 min-w-0">
                         <div className="font-medium truncate">{i.title}</div>
+                        {sizeLabel(i.size) && <div className="text-sm text-steel mt-1">{sizeLabel(i.size)}</div>}
                         <div className="text-sm text-steel mt-1">{inr(i.price)} × {i.qty}</div>
                       </div>
                       <div className="flex items-center gap-2">
-                        <button onClick={() => setQty(i.id, i.qty - 1)} className="btn-ghost !px-3 !py-1">−</button>
+                        <button onClick={() => setLineQty(i.lineId, i.qty - 1)} className="btn-ghost !px-3 !py-1">−</button>
                         <span className="w-6 text-center">{i.qty}</span>
-                        <button onClick={() => setQty(i.id, i.qty + 1)} className="btn-ghost !px-3 !py-1">+</button>
+                        <button onClick={() => setLineQty(i.lineId, i.qty + 1)} className="btn-ghost !px-3 !py-1">+</button>
                       </div>
                       <div className="w-24 text-right font-medium">{inr(i.price * i.qty)}</div>
                     </div>
@@ -433,7 +586,7 @@ export default function Lookbook() {
                 </div>
                 <div className="flex justify-end mt-4 gap-3">
                   <button onClick={() => setView('feed')} className="btn-ghost">Continue shopping</button>
-                  <button onClick={() => { setPoints(0); setPayMethod('online'); setCheckoutOpen(true); }} className="btn-ink">Checkout</button>
+                  <button onClick={() => { setPoints(0); setPayMethod('online'); setCheckoutErr(''); setCheckoutOpen(true); }} className="btn-ink">Checkout</button>
                 </div>
               </>
             )}
@@ -445,10 +598,10 @@ export default function Lookbook() {
             <div className="text-5xl mb-4">✨</div>
             <div className="eyebrow mb-2">85 Lansdowne · Order confirmed</div>
             <h1 className="luxe-title text-3xl mb-3">{lastOrder.paymentMethod === 'online' ? 'Payment successful' : 'Reserved in store'}</h1>
-            <p className="text-steel text-sm mb-6">Final total <span className="text-ink font-medium">{inr(lastOrder.finalTotal)}</span> · You earned <span className="text-gold font-medium">+{lastOrder.pointsEarned}</span> points.</p>
+            <p className="text-steel text-sm mb-6">Final total <span className="text-ink font-medium">{inr(lastOrder.finalTotal)}</span>{lastOrder.pointsEarned > 0 && <> · You earned <span className="text-gold font-medium">+{lastOrder.pointsEarned}</span> points.</>}</p>
             <div className="card px-6 py-5 text-left text-sm">
-              {lastOrder.items.map((i) => (
-                <div key={i.catalogueItemId} className="flex justify-between py-2 border-b border-line last:border-0"><span>{i.title}</span><span>{inr(i.price)}</span></div>
+              {lastOrder.items.map((i, idx) => (
+                <div key={`${i.catalogueItemId}-${idx}`} className="flex justify-between py-2 border-b border-line last:border-0"><span>{i.title}</span><span>{inr(i.price)}</span></div>
               ))}
             </div>
             {lastOrder.paymentMethod === 'online' && <p className="text-xs text-steel mt-4">Razorpay · Order ID {lastOrder.id.slice(0, 8).toUpperCase()}</p>}
@@ -467,13 +620,7 @@ export default function Lookbook() {
             </div>
             <div className="p-6 space-y-5">
               <div className="flex justify-between text-sm border-b border-line pb-3"><span className="text-steel">Subtotal</span><span>{inr(subtotal)}</span></div>
-              <div>
-                <div className="flex justify-between text-sm mb-2"><span className="text-steel">Redeem loyalty points</span><span className="text-gold font-medium">{inrFull(points)} pts = {inr(discount)} off</span></div>
-                <input type="range" min="0" max={maxRedeem} value={points} onChange={(e) => setPoints(Number(e.target.value))} className="w-full accent-[#C5A880]" />
-                <div className="flex justify-between text-[10px] tracking-wide2 uppercase text-steel mt-1"><span>0</span><span>Available {inrFull(maxRedeem)}</span></div>
-              </div>
-              <div className="flex justify-between text-sm border-b border-line pb-3"><span className="text-steel">Points discount</span><span className="text-gold">−{inr(discount)}</span></div>
-              <div className="flex justify-between text-sm font-medium"><span>Final total</span><span className="luxe-title text-xl">{inr(finalTotal)}</span></div>
+              <div className="flex justify-between text-sm font-medium"><span>Final total</span><span className="luxe-title text-xl">{inr(subtotal)}</span></div>
               <div className="space-y-2">
                 <button onClick={() => setPayMethod('online')} className={cls('w-full border px-4 py-3 text-left text-sm', payMethod === 'online' ? 'border-ink bg-mist' : 'border-line hover:border-ink')}>
                   <div className="font-medium">Pay Online <span className="text-[9px] tracking-wide2 uppercase text-steel">· Razorpay</span></div>
@@ -484,12 +631,71 @@ export default function Lookbook() {
                   <div className="text-xs text-steel mt-0.5">Cash / card swipe at the boutique</div>
                 </button>
               </div>
+              {checkoutErr && <div className="text-xs text-gold font-medium">{checkoutErr}</div>}
               <button
                 onClick={() => (payMethod === 'online' ? setPayOpen(true) : doCheckout('offline'))}
-                className="btn-ink w-full"
+                className="btn-ink w-full disabled:opacity-40"
+                disabled={placing}
               >
-                {payMethod === 'online' ? `Pay ${inr(finalTotal)} online` : `Reserve & pay at store`}
+                {payMethod === 'online' ? `Pay ${inr(subtotal)} online` : (placing ? 'Placing your order…' : `Reserve & pay at store`)}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Size & quantity chooser (Customer purchases, Step 3) */}
+      {choosing && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-ink/30 p-4 overflow-y-auto" onClick={() => setChoosing(null)}>
+          <div className="card bg-white w-full max-w-md my-6 animate-fadeUp" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-line px-6 py-4">
+              <h3 className="luxe-title text-lg">{choosing.title}</h3>
+              <button onClick={() => setChoosing(null)} className="text-steel hover:text-ink text-xl">×</button>
+            </div>
+            <div className="p-6 space-y-5">
+              {choosing.size_mode === 'free' && (
+                <div className="text-sm text-steel mt-1">Free size · {stockLeft(choosing, 'FREE')} left</div>
+              )}
+              {choosing.size_mode === 'sized' && (
+                <div>
+                  <div className="label">Choose size</div>
+                  <div className="flex gap-2 flex-wrap">
+                    {['M', 'L', 'XL', 'XXL'].map((s) => {
+                      const out = stockLeft(choosing, s) <= 0;
+                      return (
+                        <button key={s} disabled={out} onClick={() => { setChooseSize(s); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors disabled:opacity-40', chooseSize === s ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                          {s}
+                        </button>
+                      );
+                    })}
+                    <button onClick={() => { setChooseSize('CUSTOM'); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', chooseSize === 'CUSTOM' ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                      Custom size
+                    </button>
+                  </div>
+                </div>
+              )}
+              {chooseSize === 'CUSTOM' ? (
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <div><label className="label">Bust (cm)</label><input className="input" type="number" value={chooseMeas.bust || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, bust: e.target.value })} /></div>
+                  <div><label className="label">Waist (cm)</label><input className="input" type="number" value={chooseMeas.waist || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, waist: e.target.value })} /></div>
+                  <div><label className="label">Hip (cm)</label><input className="input" type="number" value={chooseMeas.hip || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, hip: e.target.value })} /></div>
+                  <div><label className="label">Shoulder (cm)</label><input className="input" type="number" value={chooseMeas.shoulder || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, shoulder: e.target.value })} /></div>
+                  <div><label className="label">Length (cm)</label><input className="input" type="number" value={chooseMeas.top_length || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, top_length: e.target.value })} /></div>
+                  <div><label className="label">Sleeve length (cm)</label><input className="input" type="number" value={chooseMeas.sleeve_length || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, sleeve_length: e.target.value })} /></div>
+                  <div><label className="label">Armhole (cm)</label><input className="input" type="number" value={chooseMeas.armhole || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, armhole: e.target.value })} /></div>
+                  <div><label className="label">Bottom length (cm)</label><input className="input" type="number" value={chooseMeas.bottom_length || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, bottom_length: e.target.value })} /></div>
+                  <div><label className="label">Height (cm)</label><input className="input" type="number" value={chooseMeas.height || ''} onChange={(e) => setChooseMeas({ ...chooseMeas, height: e.target.value })} /></div>
+                  <div className="sm:col-span-2"><label className="label">Notes</label><input className="input" value={chooseMeas.notes || ''} maxLength={300} onChange={(e) => setChooseMeas({ ...chooseMeas, notes: e.target.value })} /></div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setChooseQty(Math.max(1, chooseQty - 1))} className="btn-ghost !px-3 !py-1">−</button>
+                  <span className="w-6 text-center">{chooseQty}</span>
+                  <button onClick={() => setChooseQty(Math.min(qtyCap(choosing, chooseSize), chooseQty + 1))} className="btn-ghost !px-3 !py-1">+</button>
+                </div>
+              )}
+              {chooseErr && <div className="text-xs text-gold font-medium">{chooseErr}</div>}
+              <button onClick={confirmChoose} className="btn-ink w-full">Add to bag</button>
             </div>
           </div>
         </div>

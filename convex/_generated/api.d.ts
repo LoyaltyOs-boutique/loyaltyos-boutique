@@ -18,6 +18,7 @@ import type * as events from "../events.js";
 import type * as http from "../http.js";
 import type * as lookbooks from "../lookbooks.js";
 import type * as notifications from "../notifications.js";
+import type * as orderRequests from "../orderRequests.js";
 import type * as orders from "../orders.js";
 import type * as platformStats from "../platformStats.js";
 import type * as rateLimits from "../rateLimits.js";
@@ -44,6 +45,7 @@ declare const fullApi: ApiFromModules<{
   http: typeof http;
   lookbooks: typeof lookbooks;
   notifications: typeof notifications;
+  orderRequests: typeof orderRequests;
   orders: typeof orders;
   platformStats: typeof platformStats;
   rateLimits: typeof rateLimits;
