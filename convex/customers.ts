@@ -1513,6 +1513,41 @@ export const getCustomerIntelligenceProfile = query({
       createdAt: new Date(r.created_at).toISOString(),
     }));
 
+    // 3b. Lookbook orders (new order_requests table) — PLACED only, via the
+    // by_customer_created_at index newest-first. A NEW field; the existing
+    // `orders` field above (the paid orders table) is not changed. Each line is
+    // built field-by-field with ONLY title/size/qty — measurements, notes,
+    // price_paise, subtotal_paise, mobile and search_text are deliberately NOT
+    // read, same whitelist the AI summary uses. Up to 5 newest placed orders.
+    const lookbookOrderRows = await ctx.db
+      .query("order_requests")
+      .withIndex("by_customer_created_at", (q) => q.eq("customer_id", customerId))
+      .order("desc")
+      .collect();
+    const placedLookbookOrders = lookbookOrderRows.filter((r) => r.status === "placed");
+    // True total piece count: sum of qty over ALL items of ALL placed orders
+    // (the same placedLookbookOrders set placed_count counts, NOT the slice(0,5)
+    // `recent` sample) — mirrors placedPieces in ai.ts so a caller never has to
+    // add up the `recent` examples to learn the real total.
+    const placed_pieces = placedLookbookOrders.reduce(
+      (orderSum, order) =>
+        orderSum + order.items.reduce((itemSum, item) => itemSum + item.qty, 0),
+      0,
+    );
+    const lookbook_orders = {
+      placed_count: placedLookbookOrders.length,
+      placed_pieces,
+      recent: placedLookbookOrders.slice(0, 5).map((order) => ({
+        created_at: order.created_at,
+        payment_preference: order.payment_preference,
+        items: order.items.map((item) => ({
+          title: item.title,
+          size: item.size,
+          qty: item.qty,
+        })),
+      })),
+    };
+
     // 4. Upcoming occasion (next 7 days) — reuses the SAME window logic as
     // the Delight Queue via checkUpcoming(), just scoped to this one customer.
     const OCCASION_WINDOW_DAYS = 7;
@@ -1540,6 +1575,7 @@ export const getCustomerIntelligenceProfile = query({
     return {
       customer,
       orders,
+      lookbook_orders,
       points_history,
       upcoming_occasion,
     };

@@ -127,6 +127,10 @@ export const PROMPT_FIELD_MAX = {
   ENUM: 100,
   TITLE: 200,
   DESCRIPTION: 500,
+  // ORDER_TITLE (80): a lookbook order line's piece title (order_requests
+  // items[].title) is a short merchant-entered product name, realistically
+  // well under 80 chars; tight cap bounds the prompt and injection surface.
+  ORDER_TITLE: 80,
 } as const;
 
 /**
@@ -826,6 +830,70 @@ export const getPurchaseSummaryInternal = internalQuery({
 });
 
 /**
+ * getLookbookOrderSummaryInternal — this customer's PLACED lookbook orders
+ * (the new order_requests table), read via the by_customer_created_at index
+ * newest-first, same "equality then range" convention points_ledger/activity
+ * use. Cancelled order_requests are excluded (design decision 2).
+ *
+ * CONFIDENTIAL FIELD WHITELIST (design decision 3): this query returns a count
+ * plus at most 3 recent lines, and each line is built field-by-field with ONLY
+ * title, size and qty. The whole order row is NEVER spread or returned. The
+ * confidential/price fields on each item — measurements (body-fit data),
+ * measurements.notes, price_paise — and the row-level subtotal_paise, mobile
+ * and search_text are deliberately NOT read into the returned object, so they
+ * cannot reach a Gemini prompt by construction, not merely by convention.
+ *
+ * Kept separate from getPurchaseSummaryInternal so the paid `orders` line and
+ * the "payment not collected yet" lookbook-orders line are never summed
+ * (design decision 1).
+ */
+export const getLookbookOrderSummaryInternal = internalQuery({
+  args: { customerId: v.id("users") },
+  handler: async (ctx, { customerId }) => {
+    // Per-customer, newest first. Index equality on customer_id; order("desc")
+    // walks created_at high-to-low. Bounded by one customer's order volume.
+    const rows = await ctx.db
+      .query("order_requests")
+      .withIndex("by_customer_created_at", (q) => q.eq("customer_id", customerId))
+      .order("desc")
+      .collect();
+
+    // Only "placed" counts — cancelled orders are not real pending orders.
+    const placed = rows.filter((r) => r.status === "placed");
+
+    // True total piece count: sum of qty over ALL items of ALL placed orders
+    // (the same `placed` set placedCount counts). Gemini must be given this
+    // exact number because recentLines is capped at 3 example lines; left to
+    // add up only the examples, the model under-counts the real total.
+    const placedPieces = placed.reduce(
+      (orderSum, order) =>
+        orderSum + order.items.reduce((itemSum, item) => itemSum + item.qty, 0),
+      0,
+    );
+
+    // At most 3 lines in total, built field-by-field. Walk the placed orders
+    // newest first and, within each order, every line item, so a second piece
+    // in the same order is not dropped. Stop once 3 lines are collected. Only
+    // title/size/qty are copied — never the whole item, never
+    // measurements/price_paise/subtotal/mobile/search_text.
+    const recentLines: Array<{ title: string; size: string; qty: number }> = [];
+    for (const order of placed) {
+      if (recentLines.length >= 3) break;
+      for (const item of order.items) {
+        if (recentLines.length >= 3) break;
+        recentLines.push({
+          title: item.title,
+          size: item.size,
+          qty: item.qty,
+        });
+      }
+    }
+
+    return { placedCount: placed.length, placedPieces, recentLines };
+  },
+});
+
+/**
  * generateCustomerActivitySummary — Part 3a. Builds a Gemini prompt for one
  * customer's recent (last 7 days) engagement + purchase-history aggregate and
  * returns a merchant-facing summary of their activity, or null on ANY
@@ -864,6 +932,13 @@ export const generateCustomerActivitySummary = internalAction({
     const purchases = await ctx.runQuery(internal.ai.getPurchaseSummaryInternal, { customerId });
     const totalSpendRupees = Math.floor(purchases.totalSpendPaise / 100);
 
+    // Lookbook orders (new order_requests) — PLACED only, whitelisted to
+    // title/size/qty inside the query. Kept separate from the paid `orders`
+    // line above; the two totals are never summed (design decision 1).
+    const lookbookOrders = await ctx.runQuery(internal.ai.getLookbookOrderSummaryInternal, {
+      customerId,
+    });
+
     // Truncate every free-text field at the point of use — same discipline
     // generateMessageDraft uses; only customerName/tier are free-ish text
     // here (tier is a closed enum, capped anyway per PROMPT_FIELD_MAX's own
@@ -883,10 +958,38 @@ export const generateCustomerActivitySummary = internalAction({
         ? `Purchase history: ${purchases.orderCount} order(s) totalling approximately ₹${totalSpendRupees}.`
         : `Purchase history: no orders yet.`;
 
+    // Lookbook-orders line. Payment is not collected on these (design decision
+    // 5) so they are described as requests, never as money spent. Each recent
+    // piece is "<title> (<size label>) x<qty>"; the title is the only free text
+    // and is capped with truncateForPrompt. The size enum maps to a readable
+    // label; a NONE (legacy, no size) line carries no size label.
+    const sizeLabel = (size: string): string => {
+      if (size === "FREE") return "free size";
+      if (size === "CUSTOM") return "custom size";
+      if (size === "NONE") return "";
+      return `size ${size}`;
+    };
+    let lookbookOrdersLine: string;
+    if (lookbookOrders.placedCount === 0) {
+      lookbookOrdersLine = "Lookbook orders: none yet.";
+    } else {
+      const pieces = lookbookOrders.recentLines.map((line) => {
+        const safeTitle = truncateForPrompt(line.title, PROMPT_FIELD_MAX.ORDER_TITLE);
+        const label = sizeLabel(line.size);
+        const sizePart = label ? ` (${label})` : "";
+        return `${safeTitle}${sizePart} x${line.qty}`;
+      });
+      lookbookOrdersLine =
+        `Lookbook orders: ${lookbookOrders.placedCount} placed, ${lookbookOrders.placedPieces} pieces in total (payment not collected yet). ` +
+        `Recent pieces (examples only, not the full list): ${pieces.join(", ")}.`;
+    }
+
     const prompt = [
       `You are writing a short, internal note for the staff of "85 Lansdowne", a luxury fashion boutique in Kolkata, about one of their loyalty customers.`,
       `Write a brief (2-3 sentences), factual, merchant-facing summary of this customer's recent engagement and purchase history, in a professional tone. This note is for STAFF EYES ONLY — it will never be sent to the customer, so do not address them directly or write it as a message to them.`,
       `Base the summary ONLY on the DATA section below (the customer's name/tier and the activity/purchase figures) — do not invent details not present in the data.`,
+      `Lookbook orders are order requests whose payment has not been collected yet, so do not describe them as money spent.`,
+      `Use the pieces-in-total number exactly as given; never add up the recent pieces yourself.`,
       `Return ONLY the summary text — no preamble, no quotation marks, no explanation.`,
       DATA_NOT_INSTRUCTIONS_NOTICE,
       [
@@ -894,6 +997,7 @@ export const generateCustomerActivitySummary = internalAction({
         wrapUntrustedField("customer_tier", safeTier),
         wrapUntrustedField("recent_activity", activitySummaryLine),
         wrapUntrustedField("purchase_history", purchaseSummaryLine),
+        wrapUntrustedField("lookbook_orders", lookbookOrdersLine),
       ].join(" "),
     ]
       .filter(Boolean)
