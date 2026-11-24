@@ -39,10 +39,12 @@ function fmtWhen(ms) {
 }
 
 // One line of text per item, e.g. "Saree · Size M · Qty 2". FREE reads
-// "Free size", CUSTOM reads "Custom size", NONE shows no size text (legacy).
+// "Free size", ONE reads "One size", CUSTOM reads "Custom size", NONE shows
+// no size text (legacy).
 function lineText(line) {
   const parts = [line.title];
   if (line.size === 'FREE') parts.push('Free size');
+  else if (line.size === 'ONE') parts.push('One size');
   else if (line.size === 'CUSTOM') parts.push('Custom size');
   else if (line.size !== 'NONE') parts.push(`Size ${line.size}`);
   parts.push(`Qty ${line.qty}`);

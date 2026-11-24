@@ -1458,7 +1458,7 @@ export function deleteLookbook(id) {
 }
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
-export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media, size_mode, stock }) {
+export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media, size_mode, sizes, out_of_stock_sizes, out_of_stock }) {
   // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
   // when a gallery is provided, the cover mirrors media[0].url, same as the backend.
   if (Array.isArray(media) && media.length > 0) image_url = media[0].url;
@@ -1487,8 +1487,11 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
     likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
     lookbook_id,
     media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
-    size_mode, // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
-    stock,
+    // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+    size_mode,
+    sizes,
+    out_of_stock_sizes,
+    out_of_stock,
   };
   state.catalogueItems.unshift(item);
   pushEvent('owner', 'catalogue', `New lookbook item added · ${title} (₹${item.price})`);
@@ -1511,10 +1514,12 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
       image_url: image_url || '',
       instagram_link: instagram_link || undefined,
       ...(media ? { media } : {}), // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
-      // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
-      // send size type and stock only when the caller supplied them.
+      // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+      // always send size_mode; the backend ignores size fields without it.
       ...(size_mode ? { size_mode } : {}),
-      ...(stock ? { stock } : {}),
+      ...(sizes ? { sizes } : {}),
+      ...(out_of_stock_sizes ? { out_of_stock_sizes } : {}),
+      ...(out_of_stock !== undefined ? { out_of_stock } : {}),
       ...addSession,
     }).then((cvxId) => {
       // Stamp the real ID so subsequent deletes/updates target Convex
@@ -1558,10 +1563,12 @@ export function updateCatalogueItem(id, patch) {
       } else if (p.image_url !== undefined) {
         state.catalogueItems[idx].image_url = p.image_url;
       }
-      // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
-      // mirror the saved size type and stock onto the local item, same as above.
+      // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+      // mirror the saved size availability onto the local item, same as above.
       if (p.size_mode !== undefined) state.catalogueItems[idx].size_mode = p.size_mode;
-      if (p.stock !== undefined) state.catalogueItems[idx].stock = p.stock;
+      if (p.sizes !== undefined) state.catalogueItems[idx].sizes = p.sizes;
+      if (p.out_of_stock_sizes !== undefined) state.catalogueItems[idx].out_of_stock_sizes = p.out_of_stock_sizes;
+      if (p.out_of_stock !== undefined) state.catalogueItems[idx].out_of_stock = p.out_of_stock;
       emit();
     }
   });
@@ -1637,8 +1644,11 @@ export function hydrateCatalogue(force) {
             likedBy: [], // per-customer like toggle state (bug fix — see likeItem())
             lookbook_id: lb._id,
             media: i.media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
-            size_mode: i.size_mode, // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
-            stock: i.stock,
+            // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+            size_mode: i.size_mode,
+            sizes: i.sizes,
+            out_of_stock_sizes: i.out_of_stock_sizes,
+            out_of_stock: i.out_of_stock,
           })));
         }
       }

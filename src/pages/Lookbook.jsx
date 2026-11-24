@@ -53,7 +53,7 @@ export default function Lookbook() {
   // piece whose chooser is open, or null when closed. The rest are the form
   // the chooser collects before a bag line is built.
   const [choosing, setChoosing] = useState(null); // catalogue item | null
-  const [chooseSize, setChooseSize] = useState('NONE'); // M/L/XL/XXL/FREE/CUSTOM/NONE
+  const [chooseSize, setChooseSize] = useState('FREE'); // S/M/L/XL/XXL/FREE/ONE/CUSTOM
   const [chooseQty, setChooseQty] = useState(1);
   const [chooseMeas, setChooseMeas] = useState({}); // custom-size measurement form
   const [chooseErr, setChooseErr] = useState('');
@@ -232,41 +232,39 @@ export default function Lookbook() {
     )}`;
   };
 
-  // Small bag-row label for a line's size. NONE (legacy pieces) shows nothing.
+  // Canonical display/chooser order for the five sizes.
+  const SIZE_ORDER = ['S', 'M', 'L', 'XL', 'XXL'];
+
+  // Small bag-row label for a line's size.
   const sizeLabel = (size) => {
     if (size === 'FREE') return 'Free size';
+    if (size === 'ONE') return 'One size';
     if (size === 'CUSTOM') return 'Custom size';
     if (size === 'NONE') return '';
     return `Size ${size}`;
   };
 
-  // How many units of a given piece+size are already sitting in the bag. Custom
-  // lines never merge, so they do not count toward a size's remaining amount.
-  const inBag = (pieceId, size) =>
-    cart.filter((l) => l.pieceId === pieceId && l.size === size && size !== 'CUSTOM')
-      .reduce((s, l) => s + l.qty, 0);
-  // Stock left for one piece+size, respecting what the bag already holds. CUSTOM
-  // and NONE are made to measure / legacy and never run out.
-  const stockLeft = (item, size) => {
-    if (size === 'CUSTOM' || size === 'NONE') return 10;
-    const have = (item.stock && item.stock[size]) || 0;
-    return Math.max(0, have - inBag(item.id, size));
+  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+  // stock numbers are gone; this only checks size AVAILABILITY. CUSTOM is made
+  // to measure and never out of stock.
+  const isOutOfStock = (item, size) => {
+    if (size === 'CUSTOM') return false;
+    if (item.size_mode === 'sized') return (item.out_of_stock_sizes || []).includes(size);
+    return item.out_of_stock === true;
   };
-  // Largest quantity the chooser may offer for a piece+size (cap 10).
-  const qtyCap = (item, size) => (size === 'CUSTOM' ? 10 : Math.min(10, stockLeft(item, size)));
-  // A free-size or legacy card whose only option is fully taken is sold out.
-  const cardSoldOut = (item) => {
-    if (item.size_mode === 'free') return stockLeft(item, 'FREE') <= 0;
-    return false;
-  };
+  // A free-size or one-size card that is out of stock is sold out. A sized
+  // piece is never sold out at the card level — the chooser shows which
+  // individual sizes are out.
+  const cardSoldOut = (item) => (item.size_mode === 'free' || item.size_mode === 'one') && item.out_of_stock === true;
 
   // "Add to bag" now opens the chooser for one piece instead of adding at once.
   const openChooser = (item) => {
     if (cardSoldOut(item)) return;
-    // For a sized piece, start on the first size that still has stock; if every
-    // size is sold out, use custom size, which is always made to measure.
-    const firstSized = ['M', 'L', 'XL', 'XXL'].find((s) => stockLeft(item, s) > 0) || 'CUSTOM';
-    const firstSize = item.size_mode === 'free' ? 'FREE' : item.size_mode === 'sized' ? firstSized : 'NONE';
+    // For a sized piece, start on the first in-stock size; if every size is
+    // out of stock, use custom size, which is always made to measure.
+    const availableSizes = SIZE_ORDER.filter((s) => (item.sizes || []).includes(s));
+    const firstSized = availableSizes.find((s) => !isOutOfStock(item, s)) || 'CUSTOM';
+    const firstSize = item.size_mode === 'sized' ? firstSized : (item.size_mode === 'one' ? 'ONE' : 'FREE');
     setChooseSize(firstSize);
     setChooseQty(1);
     // Prefill the custom form from the customer's own measurements only when the
@@ -301,7 +299,7 @@ export default function Lookbook() {
         setChooseErr('Please keep notes under 300 characters.');
         return;
       }
-    } else if (stockLeft(item, size) <= 0) {
+    } else if (isOutOfStock(item, size)) {
       setChooseErr('Sorry, this size is out of stock.');
       return;
     }
@@ -316,13 +314,13 @@ export default function Lookbook() {
       ...(num(chooseMeas.height) !== undefined ? { height: num(chooseMeas.height) } : {}),
       ...((chooseMeas.notes || '').trim() ? { notes: chooseMeas.notes.trim() } : {}),
     } : undefined;
-    const qty = Math.max(1, Math.min(chooseQty, size === 'CUSTOM' ? 10 : qtyCap(item, size)));
+    const qty = Math.max(1, Math.min(chooseQty, 10));
 
     setCart((c) => {
       if (size !== 'CUSTOM') {
         const ex = c.find((l) => l.pieceId === item.id && l.size === size);
         if (ex) {
-          const capped = Math.min(10, ex.qty + qty, ((item.stock && item.stock[size]) || 10));
+          const capped = Math.min(10, ex.qty + qty);
           return c.map((l) => (l === ex ? { ...l, qty: capped } : l));
         }
       }
@@ -339,25 +337,18 @@ export default function Lookbook() {
     setChoosing(null);
   };
 
-  // Change a bag line's quantity, holding it inside 1..cap for that piece+size.
-  // The cap is the piece's live stock for that size (custom lines cap at 10).
+  // Change a bag line's quantity, holding it inside 1..10 (amendment 2026-11-24
+  // — quantity is no longer stock-capped).
   const setLineQty = (lineId, q) => setCart((c) => c
-    .map((l) => {
-      if (l.lineId !== lineId) return l;
-      const piece = catalogue.find((it) => it.id === l.pieceId);
-      const max = l.size === 'CUSTOM'
-        ? 10
-        : Math.min(10, (piece && piece.stock && piece.stock[l.size]) || 10);
-      return { ...l, qty: Math.max(0, Math.min(q, max)) };
-    })
+    .map((l) => (l.lineId !== lineId ? l : { ...l, qty: Math.max(0, Math.min(q, 10)) }))
     .filter((l) => l.qty > 0));
 
-  // Real checkout: send the purchase through Convex (server sources prices and
-  // reserves stock). `method` maps to the payment preference the same way as
-  // before. On success the bag clears and the existing success screen shows a
-  // receipt built from the bag with zero points (no loyalty points on these
-  // purchases yet). On failure the bag is kept and the reason is shown inside
-  // the checkout panel. Either way we re-hydrate so stock on the feed is fresh.
+  // Real checkout: send the purchase through Convex (server sources prices).
+  // `method` maps to the payment preference the same way as before. On
+  // success the bag clears and the existing success screen shows a receipt
+  // built from the bag with zero points (no loyalty points on these purchases
+  // yet). On failure the bag is kept and the reason is shown inside the
+  // checkout panel. Either way we re-hydrate so size availability on the feed is fresh.
   const doCheckout = async (method) => {
     if (placing) return; // double-tap guard
     setPlacing(true);
@@ -653,25 +644,23 @@ export default function Lookbook() {
               <button onClick={() => setChoosing(null)} className="text-steel hover:text-ink text-xl">×</button>
             </div>
             <div className="p-6 space-y-5">
-              {choosing.size_mode === 'free' && (
-                <div className="text-sm text-steel mt-1">Free size · {stockLeft(choosing, 'FREE')} left</div>
+              {(choosing.size_mode === 'free' || choosing.size_mode === 'one') && (
+                <div className="text-sm text-steel mt-1">{choosing.size_mode === 'one' ? 'One size' : 'Free size'}</div>
               )}
               {choosing.size_mode === 'sized' && (
                 <div>
                   <div className="label">Choose size</div>
                   <div className="flex gap-2 flex-wrap">
-                    {['M', 'L', 'XL', 'XXL'].map((s) => {
-                      const out = stockLeft(choosing, s) <= 0;
-                      return (
-                        <button key={s} disabled={out} onClick={() => { setChooseSize(s); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors disabled:opacity-40', chooseSize === s ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
-                          {s}
-                        </button>
-                      );
-                    })}
+                    {SIZE_ORDER.filter((s) => (choosing.sizes || []).includes(s)).map((s) => (
+                      <button key={s} onClick={() => { setChooseSize(s); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', chooseSize === s ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                        {s}
+                      </button>
+                    ))}
                     <button onClick={() => { setChooseSize('CUSTOM'); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', chooseSize === 'CUSTOM' ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
                       Custom size
                     </button>
                   </div>
+                  {isOutOfStock(choosing, chooseSize) && <div className="text-xs text-steel mt-2">Out of stock</div>}
                 </div>
               )}
               {chooseSize === 'CUSTOM' ? (
@@ -691,11 +680,11 @@ export default function Lookbook() {
                 <div className="flex items-center gap-2">
                   <button onClick={() => setChooseQty(Math.max(1, chooseQty - 1))} className="btn-ghost !px-3 !py-1">−</button>
                   <span className="w-6 text-center">{chooseQty}</span>
-                  <button onClick={() => setChooseQty(Math.min(qtyCap(choosing, chooseSize), chooseQty + 1))} className="btn-ghost !px-3 !py-1">+</button>
+                  <button onClick={() => setChooseQty(Math.min(10, chooseQty + 1))} className="btn-ghost !px-3 !py-1">+</button>
                 </div>
               )}
               {chooseErr && <div className="text-xs text-gold font-medium">{chooseErr}</div>}
-              <button onClick={confirmChoose} className="btn-ink w-full">Add to bag</button>
+              <button onClick={confirmChoose} disabled={chooseSize !== 'CUSTOM' && isOutOfStock(choosing, chooseSize)} className="btn-ink w-full disabled:opacity-40">Add to bag</button>
             </div>
           </div>
         </div>

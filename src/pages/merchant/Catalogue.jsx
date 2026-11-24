@@ -69,10 +69,10 @@ export default function Catalogue() {
   useEffect(() => { hydrateCatalogue(); }, []);
 
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
-  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
-  // Manual Entry size type: 'none' (default, no boxes), 'free' (one box), 'sized' (M/L/XL/XXL).
-  const [manualSizeType, setManualSizeType] = useState('none');
-  const [manualStock, setManualStock] = useState({ M: '', L: '', XL: '', XXL: '', FREE: '' });
+  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+  // Manual Entry size type: 'free' (default), 'one', or 'sized' (S/M/L/XL/XXL toggles).
+  const [manualSizeType, setManualSizeType] = useState('free');
+  const [manualSizes, setManualSizes] = useState([]); // 'sized' only
   // Manual Entry — drag-drop media upload (mirrors Templates.jsx's MediaCard
   // onMediaFile pattern), auto-fills manual.image_url on success.
   const [mediaUploading, setMediaUploading] = useState(false);
@@ -91,12 +91,15 @@ export default function Catalogue() {
   const [editMediaUploading, setEditMediaUploading] = useState(false);
   const [editImageUrl, setEditImageUrl] = useState('');
   const editMediaRef = useRef(null);
-  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
-  // Edit stock modal: which piece.id is open, its chosen size type, its box values,
+  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+  // Edit stock modal: which piece.id is open, its chosen size type, its available
+  // sizes + out-of-stock sizes ('sized') or single out-of-stock flag ('free'/'one'),
   // a saving flag with a ref guard against a double Save click, and an error line.
   const [stockPieceId, setStockPieceId] = useState(null);
-  const [stockType, setStockType] = useState('none');
-  const [stockValues, setStockValues] = useState({ M: '', L: '', XL: '', XXL: '', FREE: '' });
+  const [stockType, setStockType] = useState('free');
+  const [stockSizes, setStockSizes] = useState([]); // 'sized' only
+  const [stockOutOfStockSizes, setStockOutOfStockSizes] = useState([]); // 'sized' only
+  const [stockOutOfStock, setStockOutOfStock] = useState(false); // 'free'/'one' only
   const [stockSaving, setStockSaving] = useState(false);
   const stockSavingRef = useRef(false);
   const [stockErr, setStockErr] = useState('');
@@ -276,54 +279,34 @@ export default function Catalogue() {
     };
     const editingItem = items.find((i) => i.id === editPieceId);
 
-  // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
-  // which box keys a size type shows: 'sized' uses M/L/XL/XXL, 'free' uses FREE,
-  // 'none' shows no boxes.
-  const stockKeysFor = (type) => (type === 'sized' ? ['M', 'L', 'XL', 'XXL'] : type === 'free' ? ['FREE'] : []);
+  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+  // canonical display/toggle order for the five sizes.
+  const SIZE_ORDER = ['S', 'M', 'L', 'XL', 'XXL'];
 
-  // Design spec 2026-11-15 — turn the typed box values for a size type into the
-  // { size_mode, stock } pair the backend wants, or an error string if any shown
-  // box is not a whole number from 0 to 9999. Returns { stock } with only the
-  // relevant keys; the caller decides whether to send size_mode too.
-  const buildStock = (type, values) => {
-    const keys = stockKeysFor(type);
-    const stock = {};
-    for (const key of keys) {
-      const raw = String(values[key] ?? '').trim();
-      const n = raw === '' ? 0 : Number(raw);
-      if (!Number.isInteger(n) || n < 0 || n > 9999) {
-        return { error: 'Each stock count must be a whole number from 0 to 9999.' };
-      }
-      stock[key] = n;
-    }
-    return { stock };
-  };
-
-  // Design spec 2026-11-15 — one short summary for a merchant card: nothing for
-  // a piece with no size type, "M 2 · L 0 · XL 1 · XXL 0" for sized, "Free 3" for
-  // free, and "Out of stock" when every shown count is 0.
+  // One short summary for a merchant card: "Free size"/"One size" (+ " · Out of
+  // stock" when the whole piece is out), or "Sizes: S · M · L" (+ " · Out of
+  // stock: XL" when some of those sizes are out).
   const stockLine = (piece) => {
-    if (!piece.size_mode) return '';
-    const s = piece.stock || {};
-    const keys = stockKeysFor(piece.size_mode);
-    const counts = keys.map((key) => Number(s[key]) || 0);
-    if (counts.every((c) => c === 0)) return 'Out of stock';
-    if (piece.size_mode === 'free') return `Free ${counts[0]}`;
-    return keys.map((key, idx) => `${key} ${counts[idx]}`).join(' · ');
+    const mode = piece.size_mode;
+    if (!mode) return '';
+    if (mode === 'sized') {
+      const sizes = SIZE_ORDER.filter((s) => (piece.sizes || []).includes(s));
+      const oos = SIZE_ORDER.filter((s) => (piece.out_of_stock_sizes || []).includes(s));
+      let line = `Sizes: ${sizes.join(' · ')}`;
+      if (oos.length) line += ` · Out of stock: ${oos.join(' · ')}`;
+      return line;
+    }
+    const label = mode === 'one' ? 'One size' : 'Free size';
+    return piece.out_of_stock ? `${label} · Out of stock` : label;
   };
 
   const openEditStock = (piece) => {
     setStockPieceId(piece.id);
-    // A piece already carrying a size type keeps it; a legacy piece opens on 'none'.
-    setStockType(piece.size_mode || 'none');
-    const s = piece.stock || {};
-    setStockValues({
-      M: s.M != null ? String(s.M) : '',
-      L: s.L != null ? String(s.L) : '',
-      XL: s.XL != null ? String(s.XL) : '',
-      XXL: s.XXL != null ? String(s.XXL) : '',
-      FREE: s.FREE != null ? String(s.FREE) : '',
-    });
+    const mode = piece.size_mode || 'free';
+    setStockType(mode);
+    setStockSizes(mode === 'sized' ? (piece.sizes || []) : []);
+    setStockOutOfStockSizes(mode === 'sized' ? (piece.out_of_stock_sizes || []) : []);
+    setStockOutOfStock(mode !== 'sized' ? !!piece.out_of_stock : false);
     setStockErr('');
     setStockSaving(false);
     stockSavingRef.current = false;
@@ -334,18 +317,31 @@ export default function Catalogue() {
     setStockSaving(false);
     stockSavingRef.current = false;
   };
+  // Unselecting an available size also drops it from the out-of-stock set.
+  const toggleStockSize = (sz) => {
+    setStockSizes((cur) => {
+      const next = cur.includes(sz) ? cur.filter((s) => s !== sz) : [...cur, sz];
+      setStockOutOfStockSizes((oos) => oos.filter((s) => next.includes(s)));
+      return next;
+    });
+  };
+  const toggleStockOutOfStockSize = (sz) => {
+    setStockOutOfStockSizes((cur) => (cur.includes(sz) ? cur.filter((s) => s !== sz) : [...cur, sz]));
+  };
   const saveEditStock = async () => {
     if (stockSavingRef.current) return; // guard a second Save click
-    // 'No size' has no size type and no stock keys to set, so there is nothing to
-    // write — just close. A piece already sized/free can never reach this branch.
-    if (stockType === 'none') { closeEditStock(); return; }
-    const built = buildStock(stockType, stockValues);
-    if (built.error) { setStockErr(built.error); return; }
+    if (stockType === 'sized' && stockSizes.length < 1) {
+      setStockErr('Choose at least one size.');
+      return;
+    }
     stockSavingRef.current = true;
     setStockSaving(true);
     setStockErr('');
     try {
-      await updateCatalogueItem(stockPieceId, { size_mode: stockType, stock: built.stock });
+      const patch = stockType === 'sized'
+        ? { size_mode: 'sized', sizes: stockSizes, out_of_stock_sizes: stockOutOfStockSizes }
+        : { size_mode: stockType, out_of_stock: stockOutOfStock };
+      await updateCatalogueItem(stockPieceId, patch);
       closeEditStock();
     } catch (err) {
       setStockErr(friendlyError(err));
@@ -358,14 +354,12 @@ export default function Catalogue() {
 
   const addManual = async () => {
     if (!manual.title || !manual.price) return;
-    // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md —
-    // when a size type is chosen, every shown box must be a whole number 0..9999.
-    // 'none' sends neither size_mode nor stock, so the call stays exactly as today.
-    let sizeExtra = {};
-    if (manualSizeType !== 'none') {
-      const built = buildStock(manualSizeType, manualStock);
-      if (built.error) { setMediaMsg(built.error); return; }
-      sizeExtra = { size_mode: manualSizeType, stock: built.stock };
+    // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+    // size_mode is always sent; 'sized' additionally needs at least one size.
+    let sizeExtra = { size_mode: manualSizeType };
+    if (manualSizeType === 'sized') {
+      if (manualSizes.length < 1) { setMediaMsg('Choose at least one size.'); return; }
+      sizeExtra = { size_mode: 'sized', sizes: manualSizes };
     }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
     // a typed Image URL that was never explicitly "Add"-ed still joins the gallery here.
@@ -405,9 +399,9 @@ export default function Catalogue() {
     setManualMedia([]);
     setAddTo('all');
     setNewLookbookName('');
-    // Design spec 2026-11-15 — reset the size type to the default after a save.
-    setManualSizeType('none');
-    setManualStock({ M: '', L: '', XL: '', XXL: '', FREE: '' });
+    // Amendment 2026-11-24 — reset the size type to the default after a save.
+    setManualSizeType('free');
+    setManualSizes([]);
   };
   // Shared drag-drop upload loop, mirrors Templates.jsx MediaCard's
   // onMediaFile (try/catch/finally, uploading/msg state). Design spec:
@@ -637,21 +631,23 @@ export default function Catalogue() {
             <div>
               <label className="label">Size type</label>
               <div className="flex gap-2 flex-wrap">
-                {[['none', 'No size'], ['free', 'Free size'], ['sized', 'Sized']].map(([val, lbl]) => (
+                {[['free', 'Free size'], ['one', 'One size'], ['sized', 'Sizes']].map(([val, lbl]) => (
                   <button key={val} type="button" onClick={() => setManualSizeType(val)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', manualSizeType === val ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
                     {lbl}
                   </button>
                 ))}
               </div>
             </div>
-            {manualSizeType === 'free' && (
-              <div><label className="label">Stock</label><input className="input" type="number" min="0" step="1" value={manualStock.FREE} onChange={(e) => setManualStock({ ...manualStock, FREE: e.target.value })} /></div>
-            )}
             {manualSizeType === 'sized' && (
-              <div className="grid grid-cols-2 gap-3">
-                {['M', 'L', 'XL', 'XXL'].map((sz) => (
-                  <div key={sz}><label className="label">{sz}</label><input className="input" type="number" min="0" step="1" value={manualStock[sz]} onChange={(e) => setManualStock({ ...manualStock, [sz]: e.target.value })} /></div>
-                ))}
+              <div>
+                <label className="label">Sizes</label>
+                <div className="flex gap-2 flex-wrap">
+                  {SIZE_ORDER.map((sz) => (
+                    <button key={sz} type="button" onClick={() => setManualSizes((cur) => (cur.includes(sz) ? cur.filter((s) => s !== sz) : [...cur, sz]))} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', manualSizes.includes(sz) ? 'btn-ink' : 'border-line text-steel hover:border-gold')}>
+                      {sz}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             <div>
@@ -839,21 +835,47 @@ export default function Catalogue() {
             <div>
               <label className="label">Size type</label>
               <div className="flex gap-2 flex-wrap">
-                {(stockPiece.size_mode ? [['free', 'Free size'], ['sized', 'Sized']] : [['none', 'No size'], ['free', 'Free size'], ['sized', 'Sized']]).map(([val, lbl]) => (
+                {[['free', 'Free size'], ['one', 'One size'], ['sized', 'Sizes']].map(([val, lbl]) => (
                   <button key={val} type="button" onClick={() => setStockType(val)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockType === val ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
                     {lbl}
                   </button>
                 ))}
               </div>
             </div>
-            {stockType === 'free' && (
-              <div><label className="label">Stock</label><input className="input" type="number" min="0" step="1" value={stockValues.FREE} onChange={(e) => setStockValues({ ...stockValues, FREE: e.target.value })} /></div>
-            )}
             {stockType === 'sized' && (
-              <div className="grid grid-cols-2 gap-3">
-                {['M', 'L', 'XL', 'XXL'].map((sz) => (
-                  <div key={sz}><label className="label">{sz}</label><input className="input" type="number" min="0" step="1" value={stockValues[sz]} onChange={(e) => setStockValues({ ...stockValues, [sz]: e.target.value })} /></div>
-                ))}
+              <>
+                <div>
+                  <label className="label">Available sizes</label>
+                  <div className="flex gap-2 flex-wrap">
+                    {SIZE_ORDER.map((sz) => (
+                      <button key={sz} type="button" onClick={() => toggleStockSize(sz)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockSizes.includes(sz) ? 'btn-ink' : 'border-line text-steel hover:border-gold')}>
+                        {sz}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {stockSizes.length > 0 && (
+                  <div>
+                    <label className="label">Out of stock</label>
+                    <div className="flex gap-2 flex-wrap">
+                      {SIZE_ORDER.filter((sz) => stockSizes.includes(sz)).map((sz) => (
+                        <button key={sz} type="button" onClick={() => toggleStockOutOfStockSize(sz)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockOutOfStockSizes.includes(sz) ? 'btn-ink' : 'border-line text-steel hover:border-gold')}>
+                          {sz}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+            {(stockType === 'free' || stockType === 'one') && (
+              <div>
+                <label className="label">Out of stock</label>
+                <div className="flex gap-2 flex-wrap">
+                  <button type="button" onClick={() => setStockOutOfStock((v) => !v)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockOutOfStock ? 'btn-ink' : 'border-line text-steel hover:border-gold')}>
+                    {stockOutOfStock ? 'Out of stock' : 'In stock'}
+                  </button>
+                </div>
               </div>
             )}
             {stockErr && <div className="text-xs text-gold mt-2">{stockErr}</div>}
