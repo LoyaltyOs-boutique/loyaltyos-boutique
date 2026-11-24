@@ -4,6 +4,7 @@ import { paginationOptsValidator } from "convex/server";
 import type { Id } from "./_generated/dataModel";
 import { requireMerchantSession } from "./auth";
 import { rateLimiter } from "./rateLimits";
+import { projectSizeAvailability } from "./lookbooks";
 
 /**
  * LoyaltyOS Boutique — Customer Orders backend (Build Step 1 of 4).
@@ -22,12 +23,15 @@ import { rateLimiter } from "./rateLimits";
  */
 
 // Valid sizes a customer line may carry, by the piece's size_mode.
+// Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
 const SIZE_LITERALS = v.union(
+  v.literal("S"),
   v.literal("M"),
   v.literal("L"),
   v.literal("XL"),
   v.literal("XXL"),
   v.literal("FREE"),
+  v.literal("ONE"),
   v.literal("CUSTOM"),
   v.literal("NONE"),
 );
@@ -50,19 +54,16 @@ const MEASUREMENTS_ARG = v.object({
 const MAGIC_LINK_DAYS = 180; // PRD §3.2 — same lifespan as auth.ts
 const DAY_MS = 86_400_000;
 
-// Sizes that carry real stock (everything except made-to-order CUSTOM and
-// legacy NONE). Used for both the decrement-on-place and restore-on-cancel.
-const STOCK_SIZES = ["M", "L", "XL", "XXL", "FREE"] as const;
-type StockSize = (typeof STOCK_SIZES)[number];
-
 /**
  * placeOrderRequest — PUBLIC, magic-link gated. A customer places an order of
  * 1..20 lines. Validates the caller exactly like getCustomerCatalogue, applies
- * the placeOrderByCustomer rate limit, server-sources every price, checks all
- * stock before any write, then atomically decrements stock, inserts the
- * order_requests row and one customer_activity_events row. Never writes a
- * notifications row (D12). Returns { ok:false, error } with nothing written on
- * any validation/stock failure. Never returns another customer's data.
+ * the placeOrderByCustomer rate limit, server-sources every price, validates
+ * each line's size against the piece's effective size availability (amendment
+ * 2026-11-24 — stock numbers are gone; only out-of-stock SIZES/pieces are
+ * checked), then inserts the order_requests row and one customer_activity_events
+ * row. Never writes a notifications row (D12). Returns { ok:false, error }
+ * with nothing written on any validation failure. Never returns another
+ * customer's data.
  */
 export const placeOrderRequest = mutation({
   args: {
@@ -112,13 +113,13 @@ export const placeOrderRequest = mutation({
       return { ok: false, error: "An order must have between 1 and 20 items." };
     }
 
-    // Validate every line, build the rows to insert, and tally the stock each
-    // (item, size) pair needs — all BEFORE any write, so a failure writes nothing.
+    // Validate every line and build the rows to insert — all BEFORE any
+    // write, so a failure writes nothing.
     const orderLines: Array<{
       catalogue_item_id: Id<"catalogue_items">;
       title: string;
       price_paise: number;
-      size: "M" | "L" | "XL" | "XXL" | "FREE" | "CUSTOM" | "NONE";
+      size: "S" | "M" | "L" | "XL" | "XXL" | "FREE" | "ONE" | "CUSTOM" | "NONE";
       qty: number;
       measurements?: {
         unit: "cm" | "in";
@@ -135,8 +136,6 @@ export const placeOrderRequest = mutation({
       };
     }> = [];
 
-    // needed[itemId][size] = total quantity this order wants of that stock slot.
-    const needed = new Map<string, Map<StockSize, number>>();
     let subtotalPaise = 0;
     const titles: string[] = [];
 
@@ -151,21 +150,39 @@ export const placeOrderRequest = mutation({
         return { ok: false, error: "One of the pieces in your bag is no longer available." };
       }
 
-      // Size must match the piece's size_mode.
-      const mode = item.size_mode; // "sized" | "free" | undefined (legacy)
-      if (mode === undefined) {
-        // Legacy piece — only NONE allowed, no stock, no custom size.
-        if (line.size !== "NONE") {
-          return { ok: false, error: "This piece does not have sizes." };
+      // Size must match the piece's EFFECTIVE size availability — the exact
+      // same projection the customer is shown (amendment 2026-11-24).
+      const availability = projectSizeAvailability(item);
+      // What actually gets stored on the order line — legacy/free input
+      // ("FREE" or the legacy "NONE") is always normalized to "FREE".
+      let storedSize: "S" | "M" | "L" | "XL" | "XXL" | "FREE" | "ONE" | "CUSTOM" | "NONE" = line.size;
+
+      if (availability.size_mode === "sized") {
+        const validSizes = (availability.sizes ?? []) as string[];
+        if (line.size !== "CUSTOM" && !validSizes.includes(line.size)) {
+          return { ok: false, error: "Please choose a valid size for this piece." };
         }
-      } else if (mode === "free") {
-        if (line.size !== "FREE") {
-          return { ok: false, error: "This piece is free size only." };
+        const outOfStockSizes = (availability.out_of_stock_sizes ?? []) as string[];
+        if (line.size !== "CUSTOM" && outOfStockSizes.includes(line.size)) {
+          return { ok: false, error: `${item.title} (${line.size}) is out of stock` };
+        }
+      } else if (availability.size_mode === "one") {
+        if (line.size !== "ONE") {
+          return { ok: false, error: "This piece is one size only." };
+        }
+        if (availability.out_of_stock) {
+          return { ok: false, error: `${item.title} (${line.size}) is out of stock` };
         }
       } else {
-        // "sized" — M/L/XL/XXL or CUSTOM.
-        if (!["M", "L", "XL", "XXL", "CUSTOM"].includes(line.size)) {
-          return { ok: false, error: "Please choose a valid size for this piece." };
+        // "free" — includes legacy pieces with no size_mode set (treated as
+        // Free size everywhere, per the amendment). Legacy "NONE" input is
+        // still accepted so an un-updated customer page keeps working.
+        if (line.size !== "FREE" && line.size !== "NONE") {
+          return { ok: false, error: "This piece is free size only." };
+        }
+        storedSize = "FREE";
+        if (availability.out_of_stock) {
+          return { ok: false, error: `${item.title} (FREE) is out of stock` };
         }
       }
 
@@ -201,52 +218,10 @@ export const placeOrderRequest = mutation({
         catalogue_item_id: line.catalogue_item_id,
         title: item.title,
         price_paise: pricePaise,
-        size: line.size,
+        size: storedSize,
         qty: line.qty,
         measurements,
       });
-
-      // Tally stock demand for sized/free lines (never CUSTOM or NONE).
-      if (line.size !== "CUSTOM" && line.size !== "NONE") {
-        const size = line.size as StockSize;
-        const perItem = needed.get(String(line.catalogue_item_id)) ?? new Map<StockSize, number>();
-        perItem.set(size, (perItem.get(size) ?? 0) + line.qty);
-        needed.set(String(line.catalogue_item_id), perItem);
-      }
-    }
-
-    // --- Stock check across all lines BEFORE writing anything ---
-    // Re-read each distinct item once; compare its available stock against the
-    // summed demand. Any shortfall rejects the whole order (D3).
-    const freshItemById = new Map<string, Awaited<ReturnType<typeof ctx.db.get>>>();
-    for (const [itemIdStr, perItem] of needed) {
-      const itemId = itemIdStr as Id<"catalogue_items">;
-      const item = await ctx.db.get(itemId);
-      if (!item || item.is_deleted === true) {
-        return { ok: false, error: "One of the pieces in your bag is no longer available." };
-      }
-      freshItemById.set(itemIdStr, item);
-      const stock = item.stock ?? {};
-      for (const [size, want] of perItem) {
-        const have = stock[size] ?? 0;
-        if (have < want) {
-          return {
-            ok: false,
-            error: `Sorry, "${item.title}" does not have enough stock in size ${size}.`,
-          };
-        }
-      }
-    }
-
-    // --- All checks passed: decrement stock, then insert the order + activity row ---
-    for (const [itemIdStr, perItem] of needed) {
-      const itemId = itemIdStr as Id<"catalogue_items">;
-      const item = freshItemById.get(itemIdStr)!;
-      const stock = { ...(item.stock ?? {}) };
-      for (const [size, want] of perItem) {
-        stock[size] = (stock[size] ?? 0) - want;
-      }
-      await ctx.db.patch(itemId, { stock });
     }
 
     const searchText = [customer.name, customer.mobile, ...titles]
@@ -373,10 +348,10 @@ export const searchOrderRequests = query({
 });
 
 /**
- * cancelOrderRequest — MERCHANT-ONLY. Cancels an order and restores stock for
- * every non-custom line (M/L/XL/XXL/FREE). Idempotent: an already-cancelled
- * order returns { ok:true, alreadyCancelled:true } and changes nothing, so
- * stock can never be restored twice (D5).
+ * cancelOrderRequest — MERCHANT-ONLY. Cancels an order. Idempotent: an
+ * already-cancelled order returns { ok:true, alreadyCancelled:true } and
+ * changes nothing (D5). Stock is no longer tracked (amendment 2026-11-24),
+ * so there is nothing to restore — this only flips status/cancelled_at.
  */
 export const cancelOrderRequest = mutation({
   args: {
@@ -392,17 +367,6 @@ export const cancelOrderRequest = mutation({
     }
     if (order.status === "cancelled") {
       return { ok: true, alreadyCancelled: true };
-    }
-
-    // Restore stock for each stock-bearing line (never CUSTOM or NONE).
-    for (const line of order.items) {
-      if (line.size === "CUSTOM" || line.size === "NONE") continue;
-      const item = await ctx.db.get(line.catalogue_item_id);
-      if (!item || item.is_deleted === true) continue; // deleted piece — nothing to restore
-      const size = line.size as StockSize;
-      const stock = { ...(item.stock ?? {}) };
-      stock[size] = (stock[size] ?? 0) + line.qty;
-      await ctx.db.patch(line.catalogue_item_id, { stock });
     }
 
     await ctx.db.patch(orderId, { status: "cancelled", cancelled_at: Date.now() });

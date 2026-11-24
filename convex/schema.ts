@@ -170,16 +170,33 @@ export default defineSchema({
     size: v.optional(v.string()), // Gate 2 — e.g. "S", "M", "L", "Free Size"
     colour: v.optional(v.string()), // Gate 2 — e.g. "Ivory", "Blush"
     // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md (D1)
+    // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
     // How a piece is sized for customer ordering:
-    //   "sized" = separate per-size stock (M/L/XL/XXL), size selector shown, CUSTOM allowed
-    //   "free"  = single FREE stock count, no size selector
-    //   unset   = legacy piece — quantity only, no stock limit, no size (behaves as before)
+    //   "sized" = merchant picks which of S/M/L/XL/XXL (`sizes`) the piece comes
+    //             in, size selector shown, CUSTOM allowed, individual sizes can
+    //             be flagged out of stock via `out_of_stock_sizes`
+    //   "free"  = "Free size" label, quantity only, no size selector, single
+    //             `out_of_stock` flag
+    //   "one"   = "One size" label, quantity only, no size selector, single
+    //             `out_of_stock` flag — differs from "free" only in label
+    //   unset   = legacy piece — treated as Free size everywhere (behaves as before)
     // Optional so every existing row stays valid and unchanged.
-    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"))),
-    // Per-size stock counts (integers). Only the keys relevant to size_mode are
-    // set: "sized" uses M/L/XL/XXL, "free" uses FREE. Decremented atomically
-    // when an order is placed (orderRequests.placeOrderRequest) and restored on
-    // cancel. Legacy pieces (size_mode unset) leave this undefined = unlimited.
+    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"), v.literal("one"))),
+    // "sized" pieces only — which sizes the piece is available in. At least
+    // one required when size_mode is "sized" (enforced in lookbooks.ts).
+    sizes: v.optional(
+      v.array(v.union(v.literal("S"), v.literal("M"), v.literal("L"), v.literal("XL"), v.literal("XXL"))),
+    ),
+    // "sized" pieces only — subset of `sizes` the merchant has marked out of
+    // stock. The customer sees these sizes but cannot order them.
+    out_of_stock_sizes: v.optional(
+      v.array(v.union(v.literal("S"), v.literal("M"), v.literal("L"), v.literal("XL"), v.literal("XXL"))),
+    ),
+    // "free"/"one" pieces only — single out-of-stock flag (no per-size choice
+    // since the customer never picks a size on these pieces).
+    out_of_stock: v.optional(v.boolean()),
+    // Stock no longer counted or decremented (2026-11-24 amendment) — field
+    // kept, unused, so every existing document stays valid.
     stock: v.optional(
       v.object({
         M: v.optional(v.number()),
@@ -230,14 +247,18 @@ export default defineSchema({
         catalogue_item_id: v.id("catalogue_items"),
         title: v.string(), // snapshot of the piece title at order time
         price_paise: v.number(), // PAISE — server-sourced from catalogue_items.price
-        // "NONE" = legacy piece (no size); "FREE" = free-size piece;
-        // M/L/XL/XXL = sized stock; "CUSTOM" = made-to-order (no stock).
+        // "NONE" = legacy piece (no size, stored as FREE going forward);
+        // "FREE" = free-size piece; "ONE" = one-size piece;
+        // S/M/L/XL/XXL = sized piece; "CUSTOM" = made-to-order.
+        // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
         size: v.union(
+          v.literal("S"),
           v.literal("M"),
           v.literal("L"),
           v.literal("XL"),
           v.literal("XXL"),
           v.literal("FREE"),
+          v.literal("ONE"),
           v.literal("CUSTOM"),
           v.literal("NONE"),
         ),
