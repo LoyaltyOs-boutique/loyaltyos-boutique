@@ -52,4 +52,10 @@ export const rateLimiter = new RateLimiter(components.rateLimiter, {
   // in quick succession) through while blocking automated oversell abuse.
   // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md.
   placeOrderByCustomer: { kind: "token bucket", rate: 5, period: MINUTE, capacity: 5 },
+
+  // requestVideoCall — public, magic-link-gated video-call request
+  // (videoCalls.ts). Keyed by the customer's own user_id. Same shape as
+  // placeOrderByCustomer directly above: 5 requests / minute, capacity 5.
+  // Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md.
+  requestVideoCallByCustomer: { kind: "token bucket", rate: 5, period: MINUTE, capacity: 5 },
 });

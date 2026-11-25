@@ -26,6 +26,7 @@ import type * as reviews from "../reviews.js";
 import type * as sessionLock from "../sessionLock.js";
 import type * as settings from "../settings.js";
 import type * as templates from "../templates.js";
+import type * as videoCalls from "../videoCalls.js";
 import type * as whatsapp from "../whatsapp.js";
 
 import type {
@@ -53,6 +54,7 @@ declare const fullApi: ApiFromModules<{
   sessionLock: typeof sessionLock;
   settings: typeof settings;
   templates: typeof templates;
+  videoCalls: typeof videoCalls;
   whatsapp: typeof whatsapp;
 }>;
 

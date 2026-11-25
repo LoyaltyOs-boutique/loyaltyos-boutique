@@ -299,6 +299,38 @@ export default defineSchema({
     // Full-text search over the stored search_text for the Orders tab search box.
     .searchIndex("search_orders", { searchField: "search_text" }),
 
+  /**
+   * Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
+   *
+   * video_call_requests — a customer's request (from the magic-link lookbook)
+   * for a video call about one piece. Deliberately a NEW table, same shape
+   * convention as `order_requests` directly above (own customer_id/created_at/
+   * search_text, own by_created_at + by_customer_created_at indexes, own
+   * search index) — no existing table or reader is touched. `product_title`
+   * is a snapshot of the piece's title at request time, same reasoning as
+   * order_requests.items[].title. `status` starts "new"; the merchant's
+   * "Video call via WhatsApp" button flips it to "contacted" and sets
+   * contacted_at — there is no further status after that.
+   */
+  video_call_requests: defineTable({
+    customer_id: v.id("users"),
+    catalogue_item_id: v.id("catalogue_items"),
+    product_title: v.string(), // snapshot of the piece title at request time
+    status: v.union(v.literal("new"), v.literal("contacted")),
+    contacted_at: v.optional(v.number()), // epoch ms — set only when contacted
+    created_at: v.number(), // epoch ms — Date.now() at request time
+    // Lowercased concatenation of customer name + mobile + product title,
+    // same convention as order_requests.search_text.
+    search_text: v.string(),
+  })
+    // Date-window read for the merchant Video Consultations tab (newest first).
+    .index("by_created_at", ["created_at"])
+    // Per-customer history + 24h duplicate-request check, same "equality then
+    // range" convention as order_requests.by_customer_created_at.
+    .index("by_customer_created_at", ["customer_id", "created_at"])
+    // Full-text search over the stored search_text for the tab's search box.
+    .searchIndex("search_video_calls", { searchField: "search_text" }),
+
   /** PRD §6 Table `orders` — POS/hybrid checkouts; atomic with points application. */
   orders: defineTable({
     user_id: v.id("users"),
@@ -577,8 +609,14 @@ export default defineSchema({
       // weekly most-active scoring and the AI activity summary include orders.
       // Not written by activity.ts trackActivity (that mutation is unchanged).
       v.literal("order_placed"),
+      // Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
+      // Inserted by videoCalls.requestVideoCall, same reasoning as
+      // order_placed directly above — Recent Activity, the weekly
+      // most-active scoring and the AI activity summary include it with no
+      // further code change (neither reader filters by action type).
+      v.literal("video_call_requested"),
     ),
-    catalogue_item_id: v.optional(v.id("catalogue_items")), // cart_add / like / order_placed
+    catalogue_item_id: v.optional(v.id("catalogue_items")), // cart_add / like / order_placed / video_call_requested
     lookbook_id: v.optional(v.id("lookbooks")),              // lookbook_view
     event_id: v.optional(v.id("events")),                    // event_link_click
     created_at: v.number(), // epoch ms

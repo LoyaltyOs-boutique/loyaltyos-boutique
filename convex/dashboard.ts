@@ -86,10 +86,11 @@ type ActivityItem = {
   customerId: Id<"users">;
   customerName: string;
   // "order_placed" added by the Customer Orders feature (design spec
-  // 2026-11-15) — the frontend maps this kind to an order line in Recent
-  // Activity. It arrives via row.action on customer_activity_events, same as
-  // the other activity kinds.
-  kind: "like" | "cart_add" | "lookbook_view" | "event_link_click" | "order_placed" | "review";
+  // 2026-11-15); "video_call_requested" added by the Video Consultations
+  // feature (design spec 2026-11-25) — the frontend maps each kind to a
+  // Recent Activity line. Both arrive via row.action on
+  // customer_activity_events, same as the other activity kinds.
+  kind: "like" | "cart_add" | "lookbook_view" | "event_link_click" | "order_placed" | "video_call_requested" | "review";
   itemTitle?: string;
   createdAt: number;
 };
