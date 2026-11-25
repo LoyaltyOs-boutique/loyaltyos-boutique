@@ -19,6 +19,7 @@ const NAV = [
   { to: '/merchant/templates', label: 'Templates', icon: '▤' },
   { to: '/merchant/points-ledger', label: 'Points Ledger', icon: '✪' },
   { to: '/merchant/orders', label: 'Orders', icon: '▤' },
+  { to: '/merchant/video-consultations', label: 'Video Consultations', icon: '◎' },
   { to: '/merchant/settings', label: 'Settings & Support', icon: '✦' },
 ];
 

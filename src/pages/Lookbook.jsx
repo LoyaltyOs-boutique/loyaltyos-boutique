@@ -8,7 +8,7 @@ import {
   getData, subscribe, customerLedger,
   validateMagicToken, syncMagicLinkCustomer,
   trackCartAdd, trackLookbookView, hydrateCustomerCatalogue,
-  placeOrderRemote,
+  placeOrderRemote, requestVideoCallRemote,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import { ProductGallery } from '../components/ProductGallery.jsx';
@@ -62,6 +62,13 @@ export default function Lookbook() {
   // flight; `checkoutErr` shows a failed placement inside the checkout panel.
   const [placing, setPlacing] = useState(false);
   const [checkoutErr, setCheckoutErr] = useState('');
+  // Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
+  // "Book a video call" per-piece state, keyed by piece id: a sending flag
+  // (disables the button and guards a double click), the confirmation line
+  // shown for a few seconds, and an error line on failure.
+  const [videoCallSending, setVideoCallSending] = useState({});
+  const [videoCallMsg, setVideoCallMsg] = useState({});
+  const [videoCallErr, setVideoCallErr] = useState({});
   // Race-condition fix (2026-09-17), upgraded 2026-09-19 (see
   // docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md):
   // was a bare boolean that flipped true on ANY hydrateCustomerCatalogue
@@ -230,6 +237,28 @@ export default function Lookbook() {
     return `https://wa.me/${BRAND.wa}?text=${encodeURIComponent(
       `Hi${namePart}! I'm interested in the ${item.title} from 85 Lansdowne.`
     )}`;
+  };
+
+  // Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
+  // Same confirmation message whether this is a fresh request or the 24h
+  // duplicate case — the customer never needs to know which happened.
+  const bookVideoCall = async (item) => {
+    if (videoCallSending[item.id]) return; // guard a double click
+    setVideoCallSending((s) => ({ ...s, [item.id]: true }));
+    setVideoCallErr((e) => ({ ...e, [item.id]: '' }));
+    try {
+      const res = await requestVideoCallRemote(item.id);
+      if (res && res.ok) {
+        setVideoCallMsg((m) => ({ ...m, [item.id]: 'Video call request received. Our stylist will WhatsApp you shortly to fix a time.' }));
+        setTimeout(() => setVideoCallMsg((m) => ({ ...m, [item.id]: '' })), 5000);
+      } else {
+        setVideoCallErr((e) => ({ ...e, [item.id]: (res && res.error) || 'Something went wrong — please try again.' }));
+      }
+    } catch (err) {
+      setVideoCallErr((e) => ({ ...e, [item.id]: 'Something went wrong — please try again.' }));
+    } finally {
+      setVideoCallSending((s) => ({ ...s, [item.id]: false }));
+    }
   };
 
   // Canonical display/chooser order for the five sizes.
@@ -495,6 +524,11 @@ export default function Lookbook() {
                       <a href={waLink(item)} target="_blank" rel="noreferrer" className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
                         Inquire via WhatsApp ✆
                       </a>
+                      <button type="button" onClick={() => bookVideoCall(item)} className="btn-ghost w-full mt-3 !py-2 text-[9px] border-gold/50 text-gold hover:border-gold">
+                        {videoCallSending[item.id] ? 'Sending…' : 'Book a video call'}
+                      </button>
+                      {videoCallMsg[item.id] && <div className="text-xs text-steel mt-2">{videoCallMsg[item.id]}</div>}
+                      {videoCallErr[item.id] && <div className="text-xs text-gold font-medium mt-2">{videoCallErr[item.id]}</div>}
                     </div>
                   </article>
                 ))}

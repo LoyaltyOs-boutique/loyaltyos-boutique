@@ -977,6 +977,41 @@ export function cancelOrderRequestRemote(orderId) {
 }
 
 /**
+ * Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
+ * Three merchant bridges over convex/videoCalls.ts, written exactly like the
+ * matching order-requests bridges directly above (same session handling,
+ * same error style).
+ */
+export function fetchVideoCallRequestsByDate({ fromMs, toMs, cursor, numItems }) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.query(api.videoCalls.getVideoCallRequestsByDate, {
+    fromMs,
+    toMs,
+    paginationOpts: { numItems, cursor: cursor ?? null },
+    ...session,
+  });
+}
+
+export function searchVideoCallRequestsRemote(query) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.query(api.videoCalls.searchVideoCallRequests, { query, ...session });
+}
+
+export function markVideoCallContactedRemote(requestId) {
+  const client = getConvex();
+  const session = merchantSessionArgs();
+  if (!client) return Promise.reject(new Error('Offline — Convex is not connected.'));
+  if (!session) return Promise.reject(new Error('Not logged in — please sign in again.'));
+  return client.mutation(api.videoCalls.markVideoCallContacted, { requestId, ...session });
+}
+
+/**
  * Activity Ledger fix (2026-09-02) — getPointsHistory bridge + hydrate.
  *
  * Root cause: convex/customers.ts's awardPoints mutation writes every manual
@@ -1920,6 +1955,25 @@ export function placeOrderRemote({ lines, paymentPreference }) {
   }).catch((err) => ({ ok: false, error: friendlyError(err) }));
 }
 
+/**
+ * Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
+ * Send a real customer video-call request to Convex (async). Magic-link
+ * gated, NOT a merchant call — same session shape as placeOrderRemote
+ * directly above (the saved customer session's id + token).
+ */
+export function requestVideoCallRemote(catalogueItemId) {
+  const client = getConvex();
+  const session = getCustomerSession();
+  if (!client || !session) {
+    return Promise.resolve({ ok: false, error: 'Please reopen your link from WhatsApp.' });
+  }
+  return client.mutation(api.videoCalls.requestVideoCall, {
+    id: session.id,
+    token: session.token,
+    catalogue_item_id: catalogueItemId,
+  }).catch((err) => ({ ok: false, error: friendlyError(err) }));
+}
+
 /** Get all orders (async). MERCHANT-ONLY (Merchant Session Lock). */
 export function getOrders() {
   const client = getConvex();
@@ -2437,6 +2491,9 @@ let recentActivityHydrating = false;
 // signal the current icon set has), lookbook_view -> catalogue (a lookbook
 // IS the catalogue experience), event_link_click -> campaign (an event link
 // click is a response to a merchant-sent campaign/message).
+// video_call_requested (design spec 2026-11-25) -> purchase, same bucket as
+// order_placed/cart_add directly above — all three are piece-tied customer
+// interest signals and this icon set has no dedicated "consultation" key.
 const ACTIVITY_KIND_TO_LOCAL_TYPE = {
   like: 'like',
   review: 'review',
@@ -2444,6 +2501,7 @@ const ACTIVITY_KIND_TO_LOCAL_TYPE = {
   lookbook_view: 'catalogue',
   event_link_click: 'campaign',
   order_placed: 'purchase',
+  video_call_requested: 'purchase',
 };
 
 // Short plain-English text per activity kind — omits the item name whenever
@@ -2455,6 +2513,7 @@ function activityItemText(kind, itemTitle) {
   if (kind === 'lookbook_view') return 'Viewed a lookbook';
   if (kind === 'event_link_click') return 'Opened an event link';
   if (kind === 'order_placed') return itemTitle ? `Placed an order · ${itemTitle}` : 'Placed an order';
+  if (kind === 'video_call_requested') return itemTitle ? `Requested a video call · ${itemTitle}` : 'Requested a video call';
   return 'Submitted a review'; // kind === 'review'
 }
 
