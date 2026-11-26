@@ -113,6 +113,45 @@ export const requestVideoCall = mutation({
   },
 });
 
+/**
+ * getMyRecentVideoCallRequests — PUBLIC, magic-link gated. Validates the
+ * caller exactly like requestVideoCall, then returns ONLY the
+ * catalogue_item_id values this customer requested a video call for in the
+ * last 24 hours — nothing else, and never another customer's data. Used by
+ * the lookbook to show "You've already requested a video call for this
+ * piece..." instead of letting the button fire again. Returns [] on any
+ * invalid-link condition instead of throwing, since this is a passive
+ * display check, not an action the customer is trying to take.
+ * Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+ */
+export const getMyRecentVideoCallRequests = query({
+  args: {
+    id: v.string(),
+    token: v.string(),
+  },
+  handler: async (ctx, { id, token }) => {
+    // --- Magic-link validation (mirrors requestVideoCall) ---
+    const customer = await ctx.db
+      .query("users")
+      .withIndex("by_magic_token", (q) => q.eq("magic_token", token))
+      .first();
+    if (!customer || customer.role !== "customer") return [];
+    if (String(customer._id) !== id) return [];
+    if (customer.is_deleted === true) return [];
+    const createdAt = customer.magic_token_created_at;
+    if (!createdAt || Number.isNaN(createdAt)) return [];
+    if (Date.now() > createdAt + MAGIC_LINK_DAYS * DAY_MS) return [];
+
+    const recent = await ctx.db
+      .query("video_call_requests")
+      .withIndex("by_customer_created_at", (q) =>
+        q.eq("customer_id", customer._id).gte("created_at", Date.now() - DAY_MS),
+      )
+      .collect();
+    return recent.map((r) => r.catalogue_item_id);
+  },
+});
+
 // Thin merchant-facing projection of one video-call request row + its
 // customer's name/mobile.
 async function toMerchantVideoCall(

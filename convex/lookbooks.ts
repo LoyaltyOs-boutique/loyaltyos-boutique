@@ -103,23 +103,33 @@ type LegacyStock = {
 /**
  * Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
  * Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+ * Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
  *
  * Validates the EFFECTIVE (post-patch) size_mode/sizes/out_of_stock_sizes/
- * out_of_stock combination before insert/patch. "sized" needs at least one
- * unique size, with out_of_stock_sizes a subset of sizes with no duplicates
- * and no separate out_of_stock flag (sizes are flagged individually); "free"
- * and "one" carry no sizes/out_of_stock_sizes, only the single out_of_stock
- * flag. A legacy piece (size_mode undefined) must carry none of these fields.
- * Throws a ConvexError on any violation so the caller writes nothing.
+ * out_of_stock/custom_made combination before insert/patch. "sized" needs at
+ * least one unique size OR custom_made true (so a Custom-made-only piece may
+ * carry zero sizes), out_of_stock_sizes a subset of sizes with no duplicates,
+ * and no separate out_of_stock flag (sizes are flagged individually). "free"
+ * carries no sizes/out_of_stock_sizes/custom_made, only the single
+ * out_of_stock flag. A legacy piece (size_mode undefined) must carry none of
+ * these fields. Throws a ConvexError on any violation so the caller writes
+ * nothing. Legacy "one" is never passed in here directly — callers normalize
+ * it to "free" first (see updateCatalogueItem).
  */
 function validateSizeAvailability(
-  sizeMode: "sized" | "free" | "one" | undefined,
+  sizeMode: "sized" | "free" | undefined,
   sizes: Size[] | undefined,
   outOfStockSizes: Size[] | undefined,
   outOfStock: boolean | undefined,
+  customMade: boolean | undefined,
 ) {
   if (sizeMode === undefined) {
-    if (sizes !== undefined || outOfStockSizes !== undefined || outOfStock !== undefined) {
+    if (
+      sizes !== undefined ||
+      outOfStockSizes !== undefined ||
+      outOfStock !== undefined ||
+      customMade !== undefined
+    ) {
       throw new ConvexError("Choose a size type before setting size availability.");
     }
     return;
@@ -128,13 +138,14 @@ function validateSizeAvailability(
     if (outOfStock !== undefined) {
       throw new ConvexError("A sized piece marks sizes out of stock individually, not the whole piece.");
     }
-    if (!sizes || sizes.length < 1) {
-      throw new ConvexError("Choose at least one size for a sized piece.");
+    const sizeList = sizes ?? [];
+    if (sizeList.length < 1 && customMade !== true) {
+      throw new ConvexError("Choose at least one size, or turn on Custom made, for this piece.");
     }
-    if (new Set(sizes).size !== sizes.length) {
+    if (new Set(sizeList).size !== sizeList.length) {
       throw new ConvexError("Each size can only be chosen once.");
     }
-    const available = new Set(sizes);
+    const available = new Set(sizeList);
     for (const s of outOfStockSizes ?? []) {
       if (!available.has(s)) {
         throw new ConvexError("A size can only be marked out of stock if the piece is available in it.");
@@ -144,9 +155,12 @@ function validateSizeAvailability(
       throw new ConvexError("Each out-of-stock size can only be listed once.");
     }
   } else {
-    // "free" or "one"
+    // "free"
     if (sizes !== undefined || outOfStockSizes !== undefined) {
-      throw new ConvexError("Free size and one size pieces do not have a size list.");
+      throw new ConvexError("Free size pieces do not have a size list.");
+    }
+    if (customMade === true) {
+      throw new ConvexError("Free size cannot be combined with Custom made.");
     }
   }
 }
@@ -154,68 +168,88 @@ function validateSizeAvailability(
 /**
  * Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
  * (switch-size-type fix)
+ * Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
  *
  * Drops whichever size-availability fields don't belong to `mode` BEFORE
- * validation/write — "sized" keeps sizes/out_of_stock_sizes and never an
- * out_of_stock flag; "free"/"one" keep only out_of_stock; a legacy piece
- * (mode undefined) keeps none of these fields. Called by both
- * addCatalogueItem and updateCatalogueItem so a field left over from a
- * DIFFERENT size type (e.g. a stale `out_of_stock: false` still present
- * after switching to "sized") is silently ignored instead of being
- * validated against the wrong mode's rules.
+ * validation/write — "sized" keeps sizes/out_of_stock_sizes/custom_made and
+ * never an out_of_stock flag; "free" keeps only out_of_stock, never
+ * custom_made; a legacy piece (mode undefined) keeps none of these fields.
+ * Called by both addCatalogueItem and updateCatalogueItem so a field left
+ * over from a DIFFERENT size type (e.g. a stale `out_of_stock: false` still
+ * present after switching to "sized", or `custom_made: true` surviving a
+ * switch to "free") is silently dropped instead of being validated against
+ * the wrong mode's rules.
  */
 function normalizeSizeFields(
-  mode: "sized" | "free" | "one" | undefined,
+  mode: "sized" | "free" | undefined,
   sizes: Size[] | undefined,
   outOfStockSizes: Size[] | undefined,
   outOfStock: boolean | undefined,
-): { sizes: Size[] | undefined; out_of_stock_sizes: Size[] | undefined; out_of_stock: boolean | undefined } {
+  customMade: boolean | undefined,
+): {
+  sizes: Size[] | undefined;
+  out_of_stock_sizes: Size[] | undefined;
+  out_of_stock: boolean | undefined;
+  custom_made: boolean | undefined;
+} {
   if (mode === "sized") {
-    return { sizes, out_of_stock_sizes: outOfStockSizes, out_of_stock: undefined };
+    return { sizes, out_of_stock_sizes: outOfStockSizes, out_of_stock: undefined, custom_made: customMade };
   }
-  if (mode === "free" || mode === "one") {
-    return { sizes: undefined, out_of_stock_sizes: undefined, out_of_stock: outOfStock };
+  if (mode === "free") {
+    return { sizes: undefined, out_of_stock_sizes: undefined, out_of_stock: outOfStock, custom_made: undefined };
   }
-  return { sizes: undefined, out_of_stock_sizes: undefined, out_of_stock: undefined };
+  return { sizes: undefined, out_of_stock_sizes: undefined, out_of_stock: undefined, custom_made: undefined };
 }
 
 /**
  * Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
  * Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+ * Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
  *
  * Projects a catalogue_items doc's raw size fields into what every frontend
  * reader (and orderRequests.placeOrderRequest) needs: size_mode always
- * resolved to "sized"|"free"|"one" (missing/legacy -> "free", per the
- * amendment's "legacy pieces are Free size everywhere" decision), sizes/
- * out_of_stock_sizes only present for "sized" pieces, out_of_stock only
- * present for "free"/"one" pieces. A legacy "sized" piece that predates this
- * amendment (old per-size `stock` counts, no `sizes` array yet) has its
- * sizes derived from whichever of M/L/XL/XXL exist as keys in `stock`, so it
- * keeps showing its real sizes until the merchant re-saves it through the
- * new Edit Stock UI. Exported so orderRequests.ts validates against the
- * exact same effective availability the customer is shown.
+ * resolved to "sized"|"free" (missing legacy -> "free"; legacy "one" -> also
+ * "free", keeping its out_of_stock flag — "One size" is retired as a
+ * mode but existing rows/orders keep working), sizes/out_of_stock_sizes only
+ * present for "sized" pieces, out_of_stock only present for "free" pieces,
+ * custom_made true only when set on a "sized" piece (never on "free"). A
+ * legacy "sized" piece that predates the 2026-11-24 amendment (old per-size
+ * `stock` counts, no `sizes` array yet) has its sizes derived from whichever
+ * of M/L/XL/XXL exist as keys in `stock`, so it keeps showing its real sizes
+ * until the merchant re-saves it through the Edit Stock UI. Exported so
+ * orderRequests.ts validates against the exact same effective availability
+ * the customer is shown.
  */
 export function projectSizeAvailability(item: {
   size_mode?: "sized" | "free" | "one";
   sizes?: Size[];
   out_of_stock_sizes?: Size[];
   out_of_stock?: boolean;
+  custom_made?: boolean;
   stock?: LegacyStock;
 }): {
-  size_mode: "sized" | "free" | "one";
+  size_mode: "sized" | "free";
   sizes?: Size[];
   out_of_stock_sizes?: Size[];
   out_of_stock?: boolean;
+  custom_made: boolean;
 } {
   const mode = item.size_mode ?? "free";
   if (mode !== "sized") {
-    return { size_mode: mode, out_of_stock: item.out_of_stock ?? false };
+    // "free" or legacy "one" both project to "free" — "one" keeps its
+    // out_of_stock flag since both modes share the same single-flag shape.
+    return { size_mode: "free", out_of_stock: item.out_of_stock ?? false, custom_made: false };
   }
   let sizes = item.sizes;
   if (!sizes && item.stock) {
     sizes = (["M", "L", "XL", "XXL"] as const).filter((k) => item.stock![k] !== undefined);
   }
-  return { size_mode: "sized", sizes: sizes ?? [], out_of_stock_sizes: item.out_of_stock_sizes ?? [] };
+  return {
+    size_mode: "sized",
+    sizes: sizes ?? [],
+    out_of_stock_sizes: item.out_of_stock_sizes ?? [],
+    custom_made: item.custom_made === true,
+  };
 }
 
 /**
@@ -395,12 +429,14 @@ export const getCustomerCatalogue = query({
       // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
       media?: MediaItem[];
       // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
-      // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
+      // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+      // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md —
       // the customer lookbook needs these to show the size selector and respect availability.
-      size_mode: "sized" | "free" | "one";
+      size_mode: "sized" | "free";
       sizes?: Size[];
       out_of_stock_sizes?: Size[];
       out_of_stock?: boolean;
+      custom_made: boolean;
     }> = [];
 
     // Soft-delete filter (2026-09-25-lookbook-delete-design.md decision 2) —
@@ -552,10 +588,13 @@ export const addCatalogueItem = mutation({
     media: v.optional(v.array(MEDIA_ITEM)),
     // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
     // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
-    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"), v.literal("one"))),
+    // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+    // "one" retired — new pieces are only "sized" or "free".
+    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"))),
     sizes: v.optional(SIZES_ARG),
     out_of_stock_sizes: v.optional(SIZES_ARG),
     out_of_stock: v.optional(v.boolean()),
+    custom_made: v.optional(v.boolean()),
   },
   handler: async (ctx, { userId, token, ...args }) => {
     await requireMerchantSession(ctx, userId, token);
@@ -564,11 +603,18 @@ export const addCatalogueItem = mutation({
     // — drops any field that doesn't belong to this piece's size_mode (e.g. a
     // stray out_of_stock sent alongside size_mode "sized") instead of
     // validating it against the wrong mode's rules.
-    const normalizedSize = normalizeSizeFields(args.size_mode, args.sizes, args.out_of_stock_sizes, args.out_of_stock);
+    const normalizedSize = normalizeSizeFields(
+      args.size_mode,
+      args.sizes,
+      args.out_of_stock_sizes,
+      args.out_of_stock,
+      args.custom_made,
+    );
     args.sizes = normalizedSize.sizes;
     args.out_of_stock_sizes = normalizedSize.out_of_stock_sizes;
     args.out_of_stock = normalizedSize.out_of_stock;
-    validateSizeAvailability(args.size_mode, args.sizes, args.out_of_stock_sizes, args.out_of_stock);
+    args.custom_made = normalizedSize.custom_made;
+    validateSizeAvailability(args.size_mode, args.sizes, args.out_of_stock_sizes, args.out_of_stock, args.custom_made);
 
     // Packet A (2026-10-01, decision 2) — resolve a missing lookbook_id to
     // the home lookbook, finding or creating it in the same transaction, so
@@ -605,10 +651,14 @@ export const updateCatalogueItem = mutation({
     media: v.optional(v.array(MEDIA_ITEM)),
     // Design spec: docs/superpowers/specs/2026-11-15-customer-orders-design.md
     // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
-    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"), v.literal("one"))),
+    // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+    // "one" retired — new writes are only "sized" or "free" (a row already
+    // carrying legacy "one" keeps working, see effectiveMode below).
+    size_mode: v.optional(v.union(v.literal("sized"), v.literal("free"))),
     sizes: v.optional(SIZES_ARG),
     out_of_stock_sizes: v.optional(SIZES_ARG),
     out_of_stock: v.optional(v.boolean()),
+    custom_made: v.optional(v.boolean()),
   },
   handler: async (ctx, { userId, token, id, ...patch }) => {
     await requireMerchantSession(ctx, userId, token);
@@ -630,21 +680,41 @@ export const updateCatalogueItem = mutation({
       patch.size_mode !== undefined ||
       patch.sizes !== undefined ||
       patch.out_of_stock_sizes !== undefined ||
-      patch.out_of_stock !== undefined
+      patch.out_of_stock !== undefined ||
+      patch.custom_made !== undefined
     ) {
-      const modeChanging = patch.size_mode !== undefined && patch.size_mode !== existing.size_mode;
-      const effectiveMode = patch.size_mode ?? existing.size_mode;
+      // Amendment 2026-11-25 — a legacy "one" row has no "one" branch left in
+      // normalizeSizeFields/validateSizeAvailability (retired). When the
+      // patch doesn't touch size_mode, treat the row's existing "one" as the
+      // "free" it already behaves like (same single out_of_stock-flag shape)
+      // so e.g. editing only that row's out_of_stock flag doesn't fail.
+      const existingEffectiveMode = existing.size_mode === "one" ? "free" : existing.size_mode;
+      const modeChanging = patch.size_mode !== undefined && patch.size_mode !== existingEffectiveMode;
+      const effectiveMode = patch.size_mode ?? existingEffectiveMode;
       const effectiveSizes = modeChanging ? patch.sizes : (patch.sizes ?? existing.sizes);
       const effectiveOutOfStockSizes = modeChanging
         ? patch.out_of_stock_sizes
         : (patch.out_of_stock_sizes ?? existing.out_of_stock_sizes);
       const effectiveOutOfStock = modeChanging ? patch.out_of_stock : (patch.out_of_stock ?? existing.out_of_stock);
+      const effectiveCustomMade = modeChanging ? patch.custom_made : (patch.custom_made ?? existing.custom_made);
 
       // Normalize — drops whichever fields don't belong to the effective
       // mode (e.g. a stale out_of_stock left over from before switching to
       // "sized") so validation never throws on an irrelevant leftover field.
-      const normalizedSize = normalizeSizeFields(effectiveMode, effectiveSizes, effectiveOutOfStockSizes, effectiveOutOfStock);
-      validateSizeAvailability(effectiveMode, normalizedSize.sizes, normalizedSize.out_of_stock_sizes, normalizedSize.out_of_stock);
+      const normalizedSize = normalizeSizeFields(
+        effectiveMode,
+        effectiveSizes,
+        effectiveOutOfStockSizes,
+        effectiveOutOfStock,
+        effectiveCustomMade,
+      );
+      validateSizeAvailability(
+        effectiveMode,
+        normalizedSize.sizes,
+        normalizedSize.out_of_stock_sizes,
+        normalizedSize.out_of_stock,
+        normalizedSize.custom_made,
+      );
 
       // Write the normalized values back explicitly (including explicit
       // `undefined`s, which Convex's patch treats as "remove this field")
@@ -652,6 +722,7 @@ export const updateCatalogueItem = mutation({
       patch.sizes = normalizedSize.sizes;
       patch.out_of_stock_sizes = normalizedSize.out_of_stock_sizes;
       patch.out_of_stock = normalizedSize.out_of_stock;
+      patch.custom_made = normalizedSize.custom_made;
     }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
     // validate the gallery and mirror the cover into image_url when provided.

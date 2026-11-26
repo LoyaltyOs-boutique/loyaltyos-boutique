@@ -158,26 +158,28 @@ export const placeOrderRequest = mutation({
       let storedSize: "S" | "M" | "L" | "XL" | "XXL" | "FREE" | "ONE" | "CUSTOM" | "NONE" = line.size;
 
       if (availability.size_mode === "sized") {
-        const validSizes = (availability.sizes ?? []) as string[];
-        if (line.size !== "CUSTOM" && !validSizes.includes(line.size)) {
-          return { ok: false, error: "Please choose a valid size for this piece." };
-        }
-        const outOfStockSizes = (availability.out_of_stock_sizes ?? []) as string[];
-        if (line.size !== "CUSTOM" && outOfStockSizes.includes(line.size)) {
-          return { ok: false, error: `${item.title} (${line.size}) is out of stock` };
-        }
-      } else if (availability.size_mode === "one") {
-        if (line.size !== "ONE") {
-          return { ok: false, error: "This piece is one size only." };
-        }
-        if (availability.out_of_stock) {
-          return { ok: false, error: `${item.title} (${line.size}) is out of stock` };
+        if (line.size === "CUSTOM") {
+          // Amendment 2026-11-25 — Custom size only on a piece the merchant
+          // turned Custom made on, never on a plain Sized piece.
+          if (!availability.custom_made) {
+            return { ok: false, error: "Custom size is not available for this piece." };
+          }
+        } else {
+          const validSizes = (availability.sizes ?? []) as string[];
+          if (!validSizes.includes(line.size)) {
+            return { ok: false, error: "Please choose a valid size for this piece." };
+          }
+          const outOfStockSizes = (availability.out_of_stock_sizes ?? []) as string[];
+          if (outOfStockSizes.includes(line.size)) {
+            return { ok: false, error: `${item.title} (${line.size}) is out of stock` };
+          }
         }
       } else {
-        // "free" — includes legacy pieces with no size_mode set (treated as
-        // Free size everywhere, per the amendment). Legacy "NONE" input is
-        // still accepted so an un-updated customer page keeps working.
-        if (line.size !== "FREE" && line.size !== "NONE") {
+        // "free" — includes legacy pieces with no size_mode set and legacy
+        // "one" pieces (both treated as Free size everywhere, per the
+        // amendments). Legacy "NONE"/"ONE" input is still accepted so an
+        // un-updated customer page keeps working.
+        if (line.size !== "FREE" && line.size !== "NONE" && line.size !== "ONE") {
           return { ok: false, error: "This piece is free size only." };
         }
         storedSize = "FREE";

@@ -195,6 +195,11 @@ export default defineSchema({
     // "free"/"one" pieces only — single out-of-stock flag (no per-size choice
     // since the customer never picks a size on these pieces).
     out_of_stock: v.optional(v.boolean()),
+    // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+    // "sized" pieces only — when true, the piece also offers Custom size
+    // (measurements form) alongside (or instead of) its chosen S/M/L/XL/XXL.
+    // Never set on a "free" piece (enforced in lookbooks.ts).
+    custom_made: v.optional(v.boolean()),
     // Stock no longer counted or decremented (2026-11-24 amendment) — field
     // kept, unused, so every existing document stays valid.
     stock: v.optional(
