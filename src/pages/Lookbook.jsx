@@ -8,7 +8,7 @@ import {
   getData, subscribe, customerLedger,
   validateMagicToken, syncMagicLinkCustomer,
   trackCartAdd, trackLookbookView, hydrateCustomerCatalogue,
-  placeOrderRemote, requestVideoCallRemote,
+  placeOrderRemote, requestVideoCallRemote, fetchMyRecentVideoCallRequests,
 } from '../lib/db.js';
 import { inr, inrFull, first, tierLabel, fmtDate, cls } from '../lib/util.js';
 import { ProductGallery } from '../components/ProductGallery.jsx';
@@ -53,7 +53,7 @@ export default function Lookbook() {
   // piece whose chooser is open, or null when closed. The rest are the form
   // the chooser collects before a bag line is built.
   const [choosing, setChoosing] = useState(null); // catalogue item | null
-  const [chooseSize, setChooseSize] = useState('FREE'); // S/M/L/XL/XXL/FREE/ONE/CUSTOM
+  const [chooseSize, setChooseSize] = useState('FREE'); // S/M/L/XL/XXL/FREE/CUSTOM
   const [chooseQty, setChooseQty] = useState(1);
   const [chooseMeas, setChooseMeas] = useState({}); // custom-size measurement form
   const [chooseErr, setChooseErr] = useState('');
@@ -69,6 +69,11 @@ export default function Lookbook() {
   const [videoCallSending, setVideoCallSending] = useState({});
   const [videoCallMsg, setVideoCallMsg] = useState({});
   const [videoCallErr, setVideoCallErr] = useState({});
+  // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+  // catalogue_item_ids this customer already requested a video call for in
+  // the last 24 hours — fetched once below, then grown locally (never
+  // refetched) as fresh requests succeed or hit the 24h duplicate case.
+  const [recentVideoCallIds, setRecentVideoCallIds] = useState([]);
   // Race-condition fix (2026-09-17), upgraded 2026-09-19 (see
   // docs/superpowers/specs/2026-09-19-lookbook-staleness-permanent-fix-design.md):
   // was a bare boolean that flipped true on ANY hydrateCustomerCatalogue
@@ -211,6 +216,16 @@ export default function Lookbook() {
     }
   }, [customer]);
 
+  // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+  // Fetch once per real visit, same one-shot-ref pattern as viewTrackedRef above.
+  const videoCallIdsFetchedRef = useState(() => ({ done: false }))[0];
+  useEffect(() => {
+    if (customer && !videoCallIdsFetchedRef.done) {
+      videoCallIdsFetchedRef.done = true;
+      fetchMyRecentVideoCallRequests().then((ids) => { if (Array.isArray(ids)) setRecentVideoCallIds(ids); });
+    }
+  }, [customer]);
+
   // `db` is a referentially-stable, mutated-in-place singleton (see src/lib/db.js
   // load()) — its object identity never changes, so React's Object.is dep check
   // would never see it as "changed" and this memo would never recompute after
@@ -240,8 +255,12 @@ export default function Lookbook() {
   };
 
   // Design spec: docs/superpowers/specs/2026-11-25-video-consultations-design.md
-  // Same confirmation message whether this is a fresh request or the 24h
-  // duplicate case — the customer never needs to know which happened.
+  // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+  // A 24h duplicate shows the "already requested" notice immediately (the id
+  // is already in recentVideoCallIds, or is added right away below) instead
+  // of the generic success message. A fresh request shows the success
+  // message as before, then joins recentVideoCallIds once that message
+  // clears, so the notice takes over from there.
   const bookVideoCall = async (item) => {
     if (videoCallSending[item.id]) return; // guard a double click
     setVideoCallSending((s) => ({ ...s, [item.id]: true }));
@@ -249,8 +268,15 @@ export default function Lookbook() {
     try {
       const res = await requestVideoCallRemote(item.id);
       if (res && res.ok) {
-        setVideoCallMsg((m) => ({ ...m, [item.id]: 'Video call request received. Our stylist will WhatsApp you shortly to fix a time.' }));
-        setTimeout(() => setVideoCallMsg((m) => ({ ...m, [item.id]: '' })), 5000);
+        if (res.duplicate) {
+          setRecentVideoCallIds((ids) => (ids.includes(item.id) ? ids : [...ids, item.id]));
+        } else {
+          setVideoCallMsg((m) => ({ ...m, [item.id]: 'Video call request received. Our stylist will WhatsApp you shortly to fix a time.' }));
+          setTimeout(() => {
+            setVideoCallMsg((m) => ({ ...m, [item.id]: '' }));
+            setRecentVideoCallIds((ids) => (ids.includes(item.id) ? ids : [...ids, item.id]));
+          }, 5000);
+        }
       } else {
         setVideoCallErr((e) => ({ ...e, [item.id]: (res && res.error) || 'Something went wrong — please try again.' }));
       }
@@ -281,19 +307,24 @@ export default function Lookbook() {
     if (item.size_mode === 'sized') return (item.out_of_stock_sizes || []).includes(size);
     return item.out_of_stock === true;
   };
-  // A free-size or one-size card that is out of stock is sold out. A sized
-  // piece is never sold out at the card level — the chooser shows which
-  // individual sizes are out.
-  const cardSoldOut = (item) => (item.size_mode === 'free' || item.size_mode === 'one') && item.out_of_stock === true;
+  // A free-size card that is out of stock is sold out. A sized piece is never
+  // sold out at the card level — the chooser shows which individual sizes
+  // (and Custom size, when offered) are out.
+  const cardSoldOut = (item) => item.size_mode === 'free' && item.out_of_stock === true;
 
   // "Add to bag" now opens the chooser for one piece instead of adding at once.
+  // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+  // Default selection for a sized piece: the first in-stock size; else Custom
+  // size when the piece is custom made (a Custom-made-only piece with no
+  // sizes lands here, opening straight on the measurements form); else the
+  // first size, out of stock, leaving "Add to bag" disabled as before.
   const openChooser = (item) => {
     if (cardSoldOut(item)) return;
-    // For a sized piece, start on the first in-stock size; if every size is
-    // out of stock, use custom size, which is always made to measure.
     const availableSizes = SIZE_ORDER.filter((s) => (item.sizes || []).includes(s));
-    const firstSized = availableSizes.find((s) => !isOutOfStock(item, s)) || 'CUSTOM';
-    const firstSize = item.size_mode === 'sized' ? firstSized : (item.size_mode === 'one' ? 'ONE' : 'FREE');
+    const firstInStock = availableSizes.find((s) => !isOutOfStock(item, s));
+    const firstSize = item.size_mode !== 'sized'
+      ? 'FREE'
+      : firstInStock || (item.custom_made ? 'CUSTOM' : availableSizes[0]);
     setChooseSize(firstSize);
     setChooseQty(1);
     // Prefill the custom form from the customer's own measurements only when the
@@ -528,6 +559,9 @@ export default function Lookbook() {
                         {videoCallSending[item.id] ? 'Sending…' : 'Book a video call'}
                       </button>
                       {videoCallMsg[item.id] && <div className="text-xs text-steel mt-2">{videoCallMsg[item.id]}</div>}
+                      {!videoCallMsg[item.id] && recentVideoCallIds.includes(item.id) && (
+                        <div className="text-xs text-steel mt-2">You've already requested a video call for this piece. Our stylist will WhatsApp you shortly.</div>
+                      )}
                       {videoCallErr[item.id] && <div className="text-xs text-gold font-medium mt-2">{videoCallErr[item.id]}</div>}
                     </div>
                   </article>
@@ -678,10 +712,10 @@ export default function Lookbook() {
               <button onClick={() => setChoosing(null)} className="text-steel hover:text-ink text-xl">×</button>
             </div>
             <div className="p-6 space-y-5">
-              {(choosing.size_mode === 'free' || choosing.size_mode === 'one') && (
-                <div className="text-sm text-steel mt-1">{choosing.size_mode === 'one' ? 'One size' : 'Free size'}</div>
+              {choosing.size_mode === 'free' && (
+                <div className="text-sm text-steel mt-1">Free size</div>
               )}
-              {choosing.size_mode === 'sized' && (
+              {choosing.size_mode === 'sized' && (choosing.sizes || []).length > 0 && (
                 <div>
                   <div className="label">Choose size</div>
                   <div className="flex gap-2 flex-wrap">
@@ -690,9 +724,11 @@ export default function Lookbook() {
                         {s}
                       </button>
                     ))}
-                    <button onClick={() => { setChooseSize('CUSTOM'); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', chooseSize === 'CUSTOM' ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
-                      Custom size
-                    </button>
+                    {choosing.custom_made && (
+                      <button onClick={() => { setChooseSize('CUSTOM'); setChooseQty(1); setChooseErr(''); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', chooseSize === 'CUSTOM' ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                        Custom size
+                      </button>
+                    )}
                   </div>
                   {isOutOfStock(choosing, chooseSize) && <div className="text-xs text-steel mt-2">Out of stock</div>}
                 </div>

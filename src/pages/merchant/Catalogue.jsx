@@ -69,10 +69,13 @@ export default function Catalogue() {
   useEffect(() => { hydrateCatalogue(); }, []);
 
   const [manual, setManual] = useState({ title: '', price: '', image_url: '', instagram_link: '' });
-  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
-  // Manual Entry size type: 'free' (default), 'one', or 'sized' (S/M/L/XL/XXL toggles).
-  const [manualSizeType, setManualSizeType] = useState('free');
-  const [manualSizes, setManualSizes] = useState([]); // 'sized' only
+  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+  // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md —
+  // Manual Entry size type: two independent toggles — Sizes (S/M/L/XL/XXL) and
+  // Custom made, either or both on. Free size is implied when both are off.
+  const [manualSizesOn, setManualSizesOn] = useState(false);
+  const [manualCustomMadeOn, setManualCustomMadeOn] = useState(false);
+  const [manualSizes, setManualSizes] = useState([]); // Sizes only
   // Manual Entry — drag-drop media upload (mirrors Templates.jsx's MediaCard
   // onMediaFile pattern), auto-fills manual.image_url on success.
   const [mediaUploading, setMediaUploading] = useState(false);
@@ -91,15 +94,18 @@ export default function Catalogue() {
   const [editMediaUploading, setEditMediaUploading] = useState(false);
   const [editImageUrl, setEditImageUrl] = useState('');
   const editMediaRef = useRef(null);
-  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
-  // Edit stock modal: which piece.id is open, its chosen size type, its available
-  // sizes + out-of-stock sizes ('sized') or single out-of-stock flag ('free'/'one'),
+  // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+  // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md —
+  // Edit stock modal: which piece.id is open, two independent toggles (Sizes,
+  // Custom made — Free size is implied when both are off), its available
+  // sizes + out-of-stock sizes (Sizes) or single out-of-stock flag (Free size),
   // a saving flag with a ref guard against a double Save click, and an error line.
   const [stockPieceId, setStockPieceId] = useState(null);
-  const [stockType, setStockType] = useState('free');
-  const [stockSizes, setStockSizes] = useState([]); // 'sized' only
-  const [stockOutOfStockSizes, setStockOutOfStockSizes] = useState([]); // 'sized' only
-  const [stockOutOfStock, setStockOutOfStock] = useState(false); // 'free'/'one' only
+  const [stockSizesOn, setStockSizesOn] = useState(false);
+  const [stockCustomMadeOn, setStockCustomMadeOn] = useState(false);
+  const [stockSizes, setStockSizes] = useState([]); // Sizes only
+  const [stockOutOfStockSizes, setStockOutOfStockSizes] = useState([]); // Sizes only
+  const [stockOutOfStock, setStockOutOfStock] = useState(false); // Free size only
   const [stockSaving, setStockSaving] = useState(false);
   const stockSavingRef = useRef(false);
   const [stockErr, setStockErr] = useState('');
@@ -283,30 +289,34 @@ export default function Catalogue() {
   // canonical display/toggle order for the five sizes.
   const SIZE_ORDER = ['S', 'M', 'L', 'XL', 'XXL'];
 
-  // One short summary for a merchant card: "Free size"/"One size" (+ " · Out of
-  // stock" when the whole piece is out), or "Sizes: S · M · L" (+ " · Out of
-  // stock: XL" when some of those sizes are out).
+  // One short summary for a merchant card: "Free size" (+ " · Out of stock"
+  // when the whole piece is out), "Sizes: S · M · L" (+ " · Custom made" when
+  // also custom made) (+ " · Out of stock: XL" when some of those sizes are
+  // out), or "Custom made" alone for a Custom-made-only piece (no sizes).
   const stockLine = (piece) => {
     const mode = piece.size_mode;
     if (!mode) return '';
     if (mode === 'sized') {
       const sizes = SIZE_ORDER.filter((s) => (piece.sizes || []).includes(s));
+      if (sizes.length === 0 && piece.custom_made) return 'Custom made';
       const oos = SIZE_ORDER.filter((s) => (piece.out_of_stock_sizes || []).includes(s));
       let line = `Sizes: ${sizes.join(' · ')}`;
+      if (piece.custom_made) line += ' · Custom made';
       if (oos.length) line += ` · Out of stock: ${oos.join(' · ')}`;
       return line;
     }
-    const label = mode === 'one' ? 'One size' : 'Free size';
-    return piece.out_of_stock ? `${label} · Out of stock` : label;
+    return piece.out_of_stock ? 'Free size · Out of stock' : 'Free size';
   };
 
   const openEditStock = (piece) => {
     setStockPieceId(piece.id);
     const mode = piece.size_mode || 'free';
-    setStockType(mode);
-    setStockSizes(mode === 'sized' ? (piece.sizes || []) : []);
-    setStockOutOfStockSizes(mode === 'sized' ? (piece.out_of_stock_sizes || []) : []);
-    setStockOutOfStock(mode !== 'sized' ? !!piece.out_of_stock : false);
+    const sized = mode === 'sized';
+    setStockSizesOn(sized && (piece.sizes || []).length > 0);
+    setStockCustomMadeOn(sized && !!piece.custom_made);
+    setStockSizes(sized ? (piece.sizes || []) : []);
+    setStockOutOfStockSizes(sized ? (piece.out_of_stock_sizes || []) : []);
+    setStockOutOfStock(!sized ? !!piece.out_of_stock : false);
     setStockErr('');
     setStockSaving(false);
     stockSavingRef.current = false;
@@ -330,17 +340,22 @@ export default function Catalogue() {
   };
   const saveEditStock = async () => {
     if (stockSavingRef.current) return; // guard a second Save click
-    if (stockType === 'sized' && stockSizes.length < 1) {
-      setStockErr('Choose at least one size.');
+    if (stockSizesOn && stockSizes.length < 1 && !stockCustomMadeOn) {
+      setStockErr('Choose at least one size, or turn on Custom made.');
       return;
     }
     stockSavingRef.current = true;
     setStockSaving(true);
     setStockErr('');
     try {
-      const patch = stockType === 'sized'
-        ? { size_mode: 'sized', sizes: stockSizes, out_of_stock_sizes: stockOutOfStockSizes }
-        : { size_mode: stockType, out_of_stock: stockOutOfStock };
+      const patch = (!stockSizesOn && !stockCustomMadeOn)
+        ? { size_mode: 'free', out_of_stock: stockOutOfStock }
+        : {
+            size_mode: 'sized',
+            sizes: stockSizesOn ? stockSizes : [],
+            out_of_stock_sizes: stockSizesOn ? stockOutOfStockSizes : [],
+            custom_made: stockCustomMadeOn,
+          };
       await updateCatalogueItem(stockPieceId, patch);
       closeEditStock();
     } catch (err) {
@@ -354,12 +369,22 @@ export default function Catalogue() {
 
   const addManual = async () => {
     if (!manual.title || !manual.price) return;
-    // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
-    // size_mode is always sent; 'sized' additionally needs at least one size.
-    let sizeExtra = { size_mode: manualSizeType };
-    if (manualSizeType === 'sized') {
-      if (manualSizes.length < 1) { setMediaMsg('Choose at least one size.'); return; }
-      sizeExtra = { size_mode: 'sized', sizes: manualSizes };
+    // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+    // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md —
+    // size_mode is always sent; Sizes additionally needs at least one size
+    // unless Custom made is also on.
+    let sizeExtra = { size_mode: 'free' };
+    if (manualSizesOn || manualCustomMadeOn) {
+      if (manualSizesOn && manualSizes.length < 1 && !manualCustomMadeOn) {
+        setMediaMsg('Choose at least one size, or turn on Custom made.');
+        return;
+      }
+      sizeExtra = {
+        size_mode: 'sized',
+        sizes: manualSizesOn ? manualSizes : [],
+        out_of_stock_sizes: [],
+        custom_made: manualCustomMadeOn,
+      };
     }
     // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
     // a typed Image URL that was never explicitly "Add"-ed still joins the gallery here.
@@ -400,7 +425,8 @@ export default function Catalogue() {
     setAddTo('all');
     setNewLookbookName('');
     // Amendment 2026-11-24 — reset the size type to the default after a save.
-    setManualSizeType('free');
+    setManualSizesOn(false);
+    setManualCustomMadeOn(false);
     setManualSizes([]);
   };
   // Shared drag-drop upload loop, mirrors Templates.jsx MediaCard's
@@ -631,14 +657,18 @@ export default function Catalogue() {
             <div>
               <label className="label">Size type</label>
               <div className="flex gap-2 flex-wrap">
-                {[['free', 'Free size'], ['one', 'One size'], ['sized', 'Sizes']].map(([val, lbl]) => (
-                  <button key={val} type="button" onClick={() => setManualSizeType(val)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', manualSizeType === val ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
-                    {lbl}
-                  </button>
-                ))}
+                <button type="button" onClick={() => { setManualSizesOn(false); setManualCustomMadeOn(false); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', !manualSizesOn && !manualCustomMadeOn ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                  Free size
+                </button>
+                <button type="button" onClick={() => setManualSizesOn((v) => !v)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', manualSizesOn ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                  Sizes
+                </button>
+                <button type="button" onClick={() => setManualCustomMadeOn((v) => !v)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', manualCustomMadeOn ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                  Custom made
+                </button>
               </div>
             </div>
-            {manualSizeType === 'sized' && (
+            {manualSizesOn && (
               <div>
                 <label className="label">Sizes</label>
                 <div className="flex gap-2 flex-wrap">
@@ -835,14 +865,18 @@ export default function Catalogue() {
             <div>
               <label className="label">Size type</label>
               <div className="flex gap-2 flex-wrap">
-                {[['free', 'Free size'], ['one', 'One size'], ['sized', 'Sizes']].map(([val, lbl]) => (
-                  <button key={val} type="button" onClick={() => setStockType(val)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockType === val ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
-                    {lbl}
-                  </button>
-                ))}
+                <button type="button" onClick={() => { setStockSizesOn(false); setStockCustomMadeOn(false); }} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', !stockSizesOn && !stockCustomMadeOn ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                  Free size
+                </button>
+                <button type="button" onClick={() => setStockSizesOn((v) => !v)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockSizesOn ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                  Sizes
+                </button>
+                <button type="button" onClick={() => setStockCustomMadeOn((v) => !v)} className={cls('px-3 py-1.5 border text-[11px] tracking-wide2 uppercase transition-colors', stockCustomMadeOn ? 'border-gold bg-gold-soft/40 text-ink' : 'border-line text-steel hover:border-gold')}>
+                  Custom made
+                </button>
               </div>
             </div>
-            {stockType === 'sized' && (
+            {stockSizesOn && (
               <>
                 <div>
                   <label className="label">Available sizes</label>
@@ -868,7 +902,7 @@ export default function Catalogue() {
                 )}
               </>
             )}
-            {(stockType === 'free' || stockType === 'one') && (
+            {!stockSizesOn && !stockCustomMadeOn && (
               <div>
                 <label className="label">Out of stock</label>
                 <div className="flex gap-2 flex-wrap">

@@ -1493,7 +1493,7 @@ export function deleteLookbook(id) {
 }
 
 /** Add catalogue item with optimistic update + Convex write-through (Step 6.2). */
-export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media, size_mode, sizes, out_of_stock_sizes, out_of_stock }) {
+export function addCatalogueItem({ title, price, image_url, instagram_link, source, lookbook_id, media, size_mode, sizes, out_of_stock_sizes, out_of_stock, custom_made }) {
   // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md —
   // when a gallery is provided, the cover mirrors media[0].url, same as the backend.
   if (Array.isArray(media) && media.length > 0) image_url = media[0].url;
@@ -1523,10 +1523,12 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
     lookbook_id,
     media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
     // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+    // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
     size_mode,
     sizes,
     out_of_stock_sizes,
     out_of_stock,
+    custom_made,
   };
   state.catalogueItems.unshift(item);
   pushEvent('owner', 'catalogue', `New lookbook item added · ${title} (₹${item.price})`);
@@ -1555,6 +1557,8 @@ export function addCatalogueItem({ title, price, image_url, instagram_link, sour
       ...(sizes ? { sizes } : {}),
       ...(out_of_stock_sizes ? { out_of_stock_sizes } : {}),
       ...(out_of_stock !== undefined ? { out_of_stock } : {}),
+      // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+      ...(custom_made !== undefined ? { custom_made } : {}),
       ...addSession,
     }).then((cvxId) => {
       // Stamp the real ID so subsequent deletes/updates target Convex
@@ -1600,10 +1604,25 @@ export function updateCatalogueItem(id, patch) {
       }
       // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md —
       // mirror the saved size availability onto the local item, same as above.
-      if (p.size_mode !== undefined) state.catalogueItems[idx].size_mode = p.size_mode;
-      if (p.sizes !== undefined) state.catalogueItems[idx].sizes = p.sizes;
-      if (p.out_of_stock_sizes !== undefined) state.catalogueItems[idx].out_of_stock_sizes = p.out_of_stock_sizes;
-      if (p.out_of_stock !== undefined) state.catalogueItems[idx].out_of_stock = p.out_of_stock;
+      // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md —
+      // the merchant UI always sends size_mode together with a complete set of
+      // size fields for the new mode (Catalogue.jsx), so when size_mode is sent
+      // the other four fields are replaced wholesale from the patch (including
+      // `undefined`) rather than merged one-by-one — otherwise a field left
+      // over from the OLD mode (e.g. sizes after switching to Free size) would
+      // stay stale in local state until the next hydrate.
+      if (p.size_mode !== undefined) {
+        state.catalogueItems[idx].size_mode = p.size_mode;
+        state.catalogueItems[idx].sizes = p.sizes;
+        state.catalogueItems[idx].out_of_stock_sizes = p.out_of_stock_sizes;
+        state.catalogueItems[idx].out_of_stock = p.out_of_stock;
+        state.catalogueItems[idx].custom_made = p.custom_made;
+      } else {
+        if (p.sizes !== undefined) state.catalogueItems[idx].sizes = p.sizes;
+        if (p.out_of_stock_sizes !== undefined) state.catalogueItems[idx].out_of_stock_sizes = p.out_of_stock_sizes;
+        if (p.out_of_stock !== undefined) state.catalogueItems[idx].out_of_stock = p.out_of_stock;
+        if (p.custom_made !== undefined) state.catalogueItems[idx].custom_made = p.custom_made;
+      }
       emit();
     }
   });
@@ -1680,10 +1699,12 @@ export function hydrateCatalogue(force) {
             lookbook_id: lb._id,
             media: i.media, // Design spec: docs/superpowers/specs/2026-09-25-product-gallery-design.md
             // Amendment: docs/superpowers/specs/2026-11-24-sizes-availability-amendment.md
+            // Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
             size_mode: i.size_mode,
             sizes: i.sizes,
             out_of_stock_sizes: i.out_of_stock_sizes,
             out_of_stock: i.out_of_stock,
+            custom_made: i.custom_made,
           })));
         }
       }
@@ -1972,6 +1993,24 @@ export function requestVideoCallRemote(catalogueItemId) {
     token: session.token,
     catalogue_item_id: catalogueItemId,
   }).catch((err) => ({ ok: false, error: friendlyError(err) }));
+}
+
+/**
+ * Amendment: docs/superpowers/specs/2026-11-25-custom-made-and-video-call-notice-amendment.md
+ * Fetch the catalogue_item_ids this customer requested a video call for in
+ * the last 24 hours (async). Magic-link gated, same session shape as
+ * requestVideoCallRemote directly above. Resolves to [] on any failure (no
+ * client, no session, or a thrown query) — this is a passive display check,
+ * never something the customer needs an error for.
+ */
+export function fetchMyRecentVideoCallRequests() {
+  const client = getConvex();
+  const session = getCustomerSession();
+  if (!client || !session) return Promise.resolve([]);
+  return client.query(api.videoCalls.getMyRecentVideoCallRequests, {
+    id: session.id,
+    token: session.token,
+  }).catch(() => []);
 }
 
 /** Get all orders (async). MERCHANT-ONLY (Merchant Session Lock). */
